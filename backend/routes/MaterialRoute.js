@@ -276,6 +276,16 @@ router.get(
 // Get UoM master list for dropdown
 router.get("/uom", AuthToken.authSession, MaterialController.getUomMaster);
 
+// Get plant master list for dropdown
+router.get("/plant", AuthToken.authSession, MaterialController.getPlantMaster);
+
+// Get storage location master list for dropdown
+router.get(
+    "/storage-location",
+    AuthToken.authSession,
+    MaterialController.getStorageLocationMaster
+);
+
 // Get material by ID with full details and attachments
 router.get("/:materialId", MaterialController.getMaterialById);
 

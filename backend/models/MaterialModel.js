@@ -7,7 +7,6 @@ const getMimeType = require("../helper/mimetype.js");
 const xlsx = require("xlsx");
 const axios = require("axios");
 const pool = require("../config/connection");
-const wmsPool = require("../config/wmsconnection");
 const saveToDatabase = require("../helper/sap_seeding");
 const Emailer = require("../models/EmailModel.js");
 const MaterialTemplate = require("../models/MaterialTemplateModel");
@@ -4911,17 +4910,23 @@ const Material = {
 
     getLocationAndPlant: async () => {
         try {
+            // Plant & storage-location options come from MDM master data
+            // (mst_plant / mst_storage_location), which carry the descriptions.
+            // plant_code + storage_location are what the UI binds to; plant_id /
+            // warehouse_id are kept for backward compatibility with the response shape.
             const query = `
-            SELECT 
-                w.id as warehouse_id, 
-                w.location as storage_location, 
-                p.id as plant_id, 
-                p.code as plant_code 
-            FROM plant p
-            LEFT JOIN warehouse w ON w.plant_id = p.id
-            ORDER BY p.code, w.location
+            SELECT
+                sl.id          AS warehouse_id,
+                sl.sloc_code   AS storage_location,
+                p.id           AS plant_id,
+                p.plant_code   AS plant_code,
+                p.description  AS plant_description,
+                sl.description AS sloc_description
+            FROM public.mst_plant p
+            LEFT JOIN public.mst_storage_location sl ON sl.plant_code = p.plant_code
+            ORDER BY p.plant_code, sl.sloc_code
         `;
-            const result = await wmsPool.query(query);
+            const result = await pool.query(query);
             return result.rows;
         } catch (error) {
             console.error("Error in MaterialModel:", error);
@@ -4948,6 +4953,28 @@ const Material = {
             return result.rows;
         } catch (error) {
             console.error("Error in MaterialModel.getUomMaster:", error);
+            throw error;
+        }
+    },
+
+    getPlantMaster: async () => {
+        try {
+            const query = `SELECT plant_code, description, name2, city FROM public.mst_plant ORDER BY plant_code`;
+            const result = await pool.query(query);
+            return result.rows;
+        } catch (error) {
+            console.error("Error in MaterialModel.getPlantMaster:", error);
+            throw error;
+        }
+    },
+
+    getStorageLocationMaster: async () => {
+        try {
+            const query = `SELECT company_code, plant_code, sloc_code, description FROM public.mst_storage_location ORDER BY plant_code, sloc_code`;
+            const result = await pool.query(query);
+            return result.rows;
+        } catch (error) {
+            console.error("Error in MaterialModel.getStorageLocationMaster:", error);
             throw error;
         }
     },

@@ -3172,6 +3172,24 @@ const MaterialController = {
             res.status(500).json({ success: false, error: error.message });
         }
     },
+
+    getPlantMaster: async (req, res) => {
+        try {
+            const plantList = await Material.getPlantMaster();
+            res.status(200).json({ success: true, data: plantList });
+        } catch (error) {
+            res.status(500).json({ success: false, error: error.message });
+        }
+    },
+
+    getStorageLocationMaster: async (req, res) => {
+        try {
+            const slocList = await Material.getStorageLocationMaster();
+            res.status(200).json({ success: true, data: slocList });
+        } catch (error) {
+            res.status(500).json({ success: false, error: error.message });
+        }
+    },
 };
 
 MaterialController.__private = {
