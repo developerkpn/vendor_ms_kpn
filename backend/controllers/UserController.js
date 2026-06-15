@@ -34,7 +34,14 @@ const getReadableError = err => {
 const UserController = {
     showAll: async (req, res) => {
         try {
-            let data = await User.showAll();
+            // Optional pagination + search. Omit page/limit to get all rows
+            // (unchanged behavior for existing callers). Aliases: pageSize, q.
+            const { page, limit, pageSize, search, q } = req.query || {};
+            let data = await User.showAll({
+                page,
+                limit: limit ?? pageSize,
+                search: search ?? q,
+            });
             res.status(200).send(data);
         } catch (err) {
             console.error(err);

@@ -13,7 +13,7 @@ const {
 } = require("../helper/materialSidebarMenu.js");
 
 const User = {
-    showAll: async () => {
+    showAll: async ({ page, limit, search } = {}) => {
         const client = await db.connect();
         try {
             const row = await client.query(`
@@ -30,10 +30,47 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
                 us.is_active
                 FROM mst_mgr us
 				LEFT JOIN (SELECT DISTINCT user_group_name, user_group_id from mst_page_access) sec on us.user_group = sec.user_group_id`);
-            return {
-                count: row.rowCount,
-                data: row.rows,
+            let rows = row.rows;
+
+            // Optional backend search across name / username / email / role / group.
+            const term = typeof search === "string" ? search.trim().toLowerCase() : "";
+            if (term) {
+                rows = rows.filter(user =>
+                    [
+                        user.fullname,
+                        user.username,
+                        user.email,
+                        user.role,
+                        user.user_group_name,
+                    ].some(value => String(value ?? "").toLowerCase().includes(term))
+                );
+            }
+
+            const total = rows.length;
+
+            // Optional pagination — applied only when BOTH page and limit are valid
+            // positive integers. Otherwise the full (filtered) list is returned, so
+            // existing callers that pass no params keep the original { count, data }.
+            const pageNum = Number.parseInt(page, 10);
+            const limitNum = Number.parseInt(limit, 10);
+            const paginate =
+                Number.isInteger(pageNum) &&
+                pageNum > 0 &&
+                Number.isInteger(limitNum) &&
+                limitNum > 0;
+
+            const result = {
+                count: total,
+                data: paginate
+                    ? rows.slice((pageNum - 1) * limitNum, (pageNum - 1) * limitNum + limitNum)
+                    : rows,
             };
+            if (paginate) {
+                result.page = pageNum;
+                result.limit = limitNum;
+                result.totalPages = Math.ceil(total / limitNum);
+            }
+            return result;
         } catch (error) {
             console.error(error);
         } finally {
