@@ -1706,16 +1706,24 @@ const runSingleRequestApprovalInboxQuery = async client => {
 const GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY = `SELECT
         u.user_id AS requester_user_id,
         u.username AS requester_username,
+        u.fullname AS requester_fullname,
+        u.email AS requester_email,
         a.approval_1_user_id,
         a.approval_2_user_id,
         a.approval_3_user_id,
         a.approval_3_type,
         a.approval_3_group,
+        COALESCE(au1.fullname, au1.username, a.approval_1_user_id) AS approval_1_user_name,
+        COALESCE(au2.fullname, au2.username, a.approval_2_user_id) AS approval_2_user_name,
         COALESCE(au3.fullname, au3.username, a.approval_3_user_id) AS approval_3_user_name,
         COALESCE(active_requests.active_request_count, 0) AS active_request_count
     FROM mst_user u
-    LEFT JOIN mat_single_request_approval a
+    LEFT JOIN mat_approvers_matrix a
         ON a.requester_user_id = u.user_id
+    LEFT JOIN mst_user au1
+        ON au1.user_id = a.approval_1_user_id
+    LEFT JOIN mst_user au2
+        ON au2.user_id = a.approval_2_user_id
     LEFT JOIN mst_user au3
         ON au3.user_id = a.approval_3_user_id
     LEFT JOIN (
@@ -5410,7 +5418,7 @@ const Material = {
                         ) {
                             const requesterMasterResult = await client.query(
                                 `SELECT approval_3_user_id
-                                 FROM mat_single_request_approval
+                                 FROM mat_approvers_matrix
                                  WHERE requester_user_id = $1`,
                                 [snapshot.created_by ?? snapshot.requester_user_id]
                             );
@@ -5547,7 +5555,7 @@ const Material = {
                     if (activeStage === "Approval 2") {
                         const requesterMasterResult = await client.query(
                             `SELECT approval_3_user_id
-                             FROM mat_single_request_approval
+                             FROM mat_approvers_matrix
                              WHERE requester_user_id = $1`,
                             [snapshot.created_by ?? snapshot.requester_user_id]
                         );
@@ -5890,7 +5898,7 @@ const Material = {
                         normalizeSingleRequestTicketType(ticketType);
                     const requesterMasterResult = await client.query(
                         `SELECT approval_1_user_id, approval_2_user_id, approval_3_user_id
-                         FROM mat_single_request_approval
+                         FROM mat_approvers_matrix
                          WHERE requester_user_id = $1`,
                         [createdBy]
                     );
@@ -6070,7 +6078,7 @@ const Material = {
 
                     const requesterMasterResult = await client.query(
                         `SELECT approval_1_user_id, approval_2_user_id, approval_3_user_id
-                         FROM mat_single_request_approval
+                         FROM mat_approvers_matrix
                          WHERE requester_user_id = $1`,
                         [createdBy]
                     );
@@ -6849,20 +6857,59 @@ const Material = {
         }
     },
 
-    getAdministratorApproverMasters: async () => {
+    getAdministratorApproverMasters: async ({ page, limit, search } = {}) => {
         return DBClientWrapper(async client => {
             const result = await client.query(GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY);
-            return result.rows.map(row => ({
+            let rows = result.rows.map(row => ({
                 requester_user_id: row.requester_user_id,
                 requester_username: row.requester_username,
+                requester_fullname: row.requester_fullname,
+                requester_email: row.requester_email,
                 approval_1_user_id: row.approval_1_user_id,
+                approval_1_user_name: row.approval_1_user_name,
                 approval_2_user_id: row.approval_2_user_id,
+                approval_2_user_name: row.approval_2_user_name,
                 approval_3_user_id: row.approval_3_user_id,
                 approval_3_user_name: row.approval_3_user_name,
                 approval_3_type: row.approval_3_type || "SYSTEM",
                 approval_3_group: row.approval_3_group || MDM_MATERIAL_GROUP_NAME,
                 is_locked: false,
             }));
+
+            // Optional backend search across requester name / username / email.
+            const term = typeof search === "string" ? search.trim().toLowerCase() : "";
+            if (term) {
+                rows = rows.filter(r =>
+                    [r.requester_username, r.requester_fullname, r.requester_email].some(
+                        value => String(value ?? "").toLowerCase().includes(term)
+                    )
+                );
+            }
+
+            const total = rows.length;
+
+            // Optional pagination — applied only when both page & limit are valid
+            // positives; otherwise the full (filtered) list is returned so existing
+            // callers that pass no params are unaffected.
+            const pageNum = Number.parseInt(page, 10);
+            const limitNum = Number.parseInt(limit, 10);
+            const paginate =
+                Number.isInteger(pageNum) &&
+                pageNum > 0 &&
+                Number.isInteger(limitNum) &&
+                limitNum > 0;
+
+            const data = paginate
+                ? rows.slice((pageNum - 1) * limitNum, (pageNum - 1) * limitNum + limitNum)
+                : rows;
+
+            return {
+                count: total,
+                data,
+                ...(paginate
+                    ? { page: pageNum, limit: limitNum, totalPages: Math.ceil(total / limitNum) }
+                    : {}),
+            };
         });
     },
 
@@ -6886,7 +6933,7 @@ const Material = {
 
             const existingMasterResult = await client.query(
                 `SELECT approval_1_user_id, approval_2_user_id, approval_3_user_id, approval_3_type, approval_3_group
-                 FROM mat_single_request_approval
+                 FROM mat_approvers_matrix
                  WHERE requester_user_id = $1`,
                 [requesterUserId]
             );
@@ -6927,7 +6974,7 @@ const Material = {
             });
 
             const result = await client.query(
-                `INSERT INTO mat_single_request_approval (
+                `INSERT INTO mat_approvers_matrix (
                      requester_user_id,
                      approval_1_user_id,
                      approval_2_user_id,

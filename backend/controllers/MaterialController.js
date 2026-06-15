@@ -2921,8 +2921,14 @@ const MaterialController = {
                 return res.status(403).json({ success: false, message: "Forbidden" });
             }
 
-            const rows = await Material.getAdministratorApproverMasters();
-            return res.status(200).json({ success: true, data: rows });
+            // Optional pagination + search (omit page/limit to get all). Aliases: pageSize, q.
+            const { page, limit, pageSize, search, q } = req.query || {};
+            const result = await Material.getAdministratorApproverMasters({
+                page,
+                limit: limit ?? pageSize,
+                search: search ?? q,
+            });
+            return res.status(200).json({ success: true, ...result });
         } catch (error) {
             return res.status(500).json({
                 success: false,

@@ -3,7 +3,7 @@
 -- Purpose:
 -- 1. Persist batch material-create submissions (1..10 rows per submit).
 -- 2. Mirror the mat_single_request approval chain per item, resolved from
---    mat_single_request_approval via buildSingleRequestApprovalSnapshot.
+--    mat_approvers_matrix via buildSingleRequestApprovalSnapshot.
 
 BEGIN;
 
@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS public.mat_mass_request (
     id bigserial PRIMARY KEY,
     mass_request_no varchar(30) NOT NULL,
     item_count int2 NOT NULL CHECK (item_count BETWEEN 1 AND 10),
+    mass_request_reason text NULL,
     created_by varchar(100) NOT NULL,
     created_by_username varchar(100) NULL,
     created_at timestamptz NOT NULL DEFAULT NOW(),
@@ -22,6 +23,9 @@ CREATE INDEX IF NOT EXISTS idx_mat_mass_request_created_by
     ON public.mat_mass_request(created_by);
 CREATE INDEX IF NOT EXISTS idx_mat_mass_request_created_at
     ON public.mat_mass_request(created_at DESC);
+
+COMMENT ON COLUMN public.mat_mass_request.mass_request_reason IS
+    'Requester reason captured when submitting a mass material request batch.';
 
 CREATE TABLE IF NOT EXISTS public.mat_mass_request_item (
     id bigserial PRIMARY KEY,
