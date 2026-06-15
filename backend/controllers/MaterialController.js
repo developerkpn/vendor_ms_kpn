@@ -2944,43 +2944,101 @@ const MaterialController = {
                 return res.status(403).json({ success: false, message: "Forbidden" });
             }
 
-            const assignmentPayload = {
+            // Whole-list save: ordered array of manual approver user_ids.
+            // Accept `manualApprovers` (preferred) or `manualApproverIds` alias.
+            const manualApproverIds =
+                req.body?.manualApprovers ?? req.body?.manualApproverIds;
+
+            const result = await Material.saveRequesterApproverChain({
                 requesterUserId: req.params.requesterUserId,
+                manualApproverIds,
                 actorUsername: req.cookies.username,
-            };
-
-            if (
-                Object.prototype.hasOwnProperty.call(
-                    req.body || {},
-                    "approval1UserId"
-                )
-            ) {
-                assignmentPayload.approval1UserId = req.body.approval1UserId;
-            }
-
-            if (
-                Object.prototype.hasOwnProperty.call(
-                    req.body || {},
-                    "approval2UserId"
-                )
-            ) {
-                assignmentPayload.approval2UserId = req.body.approval2UserId;
-            }
-
-            const result = await Material.updateAdministratorApproverMaster(
-                assignmentPayload
-            );
+            });
 
             return res.status(200).json({
                 success: true,
-                message: "Requester approver master saved successfully",
+                message: "Requester approver chain saved successfully",
                 data: result,
             });
         } catch (error) {
-            return res.status(error.statusCode || 500).json({
+            const statusCode = error.statusCode || 500;
+            const payload = {
                 success: false,
-                message: error.message || "Failed to save requester approver master",
+                message:
+                    error.message || "Failed to save requester approver chain",
+            };
+
+            if (error.code) {
+                payload.code = error.code;
+            }
+
+            if (Array.isArray(error.errors) && error.errors.length > 0) {
+                payload.errors = error.errors;
+            }
+
+            return res.status(statusCode).json(payload);
+        }
+    },
+
+    // MDM grab: an active MDM_MATERIAL user atomically claims the open
+    // Master Data (final) step of a single request.
+    claimSingleRequestMdmStep: async (req, res) => {
+        try {
+            const result = await Material.claimSingleRequestMdmStepByUser({
+                requestId: req.params.id,
+                actorUserId: req.cookies.user_id,
+                actorUsername: req.cookies.username,
             });
+
+            return res.status(200).json({
+                success: true,
+                message: "Master Data step claimed successfully",
+                data: result,
+            });
+        } catch (error) {
+            const statusCode = error.statusCode || 500;
+            const payload = {
+                success: false,
+                message:
+                    statusCode === 500
+                        ? "Failed to claim Master Data step"
+                        : error.message,
+                error: statusCode === 500 ? error.message : undefined,
+                code: error.code,
+            };
+
+            return res.status(statusCode).json(payload);
+        }
+    },
+
+    // MDM grab for a mass request: claims the open Master Data step across
+    // all items of the batch atomically (single winner).
+    claimMassRequestMdmStep: async (req, res) => {
+        try {
+            const result = await Material.claimMassRequestMdmStepByUser({
+                massRequestId: req.params.id,
+                actorUserId: req.cookies.user_id,
+                actorUsername: req.cookies.username,
+            });
+
+            return res.status(200).json({
+                success: true,
+                message: "Master Data step claimed successfully",
+                data: result,
+            });
+        } catch (error) {
+            const statusCode = error.statusCode || 500;
+            const payload = {
+                success: false,
+                message:
+                    statusCode === 500
+                        ? "Failed to claim Master Data step"
+                        : error.message,
+                error: statusCode === 500 ? error.message : undefined,
+                code: error.code,
+            };
+
+            return res.status(statusCode).json(payload);
         }
     },
 

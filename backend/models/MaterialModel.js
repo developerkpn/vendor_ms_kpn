@@ -32,6 +32,11 @@ const {
     isSingleRequestApprovalInboxEligible,
     normalizeSingleRequestTicketType,
     resolveSingleRequestApprovalStage,
+    // Step-based action patch builders (new dynamic-approver flow).
+    buildStepApprovePatch,
+    buildStepReworkPatch,
+    buildStepRejectPatch,
+    buildStepRevisedPatch,
 } = require("../helper/singleRequestApproval.js");
 const {
     resolveMassRequestApprovalStage,
@@ -42,7 +47,25 @@ const {
     buildMassRequestReworkPatch,
     buildMassRequestRejectPatch,
     syncMassRequestItemApprovalSnapshot,
+    // New step-based mass flow (mat_mass_request_item_approval_step).
+    buildMassStepApprovePatch,
+    buildMassStepReworkPatch,
+    buildMassStepRejectPatch,
+    buildMassStepRevisedPatch,
+    mapMassStepRowsToPayload,
 } = require("../helper/massRequestApproval");
+const {
+    STEP_KINDS,
+    normalizeStepStatus,
+    buildApprovalStepPlan,
+    resolveActiveStep,
+    stepLabel,
+    resolveAssignedToFromSteps,
+    canActorActOnStep,
+    isFinalStepActive,
+    buildStepsPayload,
+    findStepByLabel,
+} = require("../helper/approvalSteps.js");
 const {
     buildMaterialDescriptionAndLongText,
 } = require("../helper/materialTemplateHelper");
@@ -800,6 +823,247 @@ const updateSingleRequestColumns = async (client, requestId, patch = {}) => {
     );
 };
 
+// =====================================================================
+// Dynamic-approver step engine — DB helpers (mat_*_approval_step tables).
+// The new approval flow routes EXCLUSIVELY through these step rows; the
+// legacy approval_1/2/3_* columns are no longer read or written here.
+// =====================================================================
+
+const loadRequesterChain = async (client, requesterUserId) => {
+    const result = await client.query(
+        `SELECT level, approver_user_id
+           FROM mat_approvers_matrix_level
+          WHERE requester_user_id = $1
+          ORDER BY level`,
+        [requesterUserId]
+    );
+
+    return result.rows.map(row => ({
+        level: row.level,
+        approverUserId: row.approver_user_id,
+    }));
+};
+
+const insertSingleRequestApprovalSteps = async (client, requestId, plan = []) => {
+    for (const step of plan) {
+        await client.query(
+            `INSERT INTO mat_single_request_approval_step (
+                request_id,
+                level,
+                kind,
+                approver_user_id,
+                status,
+                created_at,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, NOW(), NOW())`,
+            [
+                requestId,
+                step.level,
+                step.kind,
+                step.approverUserId ?? null,
+                step.status ?? "WAITING",
+            ]
+        );
+    }
+};
+
+const loadSingleRequestSteps = async (
+    client,
+    requestId,
+    { forUpdate = false } = {}
+) => {
+    const result = await client.query(
+        `SELECT
+            s.id,
+            s.request_id,
+            s.level,
+            s.kind,
+            s.approver_user_id,
+            s.claimed_at,
+            s.status,
+            s.acted_at,
+            s.remark,
+            COALESCE(au.fullname, au.username, s.approver_user_id) AS approver_name
+         FROM mat_single_request_approval_step s
+         LEFT JOIN mst_user au ON au.user_id = s.approver_user_id
+         WHERE s.request_id = $1
+         ORDER BY s.level${forUpdate ? "\n         FOR UPDATE OF s" : ""}`,
+        [requestId]
+    );
+
+    return result.rows;
+};
+
+const updateSingleRequestStepRow = async (client, stepId, patch = {}) => {
+    const assignments = [];
+    const params = [stepId];
+    let paramIndex = 2;
+
+    for (const field of Object.keys(patch)) {
+        const value = patch[field];
+
+        if (isRawSqlExpression(value)) {
+            assignments.push(`${field} = ${value.__sql}`);
+            continue;
+        }
+
+        assignments.push(`${field} = $${paramIndex}`);
+        params.push(value);
+        paramIndex += 1;
+    }
+
+    if (assignments.length === 0) {
+        return;
+    }
+
+    await client.query(
+        `UPDATE mat_single_request_approval_step
+         SET ${assignments.join(", ")},
+             updated_at = NOW()
+         WHERE id = $1`,
+        params
+    );
+};
+
+// Atomic single-winner grab of the open MDM step. Returns true iff this actor
+// won the claim (i.e. the step was still unclaimed and got assigned to them).
+const claimMdmSingleRequestStep = async (client, stepId, actorUserId) => {
+    const result = await client.query(
+        `UPDATE mat_single_request_approval_step
+         SET approver_user_id = $2,
+             claimed_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $1
+           AND kind = 'MDM'
+           AND approver_user_id IS NULL
+         RETURNING id`,
+        [stepId, actorUserId]
+    );
+
+    return result.rowCount === 1;
+};
+
+// --- Mass-item step helpers (mat_mass_request_item_approval_step) ---------
+
+const insertMassItemApprovalSteps = async (client, itemId, plan = []) => {
+    for (const step of plan) {
+        await client.query(
+            `INSERT INTO mat_mass_request_item_approval_step (
+                item_id,
+                level,
+                kind,
+                approver_user_id,
+                status,
+                created_at,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, NOW(), NOW())`,
+            [
+                itemId,
+                step.level,
+                step.kind,
+                step.approverUserId ?? null,
+                step.status ?? "WAITING",
+            ]
+        );
+    }
+};
+
+// Load the step rows for the FIRST item of a batch (all items share the plan).
+const loadMassItemSteps = async (
+    client,
+    massRequestId,
+    { forUpdate = false } = {}
+) => {
+    const result = await client.query(
+        `SELECT
+            s.id,
+            s.item_id,
+            s.level,
+            s.kind,
+            s.approver_user_id,
+            s.claimed_at,
+            s.status,
+            s.acted_at,
+            s.remark,
+            COALESCE(au.fullname, au.username, s.approver_user_id) AS approver_name
+         FROM mat_mass_request_item_approval_step s
+         JOIN mat_mass_request_item i ON i.id = s.item_id
+         LEFT JOIN mst_user au ON au.user_id = s.approver_user_id
+         WHERE i.mass_request_id = $1
+           AND i.item_no = (
+               SELECT MIN(ii.item_no)
+               FROM mat_mass_request_item ii
+               WHERE ii.mass_request_id = $1
+           )
+         ORDER BY s.level${forUpdate ? "\n         FOR UPDATE OF s" : ""}`,
+        [massRequestId]
+    );
+
+    return result.rows;
+};
+
+// Apply a step-status patch to the matching LEVEL step row of EVERY item in a
+// batch. Patch values may include raw-SQL sentinels (e.g. NOW()).
+const updateMassItemStepRowsByLevel = async (
+    client,
+    massRequestId,
+    level,
+    patch = {}
+) => {
+    const assignments = [];
+    const params = [massRequestId, level];
+    let paramIndex = 3;
+
+    for (const field of Object.keys(patch)) {
+        const value = patch[field];
+
+        if (isRawSqlExpression(value)) {
+            assignments.push(`${field} = ${value.__sql}`);
+            continue;
+        }
+
+        assignments.push(`${field} = $${paramIndex}`);
+        params.push(value);
+        paramIndex += 1;
+    }
+
+    if (assignments.length === 0) {
+        return;
+    }
+
+    await client.query(
+        `UPDATE mat_mass_request_item_approval_step s
+         SET ${assignments.join(", ")},
+             updated_at = NOW()
+         FROM mat_mass_request_item i
+         WHERE s.item_id = i.id
+           AND i.mass_request_id = $1
+           AND s.level = $2`,
+        params
+    );
+};
+
+// Atomic single-winner grab of the open MDM step across ALL items of a batch.
+// Only succeeds when none of the batch's MDM steps have been claimed yet.
+const claimMdmMassItemStep = async (client, massRequestId, level, actorUserId) => {
+    const result = await client.query(
+        `UPDATE mat_mass_request_item_approval_step s
+         SET approver_user_id = $3,
+             claimed_at = NOW(),
+             updated_at = NOW()
+         FROM mat_mass_request_item i
+         WHERE s.item_id = i.id
+           AND i.mass_request_id = $1
+           AND s.level = $2
+           AND s.kind = 'MDM'
+           AND s.approver_user_id IS NULL
+         RETURNING s.id`,
+        [massRequestId, level, actorUserId]
+    );
+
+    return result.rowCount > 0;
+};
+
 const getSingleRequestAttachments = async (client, requestId) => {
     const result = await client.query(
         `SELECT id, file_name, file_path, file_type
@@ -1274,6 +1538,57 @@ const isActorMdmMaterialUser = async (client, actorUserId) => {
     return result.rowCount > 0;
 };
 
+// =====================================================================
+// Dynamic-approver step engine — shared SQL fragments.
+// Each request/item exposes its step rows as a `approval_steps` jsonb
+// array (ordered by level, snake-cased to match buildStepsPayload), and
+// `active_step` jsonb (lowest-level row not yet APPROVED). JS layers map
+// these through the approvalSteps helpers for payloads + visibility.
+// =====================================================================
+
+// LATERAL block (single request): aggregate this request's step rows.
+// `<alias>` is the table alias for mat_single_request (e.g. `r`).
+const buildSingleRequestStepLateral = (alias = "r") => `LEFT JOIN LATERAL (
+                        SELECT
+                            COALESCE(
+                                jsonb_agg(
+                                    jsonb_build_object(
+                                        'level', s.level,
+                                        'kind', s.kind,
+                                        'approver_user_id', s.approver_user_id,
+                                        'approver_name', COALESCE(sau.fullname, sau.username, s.approver_user_id),
+                                        'status', s.status,
+                                        'claimed_at', s.claimed_at,
+                                        'acted_at', s.acted_at,
+                                        'remark', s.remark
+                                    )
+                                    ORDER BY s.level
+                                ) FILTER (WHERE s.id IS NOT NULL),
+                                '[]'::jsonb
+                            ) AS approval_steps,
+                            (
+                                SELECT to_jsonb(active.*)
+                                FROM (
+                                    SELECT
+                                        a.level,
+                                        a.kind,
+                                        a.approver_user_id,
+                                        a.status
+                                    FROM mat_single_request_approval_step a
+                                    WHERE a.request_id = ${alias}.id
+                                      AND UPPER(COALESCE(a.status, 'WAITING')) <> 'APPROVED'
+                                    ORDER BY a.level
+                                    LIMIT 1
+                                ) active
+                            ) AS active_step
+                        FROM mat_single_request_approval_step s
+                        LEFT JOIN mst_user sau ON sau.user_id = s.approver_user_id
+                        WHERE s.request_id = ${alias}.id
+                    ) step_rows ON TRUE`;
+
+const SINGLE_REQUEST_STEP_SELECT_FIELDS = `COALESCE(step_rows.approval_steps, '[]'::jsonb) AS approval_steps,
+                        step_rows.active_step`;
+
 const SINGLE_REQUEST_REWORK_SELECT_FIELDS = `r.rework_stage,
                         r.rework_by_user_id,
                         TO_CHAR(r.rework_at, 'YYYY-MM-DD HH24:MI') AS rework_at,
@@ -1310,21 +1625,7 @@ const buildSingleRequestSelectFields = ({
                         r.template_payload,
                         r.status,
                         r.created_by AS requester_user_id,
-                        r.approval_1_user_id,
-                        COALESCE(approval_1_user.fullname, approval_1_user.username, r.approval_1_user_id) AS approval_1_user_name,
-                        r.approval_1_status,
-                        TO_CHAR(r.approval_1_at, 'YYYY-MM-DD HH24:MI') AS approval_1_at,
-                        r.approval_1_remark,
-                        r.approval_2_user_id,
-                        COALESCE(approval_2_user.fullname, approval_2_user.username, r.approval_2_user_id) AS approval_2_user_name,
-                        r.approval_2_status,
-                        TO_CHAR(r.approval_2_at, 'YYYY-MM-DD HH24:MI') AS approval_2_at,
-                        r.approval_2_remark,
-                          r.approval_3_status,
-                          r.approval_3_user_id,
-                          COALESCE(approval_3_user.fullname, approval_3_user.username, r.approval_3_user_id) AS approval_3_user_name,
-                          TO_CHAR(r.approval_3_at, 'YYYY-MM-DD HH24:MI') AS approval_3_at,
-                          r.approval_3_remark,
+                        ${SINGLE_REQUEST_STEP_SELECT_FIELDS},
                           ${
                               includeReworkFields
                                   ? SINGLE_REQUEST_REWORK_SELECT_FIELDS
@@ -1352,12 +1653,8 @@ const SINGLE_REQUEST_GROUP_BY = `r.id,
                           mis.code,
                           mis.name,
                           u.username,
-                          approval_1_user.fullname,
-                          approval_1_user.username,
-                          approval_2_user.fullname,
-                          approval_2_user.username,
-                          approval_3_user.fullname,
-                          approval_3_user.username`;
+                          step_rows.approval_steps,
+                          step_rows.active_step`;
 
 const buildSingleRequestListQuery = (
     whereClause,
@@ -1366,9 +1663,7 @@ const buildSingleRequestListQuery = (
                         ${buildSingleRequestSelectFields({ includeReworkFields })}
                       FROM mat_single_request r
                       LEFT JOIN mst_user u ON u.user_id = r.created_by
-                      LEFT JOIN mst_user approval_1_user ON approval_1_user.user_id = r.approval_1_user_id
-                      LEFT JOIN mst_user approval_2_user ON approval_2_user.user_id = r.approval_2_user_id
-                      LEFT JOIN mst_user approval_3_user ON approval_3_user.user_id = r.approval_3_user_id
+                      ${buildSingleRequestStepLateral("r")}
                       ${
                           includeReworkFields
                               ? "LEFT JOIN mst_user rework_by ON rework_by.user_id = r.rework_by_user_id"
@@ -1408,24 +1703,11 @@ const buildSingleRequestApprovalInboxQuery = ({
                         r.long_text_3,
                         r.template_payload,
                         r.status,
+                        r.created_by AS requester_user_id,
                         COALESCE(u.username, r.created_by) AS created_by,
                         TO_CHAR(r.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
                         r.assigned_to,
-                        r.approval_1_user_id,
-                        COALESCE(approval_1_user.fullname, approval_1_user.username, r.approval_1_user_id) AS approval_1_user_name,
-                        r.approval_1_status,
-                        TO_CHAR(r.approval_1_at, 'YYYY-MM-DD HH24:MI') AS approval_1_at,
-                        r.approval_1_remark,
-                        r.approval_2_user_id,
-                          COALESCE(approval_2_user.fullname, approval_2_user.username, r.approval_2_user_id) AS approval_2_user_name,
-                          r.approval_2_status,
-                          TO_CHAR(r.approval_2_at, 'YYYY-MM-DD HH24:MI') AS approval_2_at,
-                          r.approval_2_remark,
-                          r.approval_3_user_id,
-                          COALESCE(approval_3_user.fullname, approval_3_user.username, r.approval_3_user_id) AS approval_3_user_name,
-                          r.approval_3_status,
-                          TO_CHAR(r.approval_3_at, 'YYYY-MM-DD HH24:MI') AS approval_3_at,
-                          r.approval_3_remark,
+                        ${SINGLE_REQUEST_STEP_SELECT_FIELDS},
                           ${
                               includeReworkFields
                                   ? SINGLE_REQUEST_REWORK_SELECT_FIELDS
@@ -1441,9 +1723,7 @@ const buildSingleRequestApprovalInboxQuery = ({
                       LEFT JOIN mat_item_group mig ON mig.id = r.material_group_id
                       LEFT JOIN mat_item_sub_group mis ON mis.id = r.material_sub_group_id
                       LEFT JOIN mst_user u ON u.user_id = r.created_by
-                      LEFT JOIN mst_user approval_1_user ON approval_1_user.user_id = r.approval_1_user_id
-                      LEFT JOIN mst_user approval_2_user ON approval_2_user.user_id = r.approval_2_user_id
-                      LEFT JOIN mst_user approval_3_user ON approval_3_user.user_id = r.approval_3_user_id
+                      ${buildSingleRequestStepLateral("r")}
                       ${
                           includeReworkFields
                               ? "LEFT JOIN mst_user rework_by ON rework_by.user_id = r.rework_by_user_id"
@@ -1502,16 +1782,7 @@ const buildSingleRequestApprovalInboxQuery = ({
                         WHERE att.request_id = r.id
                     ) attachment_rows ON TRUE
                     WHERE (
-                        COALESCE(r.approval_1_status, 'WAITING') = 'WAITING'
-                        OR (
-                            r.approval_1_status = 'APPROVED'
-                            AND COALESCE(r.approval_2_status, 'WAITING') = 'WAITING'
-                        )
-                        OR (
-                            r.approval_1_status = 'APPROVED'
-                            AND r.approval_2_status = 'APPROVED'
-                            AND COALESCE(r.approval_3_status, 'WAITING') = 'WAITING'
-                        )
+                        step_rows.active_step IS NOT NULL
                         OR UPPER(COALESCE(r.status, '')) IN ('DONE', 'REWORK', 'REJECT', 'REJECTED', 'CANCEL')
                     )
                     ORDER BY r.created_at DESC, r.id DESC`;
@@ -1531,6 +1802,55 @@ const GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_LEGACY_QUERY =
         includeEditHistory: false,
         includeReworkFields: false,
     });
+// LATERAL block (mass request): aggregate the FIRST item's step rows (all
+// items of a batch share the same plan) into `approval_steps` jsonb plus the
+// `active_step` jsonb (lowest-level row not yet APPROVED). `m` is the alias for
+// mat_mass_request. Exposes `first_item.id`/status/assigned_to alongside.
+const MASS_REQUEST_FIRST_ITEM_STEP_LATERAL = `LEFT JOIN LATERAL (
+    SELECT
+        i.id AS first_item_id,
+        i.material_description AS first_item_material_description,
+        i.base_uom AS first_item_uom,
+        i.status AS first_item_status,
+        i.assigned_to AS first_item_assigned_to,
+        COALESCE(
+            (
+                SELECT jsonb_agg(
+                    jsonb_build_object(
+                        'level', s.level,
+                        'kind', s.kind,
+                        'approver_user_id', s.approver_user_id,
+                        'approver_name', COALESCE(sau.fullname, sau.username, s.approver_user_id),
+                        'status', s.status,
+                        'claimed_at', s.claimed_at,
+                        'acted_at', s.acted_at,
+                        'remark', s.remark
+                    )
+                    ORDER BY s.level
+                )
+                FROM mat_mass_request_item_approval_step s
+                LEFT JOIN mst_user sau ON sau.user_id = s.approver_user_id
+                WHERE s.item_id = i.id
+            ),
+            '[]'::jsonb
+        ) AS approval_steps,
+        (
+            SELECT to_jsonb(active.*)
+            FROM (
+                SELECT a.level, a.kind, a.approver_user_id, a.status
+                FROM mat_mass_request_item_approval_step a
+                WHERE a.item_id = i.id
+                  AND UPPER(COALESCE(a.status, 'WAITING')) <> 'APPROVED'
+                ORDER BY a.level
+                LIMIT 1
+            ) active
+        ) AS active_step
+    FROM mat_mass_request_item i
+    WHERE i.mass_request_id = m.id
+    ORDER BY i.item_no ASC
+    LIMIT 1
+) first_item ON TRUE`;
+
 const GET_MASS_REQUESTS_BY_USER_QUERY = `SELECT
     m.id,
     m.mass_request_no,
@@ -1539,52 +1859,14 @@ const GET_MASS_REQUESTS_BY_USER_QUERY = `SELECT
     m.created_by,
     m.created_by_username,
     TO_CHAR(m.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
-    first_item.material_description AS first_item_material_description,
-    first_item.base_uom AS first_item_uom,
-    first_item.status AS first_item_status,
-    first_item.assigned_to AS first_item_assigned_to,
-    first_item.approval_1_user_id AS first_item_approval_1_user_id,
-    first_item.approval_1_status AS first_item_approval_1_status,
-    TO_CHAR(first_item.approval_1_at, 'YYYY-MM-DD HH24:MI') AS first_item_approval_1_at,
-    first_item.approval_1_remark AS first_item_approval_1_remark,
-    first_item.approval_2_user_id AS first_item_approval_2_user_id,
-    first_item.approval_2_status AS first_item_approval_2_status,
-    TO_CHAR(first_item.approval_2_at, 'YYYY-MM-DD HH24:MI') AS first_item_approval_2_at,
-    first_item.approval_2_remark AS first_item_approval_2_remark,
-    first_item.approval_3_user_id AS first_item_approval_3_user_id,
-    first_item.approval_3_status AS first_item_approval_3_status,
-    TO_CHAR(first_item.approval_3_at, 'YYYY-MM-DD HH24:MI') AS first_item_approval_3_at,
-    first_item.approval_3_remark AS first_item_approval_3_remark,
-    COALESCE(au1.fullname, au1.username, first_item.approval_1_user_id) AS first_item_approval_1_user_name,
-    COALESCE(au2.fullname, au2.username, first_item.approval_2_user_id) AS first_item_approval_2_user_name,
-    COALESCE(au3.fullname, au3.username, first_item.approval_3_user_id) AS first_item_approval_3_user_name
+    first_item.first_item_material_description,
+    first_item.first_item_uom AS first_item_uom,
+    first_item.first_item_status,
+    first_item.first_item_assigned_to,
+    COALESCE(first_item.approval_steps, '[]'::jsonb) AS approval_steps,
+    first_item.active_step
 FROM mat_mass_request m
-LEFT JOIN LATERAL (
-    SELECT
-        i.material_description,
-        i.base_uom,
-        i.status,
-        i.assigned_to,
-        i.approval_1_user_id,
-        i.approval_1_status,
-        i.approval_1_at,
-        i.approval_1_remark,
-        i.approval_2_user_id,
-        i.approval_2_status,
-        i.approval_2_at,
-        i.approval_2_remark,
-        i.approval_3_user_id,
-        i.approval_3_status,
-        i.approval_3_at,
-        i.approval_3_remark
-    FROM mat_mass_request_item i
-    WHERE i.mass_request_id = m.id
-    ORDER BY i.item_no ASC
-    LIMIT 1
-) first_item ON TRUE
-LEFT JOIN mst_user au1 ON au1.user_id = first_item.approval_1_user_id
-LEFT JOIN mst_user au2 ON au2.user_id = first_item.approval_2_user_id
-LEFT JOIN mst_user au3 ON au3.user_id = first_item.approval_3_user_id
+${MASS_REQUEST_FIRST_ITEM_STEP_LATERAL}
 WHERE m.created_by = $1
 ORDER BY m.created_at DESC, m.id DESC`;
 
@@ -1596,44 +1878,16 @@ const GET_MASS_REQUEST_APPROVAL_INBOX_QUERY = `SELECT
     m.created_by,
     m.created_by_username,
     TO_CHAR(m.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
-    first_item.status AS first_item_status,
-    first_item.assigned_to AS first_item_assigned_to,
-    first_item.approval_1_user_id AS first_item_approval_1_user_id,
-    first_item.approval_1_status AS first_item_approval_1_status,
-    TO_CHAR(first_item.approval_1_at, 'YYYY-MM-DD HH24:MI') AS first_item_approval_1_at,
-    first_item.approval_1_remark AS first_item_approval_1_remark,
-    first_item.approval_2_user_id AS first_item_approval_2_user_id,
-    first_item.approval_2_status AS first_item_approval_2_status,
-    TO_CHAR(first_item.approval_2_at, 'YYYY-MM-DD HH24:MI') AS first_item_approval_2_at,
-    first_item.approval_2_remark AS first_item_approval_2_remark,
-    first_item.approval_3_user_id AS first_item_approval_3_user_id,
-    first_item.approval_3_status AS first_item_approval_3_status,
-    TO_CHAR(first_item.approval_3_at, 'YYYY-MM-DD HH24:MI') AS first_item_approval_3_at,
-    first_item.approval_3_remark AS first_item_approval_3_remark,
-    COALESCE(au.fullname, au.username, m.created_by_username) AS first_item_approval_1_user_name
+    first_item.first_item_status,
+    first_item.first_item_assigned_to,
+    COALESCE(first_item.approval_steps, '[]'::jsonb) AS approval_steps,
+    first_item.active_step
 FROM mat_mass_request m
-LEFT JOIN LATERAL (
-    SELECT
-        i.status,
-        i.assigned_to,
-        i.approval_1_user_id,
-        i.approval_1_status,
-        i.approval_1_at,
-        i.approval_1_remark,
-        i.approval_2_user_id,
-        i.approval_2_status,
-        i.approval_2_at,
-        i.approval_2_remark,
-        i.approval_3_user_id,
-        i.approval_3_status,
-        i.approval_3_at,
-        i.approval_3_remark
-    FROM mat_mass_request_item i
-    WHERE i.mass_request_id = m.id
-    ORDER BY i.item_no ASC
-    LIMIT 1
-) first_item ON TRUE
-LEFT JOIN mst_user au ON au.user_id = first_item.approval_1_user_id
+${MASS_REQUEST_FIRST_ITEM_STEP_LATERAL}
+WHERE (
+    first_item.active_step IS NOT NULL
+    OR UPPER(COALESCE(first_item.first_item_status, '')) IN ('DONE', 'REWORK', 'REJECT', 'REJECTED', 'CANCEL')
+)
 ORDER BY m.created_at DESC, m.id DESC`;
 
 const isMissingSingleRequestEditHistoryTableError = error =>
@@ -1703,39 +1957,137 @@ const runSingleRequestApprovalInboxQuery = async client => {
     }
 };
 
+// =====================================================================
+// Dynamic-approver step engine — request-object payload + visibility (JS).
+// SQL returns each request/item's raw step rows as `approval_steps` jsonb
+// (and `active_step` jsonb). These helpers spread the public step payload
+// onto each row and apply non-admin inbox visibility through the shared
+// approvalSteps helpers, so single + mass stay in lockstep.
+// =====================================================================
+
+// Normalize the jsonb-aggregated steps (already snake-cased) into the row
+// shape buildStepsPayload/resolveActiveStep expect.
+const normalizeRowApprovalSteps = row => {
+    const raw = row && row.approval_steps;
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === "string") {
+        try {
+            const parsed = JSON.parse(raw);
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (error) {
+            return [];
+        }
+    }
+    return [];
+};
+
+// Spread the public step payload (approvalSteps, currentStage*, isFinalStage,
+// totalStages, assignedTo) onto a request/item row. assigned_to follows the
+// active step label, falling back to the header value when terminal.
+const attachStepPayloadToRow = row => {
+    if (!row || typeof row !== "object") return row;
+    const steps = normalizeRowApprovalSteps(row);
+    const payload = buildStepsPayload(steps);
+    row.approvalSteps = payload.approvalSteps;
+    row.currentStageLevel = payload.currentStageLevel;
+    row.currentStageLabel = payload.currentStageLabel;
+    row.currentStageKind = payload.currentStageKind;
+    row.isFinalStage = payload.isFinalStage;
+    row.totalStages = payload.totalStages;
+    row.assignedTo = payload.assignedTo ?? row.assigned_to ?? null;
+    return row;
+};
+
+const stepRowApproverId = step =>
+    step == null ? null : step.approver_user_id ?? step.approverUserId ?? null;
+
+const actorMatchesStep = (step, actorUserId) => {
+    const approverUserId = stepRowApproverId(step);
+    return (
+        approverUserId != null &&
+        actorUserId != null &&
+        String(approverUserId) === String(actorUserId)
+    );
+};
+
+// Non-admin inbox visibility over step rows:
+//   in-flight (active step exists) => canActorActOnStep on the active step;
+//   terminal status                => visible if the actor acted on (was the
+//                                     approver of) any step.
+const isStepRowVisibleForActor = (
+    steps,
+    { actorUserId, actorUsername, actorIsMdmMaterial }
+) => {
+    if (isAdminMaterialApprover(actorUsername)) {
+        return true;
+    }
+
+    const activeStep = resolveActiveStep(steps);
+
+    if (activeStep) {
+        return canActorActOnStep(activeStep, {
+            actorUserId,
+            actorUsername,
+            actorIsMdmMaterial,
+        });
+    }
+
+    return (Array.isArray(steps) ? steps : []).some(step =>
+        actorMatchesStep(step, actorUserId)
+    );
+};
+
+// Spread the step payload onto every row and (for non-admins) filter by
+// per-step visibility. Always returns the payload-enriched rows.
+const applyStepInboxVisibility = (
+    rows = [],
+    { actorUserId, actorUsername, actorIsMdmMaterial } = {}
+) => {
+    const isAdmin = isAdminMaterialApprover(actorUsername);
+
+    return rows
+        .map(row => {
+            const steps = normalizeRowApprovalSteps(row);
+            attachStepPayloadToRow(row);
+            return { row, steps };
+        })
+        .filter(
+            ({ steps }) =>
+                isAdmin ||
+                isStepRowVisibleForActor(steps, {
+                    actorUserId,
+                    actorUsername,
+                    actorIsMdmMaterial,
+                })
+        )
+        .map(({ row }) => row);
+};
+
+// Dynamic-approver masters: one row per requester with their ordered MANUAL
+// approver chain (mat_approvers_matrix_level) aggregated as manual_approvers.
+// The MDM (Master Data) stage is appended at runtime and never stored here.
 const GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY = `SELECT
         u.user_id AS requester_user_id,
         u.username AS requester_username,
         u.fullname AS requester_fullname,
         u.email AS requester_email,
-        a.approval_1_user_id,
-        a.approval_2_user_id,
-        a.approval_3_user_id,
-        a.approval_3_type,
-        a.approval_3_group,
-        COALESCE(au1.fullname, au1.username, a.approval_1_user_id) AS approval_1_user_name,
-        COALESCE(au2.fullname, au2.username, a.approval_2_user_id) AS approval_2_user_name,
-        COALESCE(au3.fullname, au3.username, a.approval_3_user_id) AS approval_3_user_name,
-        COALESCE(active_requests.active_request_count, 0) AS active_request_count
+        COALESCE(levels.manual_approvers, '[]'::jsonb) AS manual_approvers
     FROM mst_user u
-    LEFT JOIN mat_approvers_matrix a
-        ON a.requester_user_id = u.user_id
-    LEFT JOIN mst_user au1
-        ON au1.user_id = a.approval_1_user_id
-    LEFT JOIN mst_user au2
-        ON au2.user_id = a.approval_2_user_id
-    LEFT JOIN mst_user au3
-        ON au3.user_id = a.approval_3_user_id
-    LEFT JOIN (
-        SELECT created_by AS requester_user_id, COUNT(*) AS active_request_count
-        FROM mat_single_request
-        WHERE NOT (
-            UPPER(COALESCE(approval_3_status, '')) = 'APPROVED'
-            OR UPPER(COALESCE(status, '')) IN ('REJECT', 'REJECTED', 'CANCEL')
-        )
-        GROUP BY created_by
-    ) active_requests
-        ON active_requests.requester_user_id = u.user_id`;
+    LEFT JOIN LATERAL (
+        SELECT jsonb_agg(
+            jsonb_build_object(
+                'level', l.level,
+                'approver_user_id', l.approver_user_id,
+                'approver_name', COALESCE(au.fullname, au.username, l.approver_user_id),
+                'approver_username', au.username,
+                'approver_email', au.email
+            )
+            ORDER BY l.level
+        ) AS manual_approvers
+        FROM mat_approvers_matrix_level l
+        LEFT JOIN mst_user au ON au.user_id = l.approver_user_id
+        WHERE l.requester_user_id = u.user_id
+    ) levels ON TRUE`;
 
 function parseWildcardSearch(term) {
     if (!term || !term.includes('*')) return null;
@@ -5100,13 +5452,12 @@ const Material = {
         }
     },
 
+    // Per-request approver retarget (ADMIN). In the step model the approver for
+    // each MANUAL stage lives on that stage's step row, so this best-effort
+    // updates the matching manual step's approver_user_id while it is still
+    // WAITING. approval1UserId -> manual level 1, approval2UserId -> level 2.
     assignSingleRequestApproversByAdmin: async (payload = {}) => {
-        const {
-            requestId,
-            actorUsername,
-            approval1UserId,
-            approval2UserId,
-        } = payload;
+        const { requestId, actorUsername } = payload;
 
         try {
             if (!isAdminMaterialApprover(actorUsername)) {
@@ -5115,6 +5466,25 @@ const Material = {
                     403,
                     "SINGLE_REQUEST_APPROVER_ASSIGNMENT_FORBIDDEN"
                 );
+            }
+
+            // Map the controller payload to manual step levels (best-effort).
+            const levelAssignments = [];
+            if (
+                Object.prototype.hasOwnProperty.call(payload, "approval1UserId")
+            ) {
+                levelAssignments.push({
+                    level: 1,
+                    approverUserId: payload.approval1UserId ?? null,
+                });
+            }
+            if (
+                Object.prototype.hasOwnProperty.call(payload, "approval2UserId")
+            ) {
+                levelAssignments.push({
+                    level: 2,
+                    approverUserId: payload.approval2UserId ?? null,
+                });
             }
 
             return await DBClientWrapper(async client => {
@@ -5132,119 +5502,42 @@ const Material = {
                         );
                     assertSingleRequestAssignableStatus(snapshot);
 
-                    const patch = buildSingleRequestApproverAssignmentPatch({
-                        ...(Object.prototype.hasOwnProperty.call(
-                            payload,
-                            "approval1UserId"
-                        )
-                            ? { approval1UserId }
-                            : {}),
-                        ...(Object.prototype.hasOwnProperty.call(
-                            payload,
-                            "approval2UserId"
-                        )
-                            ? { approval2UserId }
-                            : {}),
-                    });
-                    const manualUsersById = await queryUsersWithPageAccessByIds(
-                        client,
-                        [...Object.values(patch), snapshot.approval_1_user_id, snapshot.approval_2_user_id]
-                    );
-                    const approval3Users =
-                        await queryActiveMdmMaterialUsers(client);
-                    const usersById = approval3Users.reduce(
-                        (allUsersById, user) => {
-                            allUsersById[user.user_id] = user;
-                            return allUsersById;
-                        },
-                        { ...manualUsersById }
-                    );
-
-                    let decision;
-
-                    try {
-                        decision = buildAdministratorAssignmentDecision({
-                            snapshot,
-                            patch,
-                            usersById,
-                            approval3Candidates: approval3Users.map(
-                                user => user.user_id
-                            ),
-                            randomIndex: approval3Users.length
-                                ? Math.floor(
-                                      Math.random() * approval3Users.length
-                                  )
-                                : 0,
-                        });
-                    } catch (error) {
-                        throw buildSingleRequestApprovalError(
-                            error.message,
-                            409,
-                            "SINGLE_REQUEST_APPROVER_ASSIGNMENT_CONFLICT"
-                        );
-                    }
-
-                    const approval3Status = decision.approval_3_user_id
-                        ? snapshot.approval_3_status || INITIAL_APPROVAL_STATUS
-                        : snapshot.approval_3_status;
-                    const approvalResult = await client.query(
-                        `UPDATE mat_single_request
-                        SET approval_1_user_id = $2,
-                            approval_2_user_id = $3,
-                            approval_3_user_id = $4,
-                            approval_3_status = $5,
-                            updated_at = NOW()
-                        WHERE id = $1
-                        RETURNING
-                            id AS request_id,
-                            created_by AS requester_user_id,
-                            approval_1_user_id,
-                            approval_1_status,
-                            approval_1_at,
-                            approval_1_remark,
-                            approval_2_user_id,
-                            approval_2_status,
-                            approval_2_at,
-                            approval_2_remark,
-                            approval_3_user_id,
-                            approval_3_status,
-                            approval_3_at,
-                            approval_3_remark`,
-                        [
-                            requestId,
-                            decision.approval_1_user_id,
-                            decision.approval_2_user_id,
-                            decision.approval_3_user_id,
-                            approval3Status,
-                        ]
-                    );
-
-                    if (approvalResult.rowCount !== 1) {
-                        throw buildSingleRequestApprovalError(
-                            "Single request not found",
-                            404,
-                            "SINGLE_REQUEST_NOT_FOUND"
-                        );
-                    }
-
-                    const nextAssignedTo =
-                        decision.assigned_to &&
-                        decision.assigned_to !== snapshot.assigned_to
-                            ? decision.assigned_to
-                            : snapshot.assigned_to;
-
-                    await syncSingleRequestApprovalSnapshot(
+                    const steps = await loadSingleRequestSteps(
                         client,
                         requestId,
-                        approvalResult.rows[0],
-                        nextAssignedTo
+                        { forUpdate: true }
+                    );
+
+                    for (const { level, approverUserId } of levelAssignments) {
+                        const step = steps.find(
+                            candidate =>
+                                Number(candidate.level) === Number(level) &&
+                                candidate.kind === STEP_KINDS.MANUAL
+                        );
+
+                        // Only retarget a manual stage that has not yet acted.
+                        if (
+                            !step ||
+                            normalizeStepStatus(step.status) !== "WAITING"
+                        ) {
+                            continue;
+                        }
+
+                        await updateSingleRequestStepRow(client, step.id, {
+                            approver_user_id: approverUserId,
+                        });
+                    }
+
+                    const refreshedSteps = await loadSingleRequestSteps(
+                        client,
+                        requestId
                     );
 
                     await client.query("COMMIT");
 
                     return {
-                        ...approvalResult.rows[0],
-                        assigned_to: nextAssignedTo,
+                        request_id: Number(requestId),
+                        ...buildStepsPayload(refreshedSteps),
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -5254,6 +5547,174 @@ const Material = {
         } catch (error) {
             console.error(
                 "Error assigning single request approvers by admin:",
+                error
+            );
+            throw error;
+        }
+    },
+
+    // MDM grab (single request): an active MDM_MATERIAL user atomically claims
+    // the open Master Data step. Single-winner via approver_user_id IS NULL.
+    claimSingleRequestMdmStepByUser: async ({
+        requestId,
+        actorUserId,
+        actorUsername,
+    }) => {
+        try {
+            return await DBClientWrapper(async client => {
+                await client.query("BEGIN");
+
+                try {
+                    const actorIsMdmMaterial = await isActorMdmMaterialUser(
+                        client,
+                        actorUserId
+                    );
+
+                    if (!actorIsMdmMaterial) {
+                        throw buildSingleRequestApprovalError(
+                            "Forbidden: only an active MDM_MATERIAL user can claim the Master Data step",
+                            403,
+                            "SINGLE_REQUEST_MDM_CLAIM_FORBIDDEN"
+                        );
+                    }
+
+                    const steps = await loadSingleRequestSteps(
+                        client,
+                        requestId,
+                        { forUpdate: true }
+                    );
+                    const activeStep = resolveActiveStep(steps);
+
+                    if (!activeStep || activeStep.kind !== STEP_KINDS.MDM) {
+                        throw buildSingleRequestApprovalError(
+                            "Master Data step is not currently open for this request",
+                            409,
+                            "SINGLE_REQUEST_MDM_STEP_NOT_ACTIVE"
+                        );
+                    }
+
+                    const won = await claimMdmSingleRequestStep(
+                        client,
+                        activeStep.id,
+                        actorUserId
+                    );
+
+                    if (!won) {
+                        throw buildSingleRequestApprovalError(
+                            "Master Data step has already been claimed",
+                            409,
+                            "ALREADY_CLAIMED"
+                        );
+                    }
+
+                    const refreshedSteps = await loadSingleRequestSteps(
+                        client,
+                        requestId
+                    );
+
+                    await client.query("COMMIT");
+
+                    return {
+                        request_id: Number(requestId),
+                        ...buildStepsPayload(refreshedSteps),
+                    };
+                } catch (error) {
+                    await client.query("ROLLBACK");
+                    throw error;
+                }
+            });
+        } catch (error) {
+            console.error(
+                "Error claiming single request Master Data step:",
+                error
+            );
+            throw error;
+        }
+    },
+
+    // MDM grab (mass request): claims the open Master Data step across ALL items
+    // of the batch in one UPDATE (single winner via approver_user_id IS NULL).
+    claimMassRequestMdmStepByUser: async ({
+        massRequestId,
+        actorUserId,
+        actorUsername,
+    }) => {
+        try {
+            return await DBClientWrapper(async client => {
+                await client.query("BEGIN");
+
+                try {
+                    const actorIsMdmMaterial = await isActorMdmMaterialUser(
+                        client,
+                        actorUserId
+                    );
+
+                    if (!actorIsMdmMaterial) {
+                        throw buildSingleRequestApprovalError(
+                            "Forbidden: only an active MDM_MATERIAL user can claim the Master Data step",
+                            403,
+                            "MASS_REQUEST_MDM_CLAIM_FORBIDDEN"
+                        );
+                    }
+
+                    const firstItemSteps = await loadMassItemSteps(
+                        client,
+                        massRequestId,
+                        { forUpdate: true }
+                    );
+
+                    if (firstItemSteps.length === 0) {
+                        throw buildSingleRequestApprovalError(
+                            "Mass request not found",
+                            404,
+                            "MASS_REQUEST_NOT_FOUND"
+                        );
+                    }
+
+                    const activeStep = resolveActiveStep(firstItemSteps);
+
+                    if (!activeStep || activeStep.kind !== STEP_KINDS.MDM) {
+                        throw buildSingleRequestApprovalError(
+                            "Master Data step is not currently open for this mass request",
+                            409,
+                            "MASS_REQUEST_MDM_STEP_NOT_ACTIVE"
+                        );
+                    }
+
+                    const won = await claimMdmMassItemStep(
+                        client,
+                        massRequestId,
+                        activeStep.level,
+                        actorUserId
+                    );
+
+                    if (!won) {
+                        throw buildSingleRequestApprovalError(
+                            "Master Data step has already been claimed",
+                            409,
+                            "ALREADY_CLAIMED"
+                        );
+                    }
+
+                    const refreshedSteps = await loadMassItemSteps(
+                        client,
+                        massRequestId
+                    );
+
+                    await client.query("COMMIT");
+
+                    return {
+                        mass_request_id: Number(massRequestId),
+                        ...mapMassStepRowsToPayload(refreshedSteps),
+                    };
+                } catch (error) {
+                    await client.query("ROLLBACK");
+                    throw error;
+                }
+            });
+        } catch (error) {
+            console.error(
+                "Error claiming mass request Master Data step:",
                 error
             );
             throw error;
@@ -5273,6 +5734,7 @@ const Material = {
                 await client.query("BEGIN");
 
                 try {
+                    // --- Step-based routing (dynamic approver flow) ---
                     const snapshot =
                         await getLockedSingleRequestApprovalSnapshot(
                             client,
@@ -5280,12 +5742,6 @@ const Material = {
                         );
                     const normalizedTicketType =
                         normalizeSingleRequestTicketType(snapshot.ticket_type);
-                    const activeStage =
-                        resolveSingleRequestApprovalStage(snapshot);
-                    const allowedStages =
-                        getSingleRequestAllowedApprovalStages(
-                            normalizedTicketType
-                        );
                     const safeRemark = remark ?? null;
                     const currentChangeExtendReason =
                         snapshot.change_extend_reason ?? null;
@@ -5298,7 +5754,12 @@ const Material = {
                                 MaterialTemplate.validateMaterialRequestTemplate,
                         });
 
-                    if (!allowedStages.includes(activeStage)) {
+                    const steps = await loadSingleRequestSteps(client, requestId, {
+                        forUpdate: true,
+                    });
+                    const activeStep = resolveActiveStep(steps);
+
+                    if (!activeStep) {
                         throw buildSingleRequestApprovalError(
                             "Single request is already processed or not waiting for approval",
                             409,
@@ -5306,14 +5767,14 @@ const Material = {
                         );
                     }
 
-                    const actorIsMdmMaterial =
-                        activeStage === "Approval 3"
-                            ? await isActorMdmMaterialUser(client, actorUserId)
-                            : false;
+                    const activeStepLabel = stepLabel(activeStep);
+                    const isMdmStep = activeStep.kind === STEP_KINDS.MDM;
+                    const actorIsMdmMaterial = isMdmStep
+                        ? await isActorMdmMaterialUser(client, actorUserId)
+                        : false;
 
                     if (
-                        !canActorApproveSingleRequestStage({
-                            approval: snapshot,
+                        !canActorActOnStep(activeStep, {
                             actorUserId,
                             actorUsername,
                             actorIsMdmMaterial,
@@ -5359,7 +5820,7 @@ const Material = {
                                 [
                                     snapshot.request_id,
                                     snapshot.request_no,
-                                    activeStage,
+                                    activeStepLabel,
                                     actorUserId ?? null,
                                     safeRemark,
                                     snapshot.material_group_id ?? null,
@@ -5411,243 +5872,6 @@ const Material = {
                         );
                     }
 
-                    if (activeStage === "Approval 1") {
-                        if (
-                            normalizedTicketType ===
-                            SINGLE_REQUEST_TICKET_TYPES.CHANGE
-                        ) {
-                            const requesterMasterResult = await client.query(
-                                `SELECT approval_3_user_id
-                                 FROM mat_approvers_matrix
-                                 WHERE requester_user_id = $1`,
-                                [snapshot.created_by ?? snapshot.requester_user_id]
-                            );
-                            const masterApproval3UserId =
-                                requesterMasterResult.rows[0]?.approval_3_user_id || null;
-
-                            const mdmUser =
-                                snapshot.approval_3_user_id != null || masterApproval3UserId
-                                    ? {
-                                           user_id:
-                                               masterApproval3UserId ||
-                                               snapshot.approval_3_user_id,
-                                       }
-                                    : await getRandomMdmMaterialUser(client);
-                            const approval3UserId =
-                                mdmUser?.user_id ??
-                                masterApproval3UserId ??
-                                snapshot.approval_3_user_id ??
-                                null;
-
-                            const approvalResult = await client.query(
-                                `UPDATE mat_single_request
-                                SET approval_1_user_id = COALESCE(approval_1_user_id, $2),
-                                    approval_1_at = NOW(),
-                                    approval_1_status = 'APPROVED',
-                                    approval_1_remark = $3,
-                                    approval_3_user_id = $4,
-                                    approval_3_status = 'WAITING',
-                                    updated_at = NOW()
-                                WHERE id = $1
-                                    AND COALESCE(approval_1_status, 'WAITING') = 'WAITING'
-                                RETURNING
-                                    id AS request_id,
-                                    created_by AS requester_user_id,
-                                    approval_1_user_id,
-                                    approval_1_status,
-                                    approval_1_at,
-                                    approval_1_remark,
-                                    approval_2_user_id,
-                                    approval_2_status,
-                                    approval_2_at,
-                                    approval_2_remark,
-                                    approval_3_user_id,
-                                    approval_3_status,
-                                    approval_3_at,
-                                    approval_3_remark`,
-                                [
-                                    requestId,
-                                    actorUserId,
-                                    safeRemark,
-                                    approval3UserId,
-                                ]
-                            );
-
-                            if (approvalResult.rowCount !== 1) {
-                                throw buildSingleRequestApprovalError(
-                                    "Single request is already processed or not waiting for approval",
-                                    409,
-                                    "SINGLE_REQUEST_APPROVAL_CONFLICT"
-                                );
-                            }
-
-                            await syncSingleRequestApprovalSnapshot(
-                                client,
-                                requestId,
-                                approvalResult.rows[0],
-                                "Approval 3"
-                            );
-                            await client.query("COMMIT");
-
-                            return {
-                                request_id: approvalResult.rows[0].request_id,
-                                stage: "Approval 1",
-                                next_stage: "Approval 3",
-                                approval_3_user_id:
-                                    approvalResult.rows[0]
-                                        .approval_3_user_id,
-                                approval_3_status:
-                                    approvalResult.rows[0]
-                                        .approval_3_status,
-                            };
-                        }
-
-                        const approvalResult = await client.query(
-                            `UPDATE mat_single_request
-                            SET approval_1_user_id = COALESCE(approval_1_user_id, $2),
-                                approval_1_at = NOW(),
-                                approval_1_status = 'APPROVED',
-                                approval_1_remark = $3,
-                                updated_at = NOW()
-                            WHERE id = $1
-                                AND COALESCE(approval_1_status, 'WAITING') = 'WAITING'
-                            RETURNING
-                                id AS request_id,
-                                created_by AS requester_user_id,
-                                approval_1_user_id,
-                                approval_1_status,
-                                approval_1_at,
-                                approval_1_remark,
-                                approval_2_user_id,
-                                approval_2_status,
-                                approval_2_at,
-                                approval_2_remark,
-                                approval_3_user_id,
-                                approval_3_status,
-                                approval_3_at,
-                                approval_3_remark`,
-                            [requestId, actorUserId, safeRemark]
-                        );
-
-                        if (approvalResult.rowCount !== 1) {
-                            throw buildSingleRequestApprovalError(
-                                "Single request is already processed or not waiting for approval",
-                                409,
-                                "SINGLE_REQUEST_APPROVAL_CONFLICT"
-                            );
-                        }
-
-                        await syncSingleRequestApprovalSnapshot(
-                            client,
-                            requestId,
-                            approvalResult.rows[0],
-                            "Approval 2"
-                        );
-                        await client.query("COMMIT");
-
-                        return {
-                            request_id: approvalResult.rows[0].request_id,
-                            stage: "Approval 1",
-                            next_stage: "Approval 2",
-                        };
-                    }
-
-                    if (activeStage === "Approval 2") {
-                        const requesterMasterResult = await client.query(
-                            `SELECT approval_3_user_id
-                             FROM mat_approvers_matrix
-                             WHERE requester_user_id = $1`,
-                            [snapshot.created_by ?? snapshot.requester_user_id]
-                        );
-                        const masterApproval3UserId =
-                            requesterMasterResult.rows[0]?.approval_3_user_id || null;
-
-                        let mdmUser;
-                        if (masterApproval3UserId) {
-                            mdmUser = { user_id: masterApproval3UserId };
-                        } else if (snapshot.approval_3_user_id != null) {
-                            mdmUser = { user_id: snapshot.approval_3_user_id };
-                        } else {
-                            mdmUser = await getRandomMdmMaterialUser(client);
-                        }
-
-                        if (!mdmUser) {
-                            throw buildSingleRequestApprovalError(
-                                "No active MDM_MATERIAL user found for Approval 3 assignment",
-                                409,
-                                "SINGLE_REQUEST_APPROVAL_NO_MDM_USER"
-                            );
-                        }
-
-                        const autoAssignedApproval3 =
-                            buildAutoAssignedApproval3({
-                                approval3UserId: mdmUser.user_id,
-                            });
-
-                        const approvalResult = await client.query(
-                            `UPDATE mat_single_request
-                            SET approval_2_user_id = COALESCE(approval_2_user_id, $2),
-                                approval_2_at = NOW(),
-                                approval_2_status = 'APPROVED',
-                                approval_2_remark = $3,
-                                approval_3_user_id = $4,
-                                approval_3_status = $5,
-                                updated_at = NOW()
-                            WHERE id = $1
-                                AND approval_1_status = 'APPROVED'
-                                AND COALESCE(approval_2_status, 'WAITING') = 'WAITING'
-                                AND (approval_3_status IS NULL OR approval_3_status = 'WAITING')
-                            RETURNING
-                                id AS request_id,
-                                created_by AS requester_user_id,
-                                approval_1_user_id,
-                                approval_1_status,
-                                approval_1_at,
-                                approval_1_remark,
-                                approval_2_user_id,
-                                approval_2_status,
-                                approval_2_at,
-                                approval_2_remark,
-                                approval_3_user_id,
-                                approval_3_status,
-                                approval_3_at,
-                                approval_3_remark`,
-                            [
-                                requestId,
-                                actorUserId,
-                                safeRemark,
-                                autoAssignedApproval3.approval_3_user_id,
-                                autoAssignedApproval3.approval_3_status,
-                            ]
-                        );
-
-                        if (approvalResult.rowCount !== 1) {
-                            throw buildSingleRequestApprovalError(
-                                "Single request is already processed or not waiting for approval",
-                                409,
-                                "SINGLE_REQUEST_APPROVAL_CONFLICT"
-                            );
-                        }
-
-                        await syncSingleRequestApprovalSnapshot(
-                            client,
-                            requestId,
-                            approvalResult.rows[0],
-                            autoAssignedApproval3.assigned_to
-                        );
-                        await client.query("COMMIT");
-
-                        return {
-                            request_id: approvalResult.rows[0].request_id,
-                            stage: "Approval 2",
-                            next_stage: autoAssignedApproval3.next_stage,
-                            approval_3_user_id:
-                                approvalResult.rows[0].approval_3_user_id,
-                            approval_3_status:
-                                approvalResult.rows[0].approval_3_status,
-                        };
-                    }
-
                     const nextSnapshot = {
                         ...snapshot,
                         ...editablePatch,
@@ -5658,9 +5882,11 @@ const Material = {
                     const materialCode =
                         resolveSingleRequestMaterialCode(nextSnapshot);
 
+                    // Change/Extend SAP-update only fires on the final (MDM) step.
                     if (
+                        isMdmStep &&
                         normalizedTicketType ===
-                        SINGLE_REQUEST_TICKET_TYPES.CHANGE
+                            SINGLE_REQUEST_TICKET_TYPES.CHANGE
                     ) {
                         if (!materialCode) {
                             throw buildSingleRequestApprovalError(
@@ -5697,10 +5923,11 @@ const Material = {
                         }
                     }
 
-                        if (
-                            normalizedTicketType ===
+                    if (
+                        isMdmStep &&
+                        normalizedTicketType ===
                             SINGLE_REQUEST_TICKET_TYPES.EXTEND
-                        ) {
+                    ) {
                         if (!materialCode) {
                             throw buildSingleRequestApprovalError(
                                 "Material code is required for Extend requests",
@@ -5716,75 +5943,76 @@ const Material = {
                             [materialCode]
                         );
 
-                            if (materialExistsResult.rowCount !== 1) {
-                                throw buildSingleRequestApprovalError(
-                                    "Extend request material code was not found",
-                                    404,
-                                    "SINGLE_REQUEST_EXTEND_MATERIAL_CODE_NOT_FOUND"
-                                );
-                            }
-
-                            const selectedPlantCode = String(
-                                nextSnapshot.plant_code || ""
-                            ).trim();
-                            const selectedStorageLocation = String(
-                                nextSnapshot.sloc_code || ""
-                            ).trim();
-
-                            if (!selectedPlantCode || !selectedStorageLocation) {
-                                throw buildSingleRequestApprovalError(
-                                    "Plant and storage location are required",
-                                    400,
-                                    "SINGLE_REQUEST_EXTEND_LOCATION_REQUIRED"
-                                );
-                            }
-
-                            const locations = await Material.getLocationAndPlant();
-                            const hasMatchingLocation = locations.some(
-                                location =>
-                                    String(location.plant_code || "").trim() ===
-                                        selectedPlantCode &&
-                                    String(
-                                        location.storage_location || ""
-                                    ).trim() === selectedStorageLocation
+                        if (materialExistsResult.rowCount !== 1) {
+                            throw buildSingleRequestApprovalError(
+                                "Extend request material code was not found",
+                                404,
+                                "SINGLE_REQUEST_EXTEND_MATERIAL_CODE_NOT_FOUND"
                             );
-
-                            if (!hasMatchingLocation) {
-                                throw buildSingleRequestApprovalError(
-                                    "Selected plant and storage location were not found",
-                                    400,
-                                    "SINGLE_REQUEST_EXTEND_LOCATION_NOT_FOUND"
-                                );
-                            }
-
-                            const sapExtendUpdateResult = await client.query(
-                                `UPDATE mat_sap_data
-                                 SET plant_code = $1,
-                                     sloc_code = $2,
-                                     updated_at = NOW(),
-                                     updated_by = $3
-                                 WHERE code = $4
-                                   AND (dffromclient IS NULL OR dffromclient = false)`,
-                                [
-                                    selectedPlantCode,
-                                    selectedStorageLocation,
-                                    actorUserId ?? null,
-                                    materialCode,
-                                ]
-                            );
-
-                            if (sapExtendUpdateResult.rowCount !== 1) {
-                                throw buildSingleRequestApprovalError(
-                                    "Extend request material code must match exactly one material",
-                                    409,
-                                    "SINGLE_REQUEST_EXTEND_MATERIAL_CODE_CONFLICT"
-                                );
-                            }
                         }
 
+                        const selectedPlantCode = String(
+                            nextSnapshot.plant_code || ""
+                        ).trim();
+                        const selectedStorageLocation = String(
+                            nextSnapshot.sloc_code || ""
+                        ).trim();
+
+                        if (!selectedPlantCode || !selectedStorageLocation) {
+                            throw buildSingleRequestApprovalError(
+                                "Plant and storage location are required",
+                                400,
+                                "SINGLE_REQUEST_EXTEND_LOCATION_REQUIRED"
+                            );
+                        }
+
+                        const locations = await Material.getLocationAndPlant();
+                        const hasMatchingLocation = locations.some(
+                            location =>
+                                String(location.plant_code || "").trim() ===
+                                    selectedPlantCode &&
+                                String(
+                                    location.storage_location || ""
+                                ).trim() === selectedStorageLocation
+                        );
+
+                        if (!hasMatchingLocation) {
+                            throw buildSingleRequestApprovalError(
+                                "Selected plant and storage location were not found",
+                                400,
+                                "SINGLE_REQUEST_EXTEND_LOCATION_NOT_FOUND"
+                            );
+                        }
+
+                        const sapExtendUpdateResult = await client.query(
+                            `UPDATE mat_sap_data
+                             SET plant_code = $1,
+                                 sloc_code = $2,
+                                 updated_at = NOW(),
+                                 updated_by = $3
+                             WHERE code = $4
+                               AND (dffromclient IS NULL OR dffromclient = false)`,
+                            [
+                                selectedPlantCode,
+                                selectedStorageLocation,
+                                actorUserId ?? null,
+                                materialCode,
+                            ]
+                        );
+
+                        if (sapExtendUpdateResult.rowCount !== 1) {
+                            throw buildSingleRequestApprovalError(
+                                "Extend request material code must match exactly one material",
+                                409,
+                                "SINGLE_REQUEST_EXTEND_MATERIAL_CODE_CONFLICT"
+                            );
+                        }
+                    }
+
+                    // Final-code generation: only when the active step is MDM
+                    // (last) AND this is a Create ticket.
                     const finalCode =
-                        activeStage === "Approval 3" &&
-                        normalizedTicketType === "Create"
+                        isMdmStep && normalizedTicketType === "Create"
                             ? buildSingleRequestFinalCode({
                                   materialGroupCode:
                                       nextSnapshot.material_group_code,
@@ -5794,26 +6022,52 @@ const Material = {
                               })
                             : null;
 
-                    const patch = buildSingleRequestFinalApprovalPatch({
-                        stage: activeStage,
-                        actorUserId,
+                    // Advance: mark the active step APPROVED. For MANUAL the
+                    // approver is already fixed; for MDM, set the approver to the
+                    // claimer (COALESCE keeps the existing claim if present).
+                    const approvePatch = buildStepApprovePatch({
                         remark: safeRemark,
-                        finalCode,
+                    });
+                    await updateSingleRequestStepRow(client, activeStep.id, {
+                        ...approvePatch.step,
+                        approver_user_id:
+                            activeStep.approver_user_id ?? actorUserId ?? null,
                     });
 
-                    const fieldPrefix = getApprovalStageFieldPrefix(activeStage);
-                    if (snapshot[`${fieldPrefix}_user_id`] != null) {
-                        delete patch[`${fieldPrefix}_user_id`];
+                    // Recompute the next active step from the post-approval state.
+                    const nextSteps = steps.map(step =>
+                        step.id === activeStep.id
+                            ? { ...step, status: "APPROVED" }
+                            : step
+                    );
+                    const nextActive = resolveActiveStep(nextSteps);
+                    // When the just-approved step was MANUAL and the next active
+                    // step is MDM, no auto-assignment is needed — the MDM row
+                    // already exists unclaimed (approver_user_id NULL) and becomes
+                    // visible to the open queue automatically.
+
+                    const headerPatch = {
+                        assigned_to: nextActive
+                            ? stepLabel(nextActive)
+                            : "Completed",
+                        status: nextActive ? "Submit" : "DONE",
+                    };
+                    if (finalCode) {
+                        headerPatch.final_code = finalCode;
                     }
 
-                    await updateSingleRequestColumns(client, requestId, patch);
+                    await updateSingleRequestColumns(
+                        client,
+                        requestId,
+                        headerPatch
+                    );
                     await client.query("COMMIT");
 
                     return {
                         request_id: Number(requestId),
-                        stage: "Approval 3",
-                        status: "Done",
-                        assigned_to: "Completed",
+                        stage: activeStepLabel,
+                        status: headerPatch.status,
+                        assigned_to: headerPatch.assigned_to,
                         final_code: finalCode,
                     };
                 } catch (error) {
@@ -5896,20 +6150,13 @@ const Material = {
                     });
                     const normalizedTicketType =
                         normalizeSingleRequestTicketType(ticketType);
-                    const requesterMasterResult = await client.query(
-                        `SELECT approval_1_user_id, approval_2_user_id, approval_3_user_id
-                         FROM mat_approvers_matrix
-                         WHERE requester_user_id = $1`,
-                        [createdBy]
-                    );
-                    const requesterMaster = requesterMasterResult.rows[0] || null;
-                    const approval3UserId = requesterMaster?.approval_3_user_id || null;
-                    const snapshot = buildSingleRequestApprovalSnapshot({
+                    // New dynamic-approver flow: freeze the manual approver chain
+                    // from mat_approvers_matrix_level and build the ordered step
+                    // plan (1..N manual + MDM last, with skips by ticket type).
+                    const chain = await loadRequesterChain(client, createdBy);
+                    const plan = buildApprovalStepPlan({
                         ticketType: normalizedTicketType,
-                        requesterUserId: createdBy,
-                        requesterUsername: createdByUsername,
-                        approvalMaster: requesterMaster,
-                        approval3UserId,
+                        chain,
                     });
 
                     const insertResult = await client.query(
@@ -5932,15 +6179,9 @@ const Material = {
                             assigned_to,
                             created_by,
                             created_at,
-                            updated_at,
-                            approval_1_user_id,
-                            approval_1_status,
-                            approval_2_user_id,
-                            approval_2_status,
-                            approval_3_user_id,
-                            approval_3_status
+                            updated_at
                         ) VALUES (
-                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'Submit', $15, $16, NOW(), NOW(), $17, $18, $19, $20, $21, $22
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'Submit', $15, $16, NOW(), NOW()
                         )
                         RETURNING id, request_no, ticket_type, change_extend_reason, material_description, base_uom, status, assigned_to, created_by, created_at`,
                         [
@@ -5960,17 +6201,15 @@ const Material = {
                             normalizedPersistedRequestFields.long_text_2 || null,
                             normalizedPersistedRequestFields.long_text_3 || null,
                             payload,
-                            resolveCreateSingleRequestAssignedTo(
-                                normalizedTicketType
-                            ),
+                            stepLabel(plan[0]),
                             createdBy,
-                            snapshot.approval_1_user_id,
-                            snapshot.approval_1_status,
-                            snapshot.approval_2_user_id,
-                            snapshot.approval_2_status,
-                            snapshot.approval_3_user_id,
-                            snapshot.approval_3_status,
                         ]
+                    );
+
+                    await insertSingleRequestApprovalSteps(
+                        client,
+                        nextId,
+                        plan
                     );
 
                     const createdAt =
@@ -6035,7 +6274,7 @@ const Material = {
                         ...insertResult.rows[0],
                         material_code: storedMaterialCode,
                         attachments: persistedAttachments,
-                        approval: snapshot,
+                        approvalSteps: plan,
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -6076,16 +6315,17 @@ const Material = {
                         2000000000 + Number(nextMassId)
                     );
 
-                    const requesterMasterResult = await client.query(
-                        `SELECT approval_1_user_id, approval_2_user_id, approval_3_user_id
-                         FROM mat_approvers_matrix
-                         WHERE requester_user_id = $1`,
-                        [createdBy]
+                    // Mass requests are always CREATE — freeze the manual chain
+                    // once and reuse the same plan for every item.
+                    const massChain = await loadRequesterChain(
+                        client,
+                        createdBy
                     );
-                    const approvalMaster =
-                        requesterMasterResult.rows[0] || null;
-                    const massApproval3UserId =
-                        approvalMaster?.approval_3_user_id || null;
+                    const massPlan = buildApprovalStepPlan({
+                        ticketType: "Create",
+                        chain: massChain,
+                    });
+                    const massFirstStepLabel = stepLabel(massPlan[0]);
 
                     const massHeaderResult = await client.query(
                         `INSERT INTO mat_mass_request (
@@ -6126,14 +6366,6 @@ const Material = {
                         );
                         const itemNo = itemIndex + 1;
 
-                        const snapshot = buildSingleRequestApprovalSnapshot({
-                            ticketType: "Create",
-                            requesterUserId: createdBy,
-                            requesterUsername: createdByUsername,
-                            approvalMaster,
-                            approval3UserId: massApproval3UserId,
-                        });
-
                         const itemResult = await client.query(
                             `INSERT INTO mat_mass_request_item (
                                 id,
@@ -6153,17 +6385,10 @@ const Material = {
                                 assigned_to,
                                 created_by,
                                 created_at,
-                                updated_at,
-                                approval_1_user_id,
-                                approval_1_status,
-                                approval_2_user_id,
-                                approval_2_status,
-                                approval_3_user_id,
-                                approval_3_status
+                                updated_at
                             ) VALUES (
                                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                                'Submit', 'Approval 1', $14, NOW(), NOW(),
-                                $15, $16, $17, $18, $19, $20
+                                'Submit', $14, $15, NOW(), NOW()
                             )
                             RETURNING id, item_no, request_no, ticket_type, status, assigned_to, created_by, created_at`,
                             [
@@ -6183,14 +6408,15 @@ const Material = {
                                 String(row.uom || "").trim(),
                                 String(row.spesifikasiTambahan || "").trim() ||
                                     null,
+                                massFirstStepLabel,
                                 createdBy,
-                                snapshot.approval_1_user_id,
-                                snapshot.approval_1_status,
-                                snapshot.approval_2_user_id,
-                                snapshot.approval_2_status,
-                                snapshot.approval_3_user_id,
-                                snapshot.approval_3_status,
                             ]
+                        );
+
+                        await insertMassItemApprovalSteps(
+                            client,
+                            nextItemId,
+                            massPlan
                         );
 
                         const itemRow = itemResult.rows[0];
@@ -6287,7 +6513,7 @@ const Material = {
                     [createdBy]
                 );
 
-                return result.rows;
+                return result.rows.map(attachStepPayloadToRow);
             });
         } catch (error) {
             console.error("Error fetching mass requests by user:", error);
@@ -6330,7 +6556,7 @@ const Material = {
                     [createdBy]
                 );
 
-                return result.rows;
+                return result.rows.map(attachStepPayloadToRow);
             });
         } catch (error) {
             console.error("Error fetching single requests by user:", error);
@@ -6346,7 +6572,9 @@ const Material = {
                     "r.id = $1",
                     [requestId]
                 );
-                const row = result.rows[0];
+                const row = result.rows[0]
+                    ? attachStepPayloadToRow(result.rows[0])
+                    : undefined;
 
                 if (!row) {
                     throw buildSingleRequestApprovalError(
@@ -6380,10 +6608,15 @@ const Material = {
         try {
             return await DBClientWrapper(async client => {
                 const result = await runSingleRequestApprovalInboxQuery(client);
+                const actorIsMdmMaterial = await isActorMdmMaterialUser(
+                    client,
+                    actorUserId
+                );
 
-                return filterSingleRequestApprovalInboxRows(result.rows, {
+                return applyStepInboxVisibility(result.rows, {
                     actorUserId,
                     actorUsername,
+                    actorIsMdmMaterial,
                 });
             });
         } catch (error) {
@@ -6411,8 +6644,6 @@ const Material = {
                             client,
                             requestId
                         );
-                    const activeStage =
-                        resolveSingleRequestApprovalStage(snapshot);
 
                     if (!isSubmittedSingleRequestStatus(snapshot.status)) {
                         throw buildSingleRequestApprovalError(
@@ -6422,7 +6653,14 @@ const Material = {
                         );
                     }
 
-                    if (!activeStage) {
+                    const steps = await loadSingleRequestSteps(
+                        client,
+                        requestId,
+                        { forUpdate: true }
+                    );
+                    const activeStep = resolveActiveStep(steps);
+
+                    if (!activeStep) {
                         throw buildSingleRequestApprovalError(
                             "Single request is already processed or not waiting for approval",
                             409,
@@ -6430,11 +6668,16 @@ const Material = {
                         );
                     }
 
+                    const actorIsMdmMaterial =
+                        activeStep.kind === STEP_KINDS.MDM
+                            ? await isActorMdmMaterialUser(client, actorUserId)
+                            : false;
+
                     if (
-                        !canActorApproveSingleRequestStage({
-                            approval: snapshot,
+                        !canActorActOnStep(activeStep, {
                             actorUserId,
                             actorUsername,
+                            actorIsMdmMaterial,
                         })
                     ) {
                         throw buildSingleRequestApprovalError(
@@ -6444,24 +6687,26 @@ const Material = {
                         );
                     }
 
-                    const patch = buildSingleRequestReworkPatch({
-                        reworkStage: activeStage,
-                        actorUserId,
+                    const reworkPatch = buildStepReworkPatch({
+                        activeStep,
                         reason,
                     });
 
-                    const fieldPrefix = getApprovalStageFieldPrefix(activeStage);
-                    if (snapshot[`${fieldPrefix}_user_id`] == null) {
-                        patch[`${fieldPrefix}_user_id`] = actorUserId;
-                    }
-
-                    await updateSingleRequestColumns(client, requestId, patch);
+                    await updateSingleRequestStepRow(client, activeStep.id, {
+                        ...reworkPatch.step,
+                        approver_user_id:
+                            activeStep.approver_user_id ?? actorUserId ?? null,
+                    });
+                    await updateSingleRequestColumns(client, requestId, {
+                        ...reworkPatch.header,
+                        rework_by_user_id: actorUserId ?? null,
+                    });
                     await client.query("COMMIT");
 
                     return {
                         request_id: Number(requestId),
-                        stage: activeStage,
-                        status: patch.status,
+                        stage: stepLabel(activeStep),
+                        status: reworkPatch.header.status,
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -6490,8 +6735,6 @@ const Material = {
                             client,
                             requestId
                         );
-                    const activeStage =
-                        resolveSingleRequestApprovalStage(snapshot);
 
                     if (!isSubmittedSingleRequestStatus(snapshot.status)) {
                         throw buildSingleRequestApprovalError(
@@ -6501,7 +6744,14 @@ const Material = {
                         );
                     }
 
-                    if (!activeStage) {
+                    const steps = await loadSingleRequestSteps(
+                        client,
+                        requestId,
+                        { forUpdate: true }
+                    );
+                    const activeStep = resolveActiveStep(steps);
+
+                    if (!activeStep) {
                         throw buildSingleRequestApprovalError(
                             "Single request is already processed or not waiting for approval",
                             409,
@@ -6509,11 +6759,16 @@ const Material = {
                         );
                     }
 
+                    const actorIsMdmMaterial =
+                        activeStep.kind === STEP_KINDS.MDM
+                            ? await isActorMdmMaterialUser(client, actorUserId)
+                            : false;
+
                     if (
-                        !canActorApproveSingleRequestStage({
-                            approval: snapshot,
+                        !canActorActOnStep(activeStep, {
                             actorUserId,
                             actorUsername,
+                            actorIsMdmMaterial,
                         })
                     ) {
                         throw buildSingleRequestApprovalError(
@@ -6523,23 +6778,27 @@ const Material = {
                         );
                     }
 
-                    const patch = buildSingleRequestRejectPatch({
-                        rejectStage: activeStage,
+                    const rejectPatch = buildStepRejectPatch({
+                        activeStep,
                         reason,
                     });
 
-                    const fieldPrefix = getApprovalStageFieldPrefix(activeStage);
-                    if (snapshot[`${fieldPrefix}_user_id`] == null) {
-                        patch[`${fieldPrefix}_user_id`] = actorUserId;
-                    }
-
-                    await updateSingleRequestColumns(client, requestId, patch);
+                    await updateSingleRequestStepRow(client, activeStep.id, {
+                        ...rejectPatch.step,
+                        approver_user_id:
+                            activeStep.approver_user_id ?? actorUserId ?? null,
+                    });
+                    await updateSingleRequestColumns(
+                        client,
+                        requestId,
+                        rejectPatch.header
+                    );
                     await client.query("COMMIT");
 
                     return {
                         request_id: Number(requestId),
-                        stage: activeStage,
-                        status: patch.status,
+                        stage: stepLabel(activeStep),
+                        status: rejectPatch.header.status,
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -6614,9 +6873,30 @@ const Material = {
                             validateMaterialRequestTemplate:
                                 MaterialTemplate.validateMaterialRequestTemplate,
                         });
-                    const revisedPatch = buildSingleRequestRevisedPatch(
+                    // Step model: resolve the reworked step by its stored label
+                    // and reset it to WAITING so the same stage re-opens.
+                    const reworkSteps = await loadSingleRequestSteps(
+                        client,
+                        requestId,
+                        { forUpdate: true }
+                    );
+                    const reworkStep = findStepByLabel(
+                        reworkSteps,
                         snapshot.rework_stage
                     );
+
+                    if (!reworkStep) {
+                        throw buildSingleRequestApprovalError(
+                            "Single request rework stage is missing",
+                            409,
+                            "SINGLE_REQUEST_REWORK_STAGE_MISSING"
+                        );
+                    }
+
+                    const revisedPatch = {
+                        status: "Submit",
+                        assigned_to: stepLabel(reworkStep),
+                    };
                     const attachmentInstructions = Array.isArray(attachments)
                         ? { newAttachments: attachments }
                         : attachments &&
@@ -6743,6 +7023,13 @@ const Material = {
                         }
                     }
 
+                    // Reopen the reworked step (WAITING) and clear its action.
+                    await updateSingleRequestStepRow(client, reworkStep.id, {
+                        status: "WAITING",
+                        acted_at: null,
+                        remark: null,
+                    });
+
                     await updateSingleRequestColumns(client, requestId, {
                         ...editablePatch,
                         ...revisedPatch,
@@ -6860,21 +7147,28 @@ const Material = {
     getAdministratorApproverMasters: async ({ page, limit, search } = {}) => {
         return DBClientWrapper(async client => {
             const result = await client.query(GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY);
-            let rows = result.rows.map(row => ({
-                requester_user_id: row.requester_user_id,
-                requester_username: row.requester_username,
-                requester_fullname: row.requester_fullname,
-                requester_email: row.requester_email,
-                approval_1_user_id: row.approval_1_user_id,
-                approval_1_user_name: row.approval_1_user_name,
-                approval_2_user_id: row.approval_2_user_id,
-                approval_2_user_name: row.approval_2_user_name,
-                approval_3_user_id: row.approval_3_user_id,
-                approval_3_user_name: row.approval_3_user_name,
-                approval_3_type: row.approval_3_type || "SYSTEM",
-                approval_3_group: row.approval_3_group || MDM_MATERIAL_GROUP_NAME,
-                is_locked: false,
-            }));
+            let rows = result.rows.map(row => {
+                const rawManualApprovers = Array.isArray(row.manual_approvers)
+                    ? row.manual_approvers
+                    : typeof row.manual_approvers === "string"
+                      ? JSON.parse(row.manual_approvers || "[]")
+                      : [];
+
+                return {
+                    requester_user_id: row.requester_user_id,
+                    requester_username: row.requester_username,
+                    requester_fullname: row.requester_fullname,
+                    requester_email: row.requester_email,
+                    manualApprovers: rawManualApprovers.map(entry => ({
+                        level: entry.level,
+                        approverUserId: entry.approver_user_id,
+                        approverName: entry.approver_name,
+                        approverUsername: entry.approver_username,
+                        approverEmail: entry.approver_email,
+                    })),
+                    is_locked: false,
+                };
+            });
 
             // Optional backend search across requester name / username / email.
             const term = typeof search === "string" ? search.trim().toLowerCase() : "";
@@ -6910,6 +7204,80 @@ const Material = {
                     ? { page: pageNum, limit: limitNum, totalPages: Math.ceil(total / limitNum) }
                     : {}),
             };
+        });
+    },
+
+    // --- Dynamic approver chain (mat_approvers_matrix_level) ---
+    // Ordered MANUAL approver levels per requester. The Master Data (MDM) stage is
+    // appended at runtime as the final stage and never stored here.
+    getRequesterApproverChain: async requesterUserId =>
+        DBClientWrapper(async client => {
+            const result = await client.query(
+                `SELECT l.level,
+                        l.approver_user_id,
+                        COALESCE(au.fullname, au.username, l.approver_user_id) AS approver_name,
+                        au.username AS approver_username,
+                        au.email AS approver_email
+                   FROM mat_approvers_matrix_level l
+                   LEFT JOIN mst_user au ON au.user_id = l.approver_user_id
+                  WHERE l.requester_user_id = $1
+                  ORDER BY l.level`,
+                [requesterUserId]
+            );
+            return result.rows.map(row => ({
+                level: row.level,
+                approverUserId: row.approver_user_id,
+                approverName: row.approver_name,
+                approverUsername: row.approver_username,
+                approverEmail: row.approver_email,
+            }));
+        }),
+
+    // Whole-list save of a requester's ordered manual chain (levels renumbered 1..N).
+    saveRequesterApproverChain: async ({
+        requesterUserId,
+        manualApproverIds = [],
+        actorUsername = null,
+    }) => {
+        const ids = (Array.isArray(manualApproverIds) ? manualApproverIds : [])
+            .map(value => (value == null ? "" : String(value).trim()))
+            .filter(Boolean);
+        if (!requesterUserId) {
+            const error = new Error("requesterUserId is required.");
+            error.statusCode = 400;
+            throw error;
+        }
+        if (ids.length < 1) {
+            const error = new Error("At least one manual approver is required.");
+            error.statusCode = 400;
+            throw error;
+        }
+        if (new Set(ids).size !== ids.length) {
+            const error = new Error("Approvers must be distinct.");
+            error.statusCode = 400;
+            throw error;
+        }
+        return DBClientWrapper(async client => {
+            try {
+                await client.query("BEGIN");
+                await client.query(
+                    `DELETE FROM mat_approvers_matrix_level WHERE requester_user_id = $1`,
+                    [requesterUserId]
+                );
+                for (let index = 0; index < ids.length; index += 1) {
+                    await client.query(
+                        `INSERT INTO mat_approvers_matrix_level
+                             (requester_user_id, level, approver_user_id, created_by, updated_by)
+                         VALUES ($1, $2, $3, $4, $4)`,
+                        [requesterUserId, index + 1, ids[index], actorUsername]
+                    );
+                }
+                await client.query("COMMIT");
+            } catch (error) {
+                await client.query("ROLLBACK");
+                throw error;
+            }
+            return Material.getRequesterApproverChain(requesterUserId);
         });
     },
 
@@ -7204,10 +7572,15 @@ const Material = {
                 const result = await client.query(
                     GET_MASS_REQUEST_APPROVAL_INBOX_QUERY
                 );
+                const actorIsMdmMaterial = await isActorMdmMaterialUser(
+                    client,
+                    actorUserId
+                );
 
-                return filterMassRequestApprovalInboxRows(result.rows, {
+                return applyStepInboxVisibility(result.rows, {
                     actorUserId,
                     actorUsername,
+                    actorIsMdmMaterial,
                 });
             });
         } catch (error) {
@@ -7231,9 +7604,9 @@ const Material = {
                 await client.query("BEGIN");
 
                 try {
-                    // Lock and read the first item of the batch to validate stage
+                    // Lock and read the first item of the batch to validate status.
                     const lockResult = await client.query(
-                        `SELECT i.*
+                        `SELECT i.id, i.status
                          FROM mat_mass_request_item i
                          WHERE i.mass_request_id = $1
                          ORDER BY i.item_no ASC
@@ -7251,27 +7624,6 @@ const Material = {
 
                     const firstItem = lockResult.rows[0];
 
-                    // Map to inbox row shape for helpers
-                    const approvalRow = {
-                        first_item_status: firstItem.status,
-                        first_item_assigned_to: firstItem.assigned_to,
-                        first_item_approval_1_user_id:
-                            firstItem.approval_1_user_id,
-                        first_item_approval_1_status:
-                            firstItem.approval_1_status,
-                        first_item_approval_2_user_id:
-                            firstItem.approval_2_user_id,
-                        first_item_approval_2_status:
-                            firstItem.approval_2_status,
-                        first_item_approval_3_user_id:
-                            firstItem.approval_3_user_id,
-                        first_item_approval_3_status:
-                            firstItem.approval_3_status,
-                    };
-
-                    const activeStage =
-                        resolveMassRequestApprovalStage(approvalRow);
-
                     if (
                         String(firstItem.status || "")
                             .trim()
@@ -7288,7 +7640,16 @@ const Material = {
                         );
                     }
 
-                    if (!activeStage) {
+                    // Step model: all items share the plan, so route off the
+                    // first item's steps and apply the change to every item.
+                    const firstItemSteps = await loadMassItemSteps(
+                        client,
+                        massRequestId,
+                        { forUpdate: true }
+                    );
+                    const activeStep = resolveActiveStep(firstItemSteps);
+
+                    if (!activeStep) {
                         throw Object.assign(
                             new Error(
                                 "Mass request is already processed or not waiting for approval"
@@ -7300,11 +7661,17 @@ const Material = {
                         );
                     }
 
+                    const activeStepLabel = stepLabel(activeStep);
+                    const actorIsMdmMaterial =
+                        activeStep.kind === STEP_KINDS.MDM
+                            ? await isActorMdmMaterialUser(client, actorUserId)
+                            : false;
+
                     if (
-                        !canActorApproveMassRequestStage({
-                            row: approvalRow,
+                        !canActorActOnStep(activeStep, {
                             actorUserId,
                             actorUsername,
+                            actorIsMdmMaterial,
                         })
                     ) {
                         throw Object.assign(
@@ -7317,88 +7684,6 @@ const Material = {
                             }
                         );
                     }
-
-                    const patch = buildMassRequestApprovePatch({
-                        activeStage,
-                        actorUserId,
-                        actorUsername,
-                        remark,
-                    });
-
-                    // Approval 2 → 3: auto-assign a random MDM_MATERIAL user
-                    if (activeStage === "Approval 2") {
-                        const mdmUser = await getRandomMdmMaterialUser(client);
-
-                        if (!mdmUser) {
-                            throw Object.assign(
-                                new Error(
-                                    "No active MDM_MATERIAL user found for Approval 3 assignment"
-                                ),
-                                {
-                                    statusCode: 409,
-                                    code: "MASS_REQUEST_APPROVAL_NO_MDM_USER",
-                                }
-                            );
-                        }
-
-                        patch.approval_3_user_id = mdmUser.user_id;
-                    }
-
-                    const fieldPrefix = getApprovalStageFieldPrefix(activeStage);
-
-                    // Build SET clause from patch, excluding __sql objects which are handled inline
-                    const patchEntries = Object.entries(patch).filter(
-                        ([_, v]) => !(v && typeof v === "object" && v.__sql)
-                    );
-                    const setClauses = patchEntries.map(
-                        ([field], i) => `${field} = $${i + 2}`
-                    );
-                    // Add __sql fields (NOW()) directly
-                    const nowFields = Object.entries(patch).filter(
-                        ([_, v]) => v && typeof v === "object" && v.__sql
-                    );
-                    const nowClauses = nowFields.map(
-                        ([field]) => `${field} = NOW()`
-                    );
-
-                    // Always set user_id with COALESCE and updated_at
-                    const allSetClauses = [
-                        ...setClauses,
-                        ...nowClauses,
-                        `${fieldPrefix}_user_id = COALESCE(${fieldPrefix}_user_id, $${
-                            patchEntries.length + 2
-                        })`,
-                        `updated_at = NOW()`,
-                    ];
-
-                    const updateQuery = `UPDATE mat_mass_request_item
-                        SET ${allSetClauses.join(", ")}
-                        WHERE mass_request_id = $1
-                        RETURNING id`;
-
-                    const updateParams = [
-                        massRequestId,
-                        ...patchEntries.map(([_, v]) => v),
-                        actorUserId,
-                    ];
-
-                    const updateResult = await client.query(
-                        updateQuery,
-                        updateParams
-                    );
-
-                    if (updateResult.rowCount === 0) {
-                        throw Object.assign(
-                            new Error(
-                                "Mass request is already processed or not waiting for approval"
-                            ),
-                            {
-                                statusCode: 409,
-                                code: "MASS_REQUEST_APPROVAL_CONFLICT",
-                            }
-                        );
-                    }
-
 
                     // If item edits are provided, update editable fields per item
                     if (Array.isArray(items) && items.length > 0) {
@@ -7442,13 +7727,58 @@ const Material = {
                             );
                         }
                     }
+
+                    // Mark this stage APPROVED on the matching step row of EVERY
+                    // item. For MDM, record the approver (claimer or this actor).
+                    const approvePatch = buildMassStepApprovePatch({ remark });
+                    await updateMassItemStepRowsByLevel(
+                        client,
+                        massRequestId,
+                        activeStep.level,
+                        approvePatch.step
+                    );
+                    if (activeStep.kind === STEP_KINDS.MDM) {
+                        await client.query(
+                            `UPDATE mat_mass_request_item_approval_step s
+                             SET approver_user_id = COALESCE(s.approver_user_id, $3),
+                                 updated_at = NOW()
+                             FROM mat_mass_request_item i
+                             WHERE s.item_id = i.id
+                               AND i.mass_request_id = $1
+                               AND s.level = $2`,
+                            [massRequestId, activeStep.level, actorUserId ?? null]
+                        );
+                    }
+
+                    // Recompute the next active step from the post-approval state.
+                    const nextSteps = firstItemSteps.map(step =>
+                        step.id === activeStep.id
+                            ? { ...step, status: "APPROVED" }
+                            : step
+                    );
+                    const nextActive = resolveActiveStep(nextSteps);
+                    const headerStatus = nextActive ? "Submit" : "DONE";
+                    const headerAssignedTo = nextActive
+                        ? stepLabel(nextActive)
+                        : "Completed";
+
+                    const updateResult = await client.query(
+                        `UPDATE mat_mass_request_item
+                         SET status = $2,
+                             assigned_to = $3,
+                             updated_at = NOW()
+                         WHERE mass_request_id = $1
+                         RETURNING id`,
+                        [massRequestId, headerStatus, headerAssignedTo]
+                    );
+
                     await client.query("COMMIT");
 
                     return {
                         mass_request_id: Number(massRequestId),
-                        stage: activeStage,
-                        status: patch.status,
-                        assigned_to: patch.assigned_to,
+                        stage: activeStepLabel,
+                        status: headerStatus,
+                        assigned_to: headerAssignedTo,
                         updated_count: updateResult.rowCount,
                     };
                 } catch (error) {
@@ -7474,7 +7804,7 @@ const Material = {
 
                 try {
                     const lockResult = await client.query(
-                        `SELECT i.*
+                        `SELECT i.id, i.status
                          FROM mat_mass_request_item i
                          WHERE i.mass_request_id = $1
                          ORDER BY i.item_no ASC
@@ -7492,26 +7822,6 @@ const Material = {
 
                     const firstItem = lockResult.rows[0];
 
-                    const approvalRow = {
-                        first_item_status: firstItem.status,
-                        first_item_assigned_to: firstItem.assigned_to,
-                        first_item_approval_1_user_id:
-                            firstItem.approval_1_user_id,
-                        first_item_approval_1_status:
-                            firstItem.approval_1_status,
-                        first_item_approval_2_user_id:
-                            firstItem.approval_2_user_id,
-                        first_item_approval_2_status:
-                            firstItem.approval_2_status,
-                        first_item_approval_3_user_id:
-                            firstItem.approval_3_user_id,
-                        first_item_approval_3_status:
-                            firstItem.approval_3_status,
-                    };
-
-                    const activeStage =
-                        resolveMassRequestApprovalStage(approvalRow);
-
                     if (
                         String(firstItem.status || "")
                             .trim()
@@ -7528,7 +7838,14 @@ const Material = {
                         );
                     }
 
-                    if (!activeStage) {
+                    const firstItemSteps = await loadMassItemSteps(
+                        client,
+                        massRequestId,
+                        { forUpdate: true }
+                    );
+                    const activeStep = resolveActiveStep(firstItemSteps);
+
+                    if (!activeStep) {
                         throw Object.assign(
                             new Error(
                                 "Mass request is already processed or not waiting for approval"
@@ -7540,11 +7857,16 @@ const Material = {
                         );
                     }
 
+                    const actorIsMdmMaterial =
+                        activeStep.kind === STEP_KINDS.MDM
+                            ? await isActorMdmMaterialUser(client, actorUserId)
+                            : false;
+
                     if (
-                        !canActorApproveMassRequestStage({
-                            row: approvalRow,
+                        !canActorActOnStep(activeStep, {
                             actorUserId,
                             actorUsername,
+                            actorIsMdmMaterial,
                         })
                     ) {
                         throw Object.assign(
@@ -7558,44 +7880,32 @@ const Material = {
                         );
                     }
 
-                    const patch = buildMassRequestReworkPatch({
-                        activeStage,
+                    const reworkPatch = buildMassStepReworkPatch({
+                        activeStep,
                         actorUserId,
                         reason,
                     });
 
-                    const patchEntries = Object.entries(patch).filter(
-                        ([_, v]) => !(v && typeof v === "object" && v.__sql)
-                    );
-                    const setClauses = patchEntries.map(
-                        ([field], i) => `${field} = $${i + 2}`
-                    );
-                    const nowFields = Object.entries(patch).filter(
-                        ([_, v]) => v && typeof v === "object" && v.__sql
-                    );
-                    const nowClauses = nowFields.map(
-                        ([field]) => `${field} = NOW()`
-                    );
-
-                    const allSetClauses = [
-                        ...setClauses,
-                        ...nowClauses,
-                        `updated_at = NOW()`,
-                    ];
-
-                    const updateQuery = `UPDATE mat_mass_request_item
-                        SET ${allSetClauses.join(", ")}
-                        WHERE mass_request_id = $1
-                        RETURNING id`;
-
-                    const updateParams = [
+                    // Mark the active step REWORK on every item, then push the
+                    // header (status/assigned_to + rework_* metadata) to all items.
+                    await updateMassItemStepRowsByLevel(
+                        client,
                         massRequestId,
-                        ...patchEntries.map(([_, v]) => v),
-                    ];
-
+                        activeStep.level,
+                        reworkPatch.step
+                    );
                     const updateResult = await client.query(
-                        updateQuery,
-                        updateParams
+                        `UPDATE mat_mass_request_item
+                         SET status = $2,
+                             assigned_to = $3,
+                             updated_at = NOW()
+                         WHERE mass_request_id = $1
+                         RETURNING id`,
+                        [
+                            massRequestId,
+                            reworkPatch.header.status,
+                            reworkPatch.header.assigned_to,
+                        ]
                     );
 
                     if (updateResult.rowCount === 0) {
@@ -7614,9 +7924,9 @@ const Material = {
 
                     return {
                         mass_request_id: Number(massRequestId),
-                        stage: activeStage,
-                        status: patch.status,
-                        assigned_to: patch.assigned_to,
+                        stage: stepLabel(activeStep),
+                        status: reworkPatch.header.status,
+                        assigned_to: reworkPatch.header.assigned_to,
                         updated_count: updateResult.rowCount,
                     };
                 } catch (error) {
@@ -7642,7 +7952,7 @@ const Material = {
 
                 try {
                     const lockResult = await client.query(
-                        `SELECT i.*
+                        `SELECT i.id, i.status
                          FROM mat_mass_request_item i
                          WHERE i.mass_request_id = $1
                          ORDER BY i.item_no ASC
@@ -7660,26 +7970,6 @@ const Material = {
 
                     const firstItem = lockResult.rows[0];
 
-                    const approvalRow = {
-                        first_item_status: firstItem.status,
-                        first_item_assigned_to: firstItem.assigned_to,
-                        first_item_approval_1_user_id:
-                            firstItem.approval_1_user_id,
-                        first_item_approval_1_status:
-                            firstItem.approval_1_status,
-                        first_item_approval_2_user_id:
-                            firstItem.approval_2_user_id,
-                        first_item_approval_2_status:
-                            firstItem.approval_2_status,
-                        first_item_approval_3_user_id:
-                            firstItem.approval_3_user_id,
-                        first_item_approval_3_status:
-                            firstItem.approval_3_status,
-                    };
-
-                    const activeStage =
-                        resolveMassRequestApprovalStage(approvalRow);
-
                     if (
                         String(firstItem.status || "")
                             .trim()
@@ -7696,7 +7986,14 @@ const Material = {
                         );
                     }
 
-                    if (!activeStage) {
+                    const firstItemSteps = await loadMassItemSteps(
+                        client,
+                        massRequestId,
+                        { forUpdate: true }
+                    );
+                    const activeStep = resolveActiveStep(firstItemSteps);
+
+                    if (!activeStep) {
                         throw Object.assign(
                             new Error(
                                 "Mass request is already processed or not waiting for approval"
@@ -7708,11 +8005,16 @@ const Material = {
                         );
                     }
 
+                    const actorIsMdmMaterial =
+                        activeStep.kind === STEP_KINDS.MDM
+                            ? await isActorMdmMaterialUser(client, actorUserId)
+                            : false;
+
                     if (
-                        !canActorApproveMassRequestStage({
-                            row: approvalRow,
+                        !canActorActOnStep(activeStep, {
                             actorUserId,
                             actorUsername,
+                            actorIsMdmMaterial,
                         })
                     ) {
                         throw Object.assign(
@@ -7726,43 +8028,31 @@ const Material = {
                         );
                     }
 
-                    const patch = buildMassRequestRejectPatch({
-                        activeStage,
+                    const rejectPatch = buildMassStepRejectPatch({
+                        activeStep,
                         reason,
                     });
 
-                    const patchEntries = Object.entries(patch).filter(
-                        ([_, v]) => !(v && typeof v === "object" && v.__sql)
-                    );
-                    const setClauses = patchEntries.map(
-                        ([field], i) => `${field} = $${i + 2}`
-                    );
-                    const nowFields = Object.entries(patch).filter(
-                        ([_, v]) => v && typeof v === "object" && v.__sql
-                    );
-                    const nowClauses = nowFields.map(
-                        ([field]) => `${field} = NOW()`
-                    );
-
-                    const allSetClauses = [
-                        ...setClauses,
-                        ...nowClauses,
-                        `updated_at = NOW()`,
-                    ];
-
-                    const updateQuery = `UPDATE mat_mass_request_item
-                        SET ${allSetClauses.join(", ")}
-                        WHERE mass_request_id = $1
-                        RETURNING id`;
-
-                    const updateParams = [
+                    // Mark the active step REJECTED on every item, then push the
+                    // header (CANCEL/Cancelled) to all items.
+                    await updateMassItemStepRowsByLevel(
+                        client,
                         massRequestId,
-                        ...patchEntries.map(([_, v]) => v),
-                    ];
-
+                        activeStep.level,
+                        rejectPatch.step
+                    );
                     const updateResult = await client.query(
-                        updateQuery,
-                        updateParams
+                        `UPDATE mat_mass_request_item
+                         SET status = $2,
+                             assigned_to = $3,
+                             updated_at = NOW()
+                         WHERE mass_request_id = $1
+                         RETURNING id`,
+                        [
+                            massRequestId,
+                            rejectPatch.header.status,
+                            rejectPatch.header.assigned_to,
+                        ]
                     );
 
                     if (updateResult.rowCount === 0) {
@@ -7781,9 +8071,9 @@ const Material = {
 
                     return {
                         mass_request_id: Number(massRequestId),
-                        stage: activeStage,
-                        status: patch.status,
-                        assigned_to: patch.assigned_to,
+                        stage: stepLabel(activeStep),
+                        status: rejectPatch.header.status,
+                        assigned_to: rejectPatch.header.assigned_to,
                         updated_count: updateResult.rowCount,
                     };
                 } catch (error) {
@@ -7815,13 +8105,48 @@ const Material = {
                         i.po_text,
                         i.spesifikasi_tambahan,
                         i.status,
-                        i.assigned_to
+                        i.assigned_to,
+                        COALESCE(item_steps.approval_steps, '[]'::jsonb) AS approval_steps,
+                        item_steps.active_step
                     FROM mat_mass_request_item i
+                    LEFT JOIN LATERAL (
+                        SELECT
+                            COALESCE(
+                                jsonb_agg(
+                                    jsonb_build_object(
+                                        'level', s.level,
+                                        'kind', s.kind,
+                                        'approver_user_id', s.approver_user_id,
+                                        'approver_name', COALESCE(sau.fullname, sau.username, s.approver_user_id),
+                                        'status', s.status,
+                                        'claimed_at', s.claimed_at,
+                                        'acted_at', s.acted_at,
+                                        'remark', s.remark
+                                    )
+                                    ORDER BY s.level
+                                ) FILTER (WHERE s.id IS NOT NULL),
+                                '[]'::jsonb
+                            ) AS approval_steps,
+                            (
+                                SELECT to_jsonb(active.*)
+                                FROM (
+                                    SELECT a.level, a.kind, a.approver_user_id, a.status
+                                    FROM mat_mass_request_item_approval_step a
+                                    WHERE a.item_id = i.id
+                                      AND UPPER(COALESCE(a.status, 'WAITING')) <> 'APPROVED'
+                                    ORDER BY a.level
+                                    LIMIT 1
+                                ) active
+                            ) AS active_step
+                        FROM mat_mass_request_item_approval_step s
+                        LEFT JOIN mst_user sau ON sau.user_id = s.approver_user_id
+                        WHERE s.item_id = i.id
+                    ) item_steps ON TRUE
                     WHERE i.mass_request_id = $1
                     ORDER BY i.item_no ASC`,
                     [massRequestId]
                 );
-                return result.rows;
+                return result.rows.map(attachStepPayloadToRow);
             });
         } catch (error) {
             console.error("Error fetching mass request items:", error);
@@ -7845,7 +8170,7 @@ const Material = {
 
                 try {
                     const lockResult = await client.query(
-                        `SELECT i.*
+                        `SELECT i.id, i.status, i.assigned_to
                          FROM mat_mass_request_item i
                          WHERE i.mass_request_id = $1
                          ORDER BY i.item_no ASC
@@ -7871,26 +8196,26 @@ const Material = {
                         );
                     }
 
-                    // Determine which approval stage has REWORK status
-                    const approval1Status = String(firstItem.approval_1_status || "").trim().toUpperCase();
-                    const approval2Status = String(firstItem.approval_2_status || "").trim().toUpperCase();
-                    const approval3Status = String(firstItem.approval_3_status || "").trim().toUpperCase();
-                    const reworkStage = approval1Status === "REWORK"
-                        ? 1
-                        : approval2Status === "REWORK"
-                            ? 2
-                            : approval3Status === "REWORK"
-                                ? 3
-                                : null;
+                    // Step model: the reworked stage is the step currently in
+                    // REWORK status (the header assigned_to was 'Requester').
+                    const firstItemSteps = await loadMassItemSteps(
+                        client,
+                        massRequestId,
+                        { forUpdate: true }
+                    );
+                    const reworkStep = firstItemSteps.find(
+                        step =>
+                            normalizeStepStatus(step.status) === "REWORK"
+                    );
 
-                    if (!reworkStage) {
+                    if (!reworkStep) {
                         throw Object.assign(
                             new Error("Mass request rework stage is missing"),
                             { statusCode: 409, code: "MASS_REQUEST_REWORK_STAGE_MISSING" }
                         );
                     }
 
-                    const stagePrefix = `approval_${reworkStage}`;
+                    const reworkStepLabel = stepLabel(reworkStep);
 
                     // Update each item's editable fields if items are provided
                     if (Array.isArray(items) && items.length > 0) {
@@ -7936,37 +8261,31 @@ const Material = {
                         }
                     }
 
-                    // Reset the reworked approval stage to WAITING and status to Submit
-                    const resetPatch = {};
-                    resetPatch[`${stagePrefix}_status`] = "WAITING";
-                    resetPatch.status = "Submit";
-                    resetPatch.assigned_to = `Approval ${reworkStage}`;
-                    resetPatch.updated_at = new Date();
-
-                    const patchEntries = Object.entries(resetPatch);
-                    const allSetClauses = patchEntries.map(
-                        ([field], i) => `${field} = $${i + 1}`
+                    // Reopen the reworked step (WAITING) on every item, then push
+                    // the header (Submit + reworked-step label) to all items.
+                    await updateMassItemStepRowsByLevel(
+                        client,
+                        massRequestId,
+                        reworkStep.level,
+                        { status: "WAITING", acted_at: null, remark: null }
                     );
 
-                    const updateQuery = `UPDATE mat_mass_request_item
-                        SET ${allSetClauses.join(", ")}
-                        WHERE mass_request_id = $${patchEntries.length + 1}
-                        RETURNING id`;
-
-                    const updateParams = [
-                        ...patchEntries.map(([_, v]) => v),
-                        massRequestId,
-                    ];
-
-                    await client.query(updateQuery, updateParams);
+                    await client.query(
+                        `UPDATE mat_mass_request_item
+                         SET status = 'Submit',
+                             assigned_to = $2,
+                             updated_at = NOW()
+                         WHERE mass_request_id = $1`,
+                        [massRequestId, reworkStepLabel]
+                    );
 
                     await client.query("COMMIT");
 
                     return {
                         mass_request_id: Number(massRequestId),
-                        rework_stage: reworkStage,
+                        rework_stage: reworkStepLabel,
                         status: "Submit",
-                        assigned_to: `Approval ${reworkStage}`,
+                        assigned_to: reworkStepLabel,
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");

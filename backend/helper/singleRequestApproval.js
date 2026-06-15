@@ -559,6 +559,102 @@ const buildSingleRequestApprovalSnapshot = ({
     };
 };
 
+// --- Step-based action patch builders (new dynamic-approver flow) ---------
+//
+// These operate on a single STEP ROW of mat_single_request_approval_step and
+// return both:
+//   - `step`   : the SET fields to apply to that step row, and
+//   - `header` : the SET fields to apply to the mat_single_request header row
+//                (status / assigned_to lifecycle columns).
+//
+// `stepLabel` lives in approvalSteps.js, which in turn requires this module
+// (for isAdminMaterialApprover / assertRequiredActionReason / the group name).
+// To avoid a circular-require load-order hazard, we resolve it lazily here.
+const resolveStepLabel = step => {
+    // eslint-disable-next-line global-require
+    const { stepLabel } = require("./approvalSteps");
+    return stepLabel(step);
+};
+
+const buildStepApprovePatch = ({ remark = null } = {}) => ({
+    step: {
+        status: "APPROVED",
+        acted_at: SQL_NOW_EXPRESSION,
+        remark: remark ?? null,
+    },
+});
+
+const buildStepReworkPatch = ({ activeStep, actorUserId, reason } = {}) => {
+    const safeReason = assertRequiredActionReason(reason, "rework");
+
+    return {
+        step: {
+            status: "REWORK",
+            acted_at: SQL_NOW_EXPRESSION,
+            remark: safeReason,
+        },
+        header: {
+            status: "Rework",
+            assigned_to: "Requester",
+            rework_stage: resolveStepLabel(activeStep),
+            rework_by_user_id: actorUserId ?? null,
+            rework_at: SQL_NOW_EXPRESSION,
+            rework_reason: safeReason,
+        },
+    };
+};
+
+const buildStepRejectPatch = ({ activeStep, reason } = {}) => {
+    const safeReason = assertRequiredActionReason(reason, "reject");
+
+    return {
+        step: {
+            status: "REJECTED",
+            acted_at: SQL_NOW_EXPRESSION,
+            remark: safeReason,
+        },
+        header: {
+            status: "CANCEL",
+            assigned_to: "Cancelled",
+        },
+        // Surfaced for callers that want to record the rejecting actor on the
+        // step row without re-deriving it here.
+        _meta: { rejectStep: activeStep || null },
+    };
+};
+
+const buildStepRevisedPatch = ({
+    reworkStep,
+    reworkStepLevel,
+    reworkStepKind,
+} = {}) => {
+    // Accept either a full step row (`reworkStep`, e.g. from findStepByLabel)
+    // or an explicit { reworkStepLevel, reworkStepKind } pair.
+    const step =
+        reworkStep ||
+        (reworkStepLevel != null
+            ? { level: reworkStepLevel, kind: reworkStepKind }
+            : null);
+
+    if (!step) {
+        throw new Error(
+            "reworkStep (or reworkStepLevel + reworkStepKind) is required to build a revised patch"
+        );
+    }
+
+    return {
+        step: {
+            status: INITIAL_APPROVAL_STATUS,
+            acted_at: null,
+            remark: null,
+        },
+        header: {
+            status: "Submit",
+            assigned_to: resolveStepLabel(step),
+        },
+    };
+};
+
 const buildAutoAssignedApproval3 = ({ approval3UserId }) => {
     if (!approval3UserId) {
         throw new Error("approval3UserId is required");
@@ -685,6 +781,10 @@ module.exports = {
     buildSingleRequestRevisedPatch,
     buildSingleRequestReworkPatch,
     buildSingleRequestApprovalSnapshot,
+    buildStepApprovePatch,
+    buildStepReworkPatch,
+    buildStepRejectPatch,
+    buildStepRevisedPatch,
     buildLoginUserGroupInfo,
     canActorApproveSingleRequestStage,
     canActorReviseSingleRequest,

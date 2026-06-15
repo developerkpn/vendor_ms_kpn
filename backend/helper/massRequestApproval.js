@@ -8,6 +8,17 @@ const {
     INITIAL_APPROVAL_STATUS,
 } = require("./singleRequestApproval");
 
+const {
+    STEP_STATUS,
+    resolveActiveStep,
+    stepLabel,
+    resolveAssignedToFromSteps,
+    canActorActOnStep,
+    isFinalStepActive,
+    buildStepsPayload,
+    findStepByLabel,
+} = require("./approvalSteps");
+
 const SQL_NOW_EXPRESSION = Object.freeze({ __sql: "NOW()" });
 
 const matchesActorUserId = (assigneeUserId, actorUserId) =>
@@ -22,6 +33,9 @@ const matchesActorUserId = (assigneeUserId, actorUserId) =>
  *
  * All items in a mass batch share the same approval chain, so reading from
  * the first item's fields is correct.
+ *
+ * LEGACY (stage-based) — kept exported for cutover safety. The new step-based
+ * flow does not use this.
  */
 const mapMassRowToApprovalShape = (row = {}) => {
     const approval = { ...row };
@@ -43,8 +57,7 @@ const mapMassRowToApprovalShape = (row = {}) => {
 /**
  * Resolve the active approval stage for a mass request batch.
  *
- * Delegates to the single-request stage resolver after mapping
- * first_item_* fields → approval_N_* fields.
+ * LEGACY (stage-based) — kept exported for cutover safety.
  *
  * @param {object} row - Mass request inbox row with first_item_* fields.
  * @returns {string|null} "Approval 1", "Approval 2", "Approval 3", or null.
@@ -56,10 +69,7 @@ const resolveMassRequestApprovalStage = (row = {}) => {
 /**
  * Check whether a mass request is eligible to appear in the approval inbox.
  *
- * A request is eligible when:
- * - It has an active approval stage (waiting for someone to act), OR
- * - Its status is a visible terminal/transitional status
- *   (SUBMIT, REWORK, REJECT, REJECTED, CANCEL, DONE).
+ * LEGACY (stage-based) — kept exported for cutover safety.
  *
  * @param {object} row - Mass request inbox row with first_item_* fields.
  * @returns {boolean}
@@ -75,9 +85,7 @@ const isMassRequestApprovalInboxEligible = (row = {}) => {
 /**
  * Filter mass request inbox rows for a given actor.
  *
- * - ADMIN sees everything.
- * - Non-admin: only rows where the actor is assigned to the active
- *   approval stage, or where they were the approver on a rejected stage.
+ * LEGACY (stage-based) — kept exported for cutover safety.
  *
  * @param {object[]} rows - Mass request inbox rows.
  * @param {object} opts
@@ -157,6 +165,8 @@ const filterMassRequestApprovalInboxRows = (
 /**
  * Check whether the actor can approve the current stage of a mass request.
  *
+ * LEGACY (stage-based) — kept exported for cutover safety.
+ *
  * @param {object} opts
  * @param {object} opts.row - Mass request inbox row with first_item_* fields.
  * @param {string|null} opts.actorUserId
@@ -193,11 +203,7 @@ const canActorApproveMassRequestStage = ({
 /**
  * Build a patch object to apply to ALL items in a mass batch after approval.
  *
- * For mass requests, all items share the same approval chain stage.
- * The patch marks the current stage as APPROVED and advances status/assignment.
- *
- * Mass requests only use the "Create" ticket type, so after Approval 2
- * the batch is fully approved (DONE / Completed).
+ * LEGACY (stage-based) — kept exported for cutover safety.
  *
  * @param {object} opts
  * @param {string} opts.activeStage - "Approval 1" or "Approval 2".
@@ -251,6 +257,8 @@ const buildMassRequestApprovePatch = ({
 /**
  * Build a patch object to apply to ALL items in a mass batch for rework request.
  *
+ * LEGACY (stage-based) — kept exported for cutover safety.
+ *
  * @param {object} opts
  * @param {string} opts.activeStage - The stage requesting rework.
  * @param {string|null} opts.actorUserId
@@ -276,6 +284,8 @@ const buildMassRequestReworkPatch = ({
 
 /**
  * Build a patch object to apply to ALL items in a mass batch for rejection.
+ *
+ * LEGACY (stage-based) — kept exported for cutover safety.
  *
  * @param {object} opts
  * @param {string} opts.activeStage - The stage rejecting the request.
@@ -303,6 +313,8 @@ const buildMassRequestRejectPatch = ({
  * on a single in-flight mass-request item when the administrator retargets the
  * approver master.  Unlike the single-request path this does NOT touch status
  * or assigned_to — the mass approve flow manages its own stage progression.
+ *
+ * LEGACY (stage-based) — kept exported for cutover safety.
  */
 const syncMassRequestItemApprovalSnapshot = async (
     client,
@@ -345,7 +357,206 @@ const syncMassRequestItemApprovalSnapshot = async (
     );
 };
 
+/* =========================================================================
+ * NEW STEP-BASED FLOW (mat_mass_request_item_approval_step)
+ *
+ * Mass requests are always CREATE. All items in a batch share the same step
+ * plan, so routing reads the FIRST item's step rows (consistent with the
+ * existing first_item_* pattern). Header status/assigned_to and the matching
+ * step-status update are then applied to EVERY item in the batch by the
+ * MaterialModel caller.
+ *
+ * These delegate to the shared step-engine in ./approvalSteps.js so single
+ * and mass stay in lockstep.
+ * ========================================================================= */
+
+/**
+ * Resolve the active step for a mass batch from the FIRST item's step rows.
+ *
+ * @param {object[]} firstItemSteps - Rows from mat_mass_request_item_approval_step
+ *   for the first item, ordered by level. Each row: {level, kind,
+ *   approver_user_id, status, ...}.
+ * @returns {object|null} The active step row (lowest level whose normalized
+ *   status !== 'APPROVED'), or null when all steps are APPROVED.
+ */
+const resolveMassActiveStepFromFirstItem = (firstItemSteps = []) =>
+    resolveActiveStep(firstItemSteps);
+
+/**
+ * Eligibility / visibility for a single actor against ONE active mass step.
+ *
+ * Delegates to the shared canActorActOnStep:
+ * - ADMIN (isAdminMaterialApprover) => true.
+ * - MANUAL => approver_user_id === actorUserId.
+ * - MDM    => actorIsMdmMaterial && (approver_user_id IS NULL OR === actorUserId).
+ *
+ * @param {object} step - The active step row.
+ * @param {object} actor - { actorUserId, actorUsername, actorIsMdmMaterial }.
+ * @returns {boolean}
+ */
+const canActorActOnMassStep = (step, actor) =>
+    canActorActOnStep(step, actor);
+
+/**
+ * Build the approve patch for a mass batch step action.
+ *
+ * Same shape as the single-request buildStepApprovePatch: the `step` block is
+ * applied to the matching step row of EVERY item; there is no header change on
+ * approve here — the MaterialModel caller recomputes header status/assigned_to
+ * from the advanced step plan (Submit + next-step label, or DONE + 'Completed').
+ *
+ * @param {object} opts
+ * @param {string|null} opts.remark
+ * @returns {{ step: { status, acted_at, remark } }}
+ */
+const buildMassStepApprovePatch = ({ remark } = {}) => ({
+    step: {
+        status: STEP_STATUS.APPROVED,
+        acted_at: SQL_NOW_EXPRESSION,
+        remark: remark ?? null,
+    },
+});
+
+/**
+ * Build the rework patch for a mass batch step action.
+ *
+ * The `step` block is applied to the matching step row of EVERY item; the
+ * `header` block (status/assigned_to + rework_* metadata) is applied to EVERY
+ * mat_mass_request_item row.
+ *
+ * @param {object} opts
+ * @param {object} opts.activeStep - The active step row being reworked.
+ * @param {string|null} opts.actorUserId
+ * @param {string|null} opts.reason - Required.
+ * @returns {{ step, header }}
+ */
+const buildMassStepReworkPatch = ({
+    activeStep,
+    actorUserId,
+    reason,
+} = {}) => {
+    const safeReason = assertRequiredActionReason(reason, "rework");
+
+    return {
+        step: {
+            status: STEP_STATUS.REWORK,
+            acted_at: SQL_NOW_EXPRESSION,
+            remark: safeReason,
+        },
+        header: {
+            status: "Rework",
+            assigned_to: "Requester",
+            rework_stage: stepLabel(activeStep),
+            rework_by_user_id: actorUserId ?? null,
+            rework_at: SQL_NOW_EXPRESSION,
+            rework_reason: safeReason,
+        },
+    };
+};
+
+/**
+ * Build the reject patch for a mass batch step action.
+ *
+ * @param {object} opts
+ * @param {object} opts.activeStep - The active step row being rejected.
+ * @param {string|null} opts.reason - Required.
+ * @returns {{ step, header }}
+ */
+const buildMassStepRejectPatch = ({
+    activeStep,
+    reason,
+} = {}) => {
+    const safeReason = assertRequiredActionReason(reason, "reject");
+
+    return {
+        step: {
+            status: STEP_STATUS.REJECTED,
+            acted_at: SQL_NOW_EXPRESSION,
+            remark: safeReason,
+        },
+        header: {
+            status: "CANCEL",
+            assigned_to: "Cancelled",
+        },
+    };
+};
+
+/**
+ * On rework SAVE (requester re-submits a mass batch): reset the reworked step
+ * back to WAITING. The reworked step is recovered by matching the stored
+ * rework_stage label back to a step row (findStepByLabel).
+ *
+ * The `step` block is applied to the matching step row of EVERY item; the
+ * `header` block is applied to EVERY mat_mass_request_item row.
+ *
+ * @param {object} opts
+ * @param {object[]} opts.firstItemSteps - First item's step rows.
+ * @param {string} opts.reworkStageLabel - Stored header rework_stage label.
+ * @returns {{ step, header, reworkStep }}
+ */
+const buildMassStepRevisedPatch = ({
+    firstItemSteps = [],
+    reworkStageLabel,
+} = {}) => {
+    const reworkStep = findStepByLabel(firstItemSteps, reworkStageLabel);
+
+    if (!reworkStep) {
+        const error = new Error(
+            `Unable to locate reworked step for label: ${reworkStageLabel}`
+        );
+        error.statusCode = 409;
+        error.code = "MASS_REQUEST_REWORK_STEP_NOT_FOUND";
+        throw error;
+    }
+
+    return {
+        reworkStep,
+        step: {
+            status: STEP_STATUS.WAITING,
+            acted_at: null,
+            remark: null,
+        },
+        header: {
+            status: "Submit",
+            assigned_to: stepLabel(reworkStep),
+        },
+    };
+};
+
+/**
+ * Build the public FE payload block for a mass batch from the FIRST item's
+ * step rows. Delegates to the shared buildStepsPayload.
+ *
+ * @param {object[]} firstItemSteps - First item's step rows (ordered by level).
+ * @returns {object} {
+ *   approvalSteps, currentStageLevel, currentStageLabel, currentStageKind,
+ *   isFinalStage, totalStages, assignedTo
+ * }
+ */
+const mapMassStepRowsToPayload = (firstItemSteps = []) =>
+    buildStepsPayload(firstItemSteps);
+
+/**
+ * True when the active step of a mass batch is the MDM (final) step.
+ *
+ * @param {object[]} firstItemSteps - First item's step rows.
+ * @returns {boolean}
+ */
+const isMassFinalStepActive = (firstItemSteps = []) =>
+    isFinalStepActive(firstItemSteps);
+
+/**
+ * Resolve the header assigned_to value for a mass batch from its first item's
+ * step rows (active step label, 'Completed' when all APPROVED, else null).
+ *
+ * @param {object[]} firstItemSteps - First item's step rows.
+ * @returns {string|null}
+ */
+const resolveMassAssignedToFromSteps = (firstItemSteps = []) =>
+    resolveAssignedToFromSteps(firstItemSteps);
+
 module.exports = {
+    // legacy stage-based (kept for cutover safety)
     resolveMassRequestApprovalStage,
     isMassRequestApprovalInboxEligible,
     filterMassRequestApprovalInboxRows,
@@ -355,4 +566,14 @@ module.exports = {
     buildMassRequestRejectPatch,
     mapMassRowToApprovalShape,
     syncMassRequestItemApprovalSnapshot,
+    // new step-based flow
+    resolveMassActiveStepFromFirstItem,
+    canActorActOnMassStep,
+    buildMassStepApprovePatch,
+    buildMassStepReworkPatch,
+    buildMassStepRejectPatch,
+    buildMassStepRevisedPatch,
+    mapMassStepRowsToPayload,
+    isMassFinalStepActive,
+    resolveMassAssignedToFromSteps,
 };

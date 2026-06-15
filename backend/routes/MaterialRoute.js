@@ -206,6 +206,13 @@ router.get(
     AuthToken.authSession,
     MaterialController.getSingleRequestById
 );
+// Whole-list save of a requester's ordered manual approver chain.
+router.put(
+    "/requests/single/approver-masters/:requesterUserId",
+    AuthToken.authSession,
+    MaterialController.assignSingleRequestApproverMaster
+);
+// PATCH alias kept temporarily for backward compatibility during cutover.
 router.patch(
     "/requests/single/approver-masters/:requesterUserId",
     AuthToken.authSession,
@@ -215,6 +222,17 @@ router.patch(
     "/requests/single/:id/assign-approvers",
     AuthToken.authSession,
     MaterialController.assignSingleRequestApprovers
+);
+// MDM grab: claim the open Master Data (final) step.
+router.post(
+    "/requests/single/:id/claim-mdm",
+    AuthToken.authSession,
+    MaterialController.claimSingleRequestMdmStep
+);
+router.post(
+    "/requests/mass/:id/claim-mdm",
+    AuthToken.authSession,
+    MaterialController.claimMassRequestMdmStep
 );
 router.post(
     "/requests/single/:id/approve",
