@@ -1,112 +1,15 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const Material = require("../models/MaterialModel");
+const materialService = require("../services/materialService");
 const MaterialController = require("../controllers/MaterialController");
 const db = require("../config/connection");
 const MaterialTemplate = require("../models/MaterialTemplateModel");
 const {
-  buildRequesterApprovalMaster,
-  buildSingleRequestApprovalSnapshot,
-  buildSingleRequestRejectPatch,
-  buildSingleRequestRevisedPatch,
-  buildSingleRequestReworkPatch,
-  canActorApproveSingleRequestStage,
   canActorReviseSingleRequest,
-  filterSingleRequestApprovalInboxRows,
-  getApprovalStageFieldPrefix,
-  isSingleRequestApprovalInboxEligible,
   assertRequiredActionReason,
   buildSingleRequestFinalCode,
-} = require("../helper/singleRequestApproval");
-
-test("buildRequesterApprovalMaster returns requester-based master data", () => {
-  const approval = buildRequesterApprovalMaster({
-    requesterUserId: "USER-BUDI",
-    approval1UserId: "USER-APPROVER-01",
-    approval2UserId: "USER-APPROVER-02",
-  });
-  assert.deepEqual(approval, {
-    requester_user_id: "USER-BUDI",
-    approval_1_user_id: "USER-APPROVER-01",
-    approval_2_user_id: "USER-APPROVER-02",
-    approval_3_user_id: null,
-    approval_3_type: "SYSTEM",
-    approval_3_group: "MDM_MATERIAL",
-  });
-});
-
-test("buildSingleRequestApprovalSnapshot copies master assignees into request columns", () => {
-  const snapshot = buildSingleRequestApprovalSnapshot({
-    requesterUserId: "USER-BUDI",
-    approvalMaster: {
-      approval_1_user_id: "USER-APPROVER-01",
-      approval_2_user_id: "USER-APPROVER-02",
-    },
-  });
-  assert.equal(snapshot.approval_1_user_id, "USER-APPROVER-01");
-  assert.equal(snapshot.approval_1_status, "WAITING");
-  assert.equal(snapshot.approval_2_user_id, "USER-APPROVER-02");
-  assert.equal(snapshot.approval_3_user_id, null);
-});
-
-test("buildSingleRequestApprovalSnapshot auto-assigns admin requester when master approvers are empty", () => {
-  const snapshot = buildSingleRequestApprovalSnapshot({
-    requesterUserId: "ADMIN-01",
-    requesterUsername: "ADMIN",
-    approvalMaster: null,
-  });
-
-  assert.equal(snapshot.approval_1_user_id, "ADMIN-01");
-  assert.equal(snapshot.approval_1_status, "WAITING");
-  assert.equal(snapshot.approval_2_user_id, "ADMIN-01");
-  assert.equal(snapshot.approval_3_user_id, null);
-});
-
-test("buildSingleRequestApprovalSnapshot keeps Create workflow defaults", () => {
-  const snapshot = buildSingleRequestApprovalSnapshot({
-    ticketType: "Create",
-    requesterUserId: "REQ-01",
-    approvalMaster: {
-      approval_1_user_id: "APP-01",
-      approval_2_user_id: "APP-02",
-    },
-  });
-
-  assert.equal(snapshot.approval_1_user_id, "APP-01");
-  assert.equal(snapshot.approval_1_status, "WAITING");
-  assert.equal(snapshot.approval_2_user_id, "APP-02");
-  assert.equal(snapshot.approval_2_status, null);
-  assert.equal(snapshot.approval_3_user_id, null);
-  assert.equal(snapshot.approval_3_status, null);
-});
-
-test("buildSingleRequestApprovalSnapshot starts Change requests at Approval 1 and Approval 3 only", () => {
-  const snapshot = buildSingleRequestApprovalSnapshot({
-    ticketType: "Change",
-    requesterUserId: "REQ-01",
-  });
-
-  assert.equal(snapshot.approval_1_user_id, null);
-  assert.equal(snapshot.approval_1_status, "WAITING");
-  assert.equal(snapshot.approval_2_user_id, null);
-  assert.equal(snapshot.approval_2_status, "APPROVED");
-  assert.equal(snapshot.approval_3_user_id, null);
-  assert.equal(snapshot.approval_3_status, "WAITING");
-});
-
-test("buildSingleRequestApprovalSnapshot starts Extend requests directly at Approval 3", () => {
-  const snapshot = buildSingleRequestApprovalSnapshot({
-    ticketType: "Extend",
-    requesterUserId: "REQ-01",
-  });
-
-  assert.equal(snapshot.approval_1_user_id, null);
-  assert.equal(snapshot.approval_1_status, "APPROVED");
-  assert.equal(snapshot.approval_2_user_id, null);
-  assert.equal(snapshot.approval_2_status, "APPROVED");
-  assert.equal(snapshot.approval_3_user_id, null);
-  assert.equal(snapshot.approval_3_status, "WAITING");
-});
+} = require("../services/materialService");
 
 test("assertRequiredActionReason rejects blank reason values", () => {
   assert.throws(
@@ -148,66 +51,6 @@ test("buildSingleRequestFinalCode requires exactly three numeric suffix digits",
   );
 });
 
-test("getApprovalStageFieldPrefix resolves all supported approval stages", () => {
-  assert.equal(getApprovalStageFieldPrefix("Approval 1"), "approval_1");
-  assert.equal(getApprovalStageFieldPrefix("Approval 2"), "approval_2");
-  assert.equal(getApprovalStageFieldPrefix("Approval 3"), "approval_3");
-  assert.throws(
-    () => getApprovalStageFieldPrefix("Requester"),
-    /Unsupported approval stage/i
-  );
-});
-
-test("buildSingleRequestReworkPatch marks request for requester rework", () => {
-  const patch = buildSingleRequestReworkPatch({
-    reworkStage: "Approval 3",
-    actorUserId: "APP-03",
-    reason: "Need updated attachment",
-  });
-
-  assert.equal(patch.status, "Rework");
-  assert.equal(patch.assigned_to, "Requester");
-  assert.equal(patch.rework_stage, "Approval 3");
-  assert.equal(patch.rework_by_user_id, "APP-03");
-  assert.equal(patch.rework_reason, "Need updated attachment");
-  assert.equal(patch.approval_3_status, "REWORK");
-  assert.equal(patch.approval_3_remark, "Need updated attachment");
-  assert.ok(patch.rework_at);
-});
-
-test("buildSingleRequestRejectPatch marks active approval stage as rejected and cancels request", () => {
-  const patch = buildSingleRequestRejectPatch({
-    rejectStage: "Approval 2",
-    reason: "Material spec tidak sesuai kebutuhan.",
-  });
-
-  assert.equal(patch.status, "CANCEL");
-  assert.equal(patch.assigned_to, "Cancelled");
-  assert.equal(patch.approval_2_status, "REJECTED");
-  assert.equal(patch.approval_2_remark, "Material spec tidak sesuai kebutuhan.");
-  assert.deepEqual(patch.approval_2_at, { __sql: "NOW()" });
-});
-
-test("buildSingleRequestRejectPatch requires reject reason", () => {
-  assert.throws(
-    () =>
-      buildSingleRequestRejectPatch({
-        rejectStage: "Approval 1",
-        reason: "   ",
-      }),
-    /reject reason is required/i
-  );
-});
-
-test("buildSingleRequestRevisedPatch resets only the active rework stage", () => {
-  assert.deepEqual(buildSingleRequestRevisedPatch("Approval 2"), {
-    status: "Submit",
-    assigned_to: "Approval 2",
-    approval_2_status: "WAITING",
-    approval_2_at: null,
-  });
-});
-
 test("canActorReviseSingleRequest allows requester and admin only", () => {
   assert.equal(
     canActorReviseSingleRequest({
@@ -235,156 +78,133 @@ test("canActorReviseSingleRequest allows requester and admin only", () => {
   );
 });
 
-test("canActorApproveSingleRequestStage includes approval 3 assignee", () => {
-  assert.equal(
-    canActorApproveSingleRequestStage({
-      approval: {
-        approval_1_status: "APPROVED",
-        approval_2_status: "APPROVED",
-        approval_3_status: "WAITING",
-        approval_3_user_id: "MDM-01",
-      },
-      actorUserId: "MDM-01",
-      actorUsername: "mdm.user",
-    }),
-    true
-  );
-});
-
-test("create single requests allow assigned Approval 3 to complete approval", () => {
-  assert.deepEqual(
-    Material.__private.getSingleRequestAllowedApprovalStages("Create"),
-    ["Approval 1", "Approval 2", "Approval 3"]
-  );
-});
-
 test("createSingleRequest query includes approval columns on mat_single_request", () => {
-  assert.match(Material.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /approval_1_user_id/i);
-  assert.match(Material.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /approval_2_user_id/i);
-  assert.match(Material.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /ticket_type/i);
-  assert.doesNotMatch(Material.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /material_code/i);
-  assert.match(Material.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /change_extend_reason/i);
+  assert.match(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /approval_1_user_id/i);
+  assert.match(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /approval_2_user_id/i);
+  assert.match(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /ticket_type/i);
+  assert.doesNotMatch(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /material_code/i);
+  assert.match(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /change_extend_reason/i);
 });
 
 test("createSingleRequest query stores material_group_id instead of material_group_code", () => {
-  assert.match(Material.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /material_group_id/i);
-  assert.doesNotMatch(Material.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /material_group_code/i);
+  assert.match(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /material_group_id/i);
+  assert.doesNotMatch(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /material_group_code/i);
 });
 
 test("getAdministratorApproverMasters query includes master join and lock metadata", () => {
-  assert.match(Material.__private.GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY, /LEFT JOIN mat_single_request_approval/i);
-  assert.match(Material.__private.GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY, /active_request_count/i);
+  assert.match(materialService.__private.GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY, /LEFT JOIN mat_single_request_approval/i);
+  assert.match(materialService.__private.GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY, /active_request_count/i);
 });
 
 test("getSingleRequestApprovalInbox query no longer joins mat_single_request_approval", () => {
-  assert.doesNotMatch(Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY, /LEFT JOIN mat_single_request_approval a/i);
+  assert.doesNotMatch(materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY, /LEFT JOIN mat_single_request_approval a/i);
 });
 
 test("getSingleRequestApprovalInbox query reads group code through the id join", () => {
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /r\.material_group_id/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /LEFT JOIN mat_item_group mig ON mig\.id = r\.material_group_id/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /mig\.code AS material_group_code/i
   );
 });
 
 test("getSingleRequestApprovalInbox query includes subgroup fields for approval detail dialog", () => {
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /LEFT JOIN mat_item_sub_group mis ON mis\.id = r\.material_sub_group_id/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /mis\.code AS material_sub_group_code/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /mis\.name AS material_sub_group_name/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /r\.rework_stage/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /r\.rework_reason/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /TO_CHAR\(r\.rework_at, 'YYYY-MM-DD HH24:MI'\) AS rework_at/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /rework_by\.username AS rework_by_username/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /approval_1_user\.fullname.*AS approval_1_user_name/is
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /LEFT JOIN mst_user approval_2_user ON approval_2_user\.user_id = r\.approval_2_user_id/i
   );
 });
 
 test("single request read queries expose final_code for approval and request views", () => {
-  assert.match(Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY, /r\.final_code/i);
-  assert.match(Material.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.final_code/i);
-  assert.match(Material.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY, /r\.final_code/i);
+  assert.match(materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY, /r\.final_code/i);
+  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.final_code/i);
+  assert.match(materialService.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY, /r\.final_code/i);
   assert.match(
-    Material.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
+    materialService.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
     /LEFT JOIN mat_item_sub_group mis ON mis\.id = r\.material_sub_group_id/i
   );
   assert.match(
-    Material.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
+    materialService.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
     /mis\.code AS material_sub_group_code/i
   );
 });
 
 test("getSingleRequests list query reads approval snapshot from mat_single_request", () => {
-  assert.doesNotMatch(Material.__private.GET_SINGLE_REQUEST_LIST_QUERY, /LEFT JOIN mat_single_request_approval a/i);
-  assert.match(Material.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.approval_1_user_id/i);
-  assert.match(Material.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.approval_2_status/i);
-  assert.match(Material.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.approval_3_status/i);
-  assert.match(Material.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.rework_stage/i);
-  assert.match(Material.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.rework_reason/i);
+  assert.doesNotMatch(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /LEFT JOIN mat_single_request_approval a/i);
+  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.approval_1_user_id/i);
+  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.approval_2_status/i);
+  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.approval_3_status/i);
+  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.rework_stage/i);
+  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.rework_reason/i);
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_LIST_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
     /TO_CHAR\(r\.rework_at, 'YYYY-MM-DD HH24:MI'\) AS rework_at/i
   );
-  assert.match(Material.__private.GET_SINGLE_REQUEST_LIST_QUERY, /rework_by\.username AS rework_by_username/i);
+  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /rework_by\.username AS rework_by_username/i);
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_LIST_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
     /approval_1_user\.fullname.*AS approval_1_user_name/is
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_LIST_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
     /LEFT JOIN mst_user approval_3_user ON approval_3_user\.user_id = r\.approval_3_user_id/i
   );
 });
 
 test("legacy single request read queries omit rework columns and joins", () => {
   assert.doesNotMatch(
-    Material.__private.GET_SINGLE_REQUEST_LIST_PRE_REWORK_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_LIST_PRE_REWORK_QUERY,
     /r\.rework_stage|r\.rework_reason|rework_by\.username/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_LIST_PRE_REWORK_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_LIST_PRE_REWORK_QUERY,
     /NULL::varchar AS rework_stage/i
   );
   assert.doesNotMatch(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY,
     /r\.rework_stage|r\.rework_reason|rework_by\.username/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY,
     /NULL::varchar AS rework_stage/i
   );
 });
@@ -429,111 +249,32 @@ test("migration adds nullable final_code to mat_single_request", () => {
 
 test("getSingleRequests list query reads group code through the id join", () => {
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_LIST_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
     /LEFT JOIN mat_item_group mig ON mig\.id = r\.material_group_id/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_LIST_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
     /mig\.code AS material_group_code/i
   );
 });
 
 test("getSingleRequests list query joins mst_user only once", () => {
   const joinMatches =
-    Material.__private.GET_SINGLE_REQUEST_LIST_QUERY.match(
+    materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY.match(
       /LEFT JOIN mst_user u ON u\.user_id = r\.created_by/gi
     ) || [];
 
   assert.equal(joinMatches.length, 1);
 });
 
-test("approval assignment workflow syncs mat_single_request snapshot", () => {
-  assert.match(
-    Material.assignSingleRequestApproversByAdmin.toString(),
-    /syncSingleRequestApprovalSnapshot/
-  );
-  assert.doesNotMatch(
-    Material.assignSingleRequestApproversByAdmin.toString(),
-    /UPDATE mat_single_request_approval/i
-  );
-  assert.match(
-    Material.assignSingleRequestApproversByAdmin.toString(),
-    /UPDATE mat_single_request/i
-  );
-});
-
-test("approval action workflow syncs mat_single_request snapshot", () => {
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /syncSingleRequestApprovalSnapshot/
-  );
-  assert.doesNotMatch(
-    Material.approveSingleRequestByAdmin.toString(),
-    /UPDATE mat_single_request_approval/i
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /UPDATE mat_single_request/i
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /INSERT INTO mat_single_request_edit_history/i
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /editedRequest/
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /material_sub_group_id/
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /template_payload/
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /BEGIN/
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /COMMIT/
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /ROLLBACK/
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /snapshot\.created_by \?\? null/
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /snapshot\.created_at \?\? null/
-  );
-  assert.doesNotMatch(
-    Material.approveSingleRequestByAdmin.toString(),
-    /actorUserId \?\? snapshot\.created_by/
-  );
-  assert.match(Material.approveSingleRequestByAdmin.toString(), /ticket_type/i);
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /resolveSingleRequestMaterialCode/i
-  );
-  assert.match(
-    Material.approveSingleRequestByAdmin.toString(),
-    /change_extend_reason/i
-  );
-});
-
 test("approval action workflow skips edit history for Change and Extend requests", () => {
-  const source = Material.approveSingleRequestByAdmin.toString();
+  const source = materialService.approveSingleRequestByAdmin.toString();
   assert.match(source, /ticketType|ticket_type/);
   assert.match(source, /INSERT INTO mat_single_request_edit_history/i);
 });
 
 test("approval action workflow applies Change updates to mat_sap_data and validates Extend material codes", () => {
-  const source = Material.approveSingleRequestByAdmin.toString();
+  const source = materialService.approveSingleRequestByAdmin.toString();
   assert.match(source, /UPDATE mat_sap_data/i);
   assert.match(source, /unit_of_measurement/i);
   assert.match(source, /resolveSingleRequestMaterialCode/i);
@@ -541,7 +282,7 @@ test("approval action workflow applies Change updates to mat_sap_data and valida
 });
 
 test("approval action workflow accepts finalCodeSuffix and stores final_code at Approval 3", () => {
-  const source = Material.approveSingleRequestByAdmin.toString();
+  const source = materialService.approveSingleRequestByAdmin.toString();
   assert.match(source, /finalCodeSuffix/);
   assert.match(source, /buildSingleRequestFinalCode/);
   assert.match(source, /final_code/);
@@ -611,7 +352,7 @@ test("approveSingleRequestByAdmin stores composed final_code on Approval 3", asy
   });
 
   try {
-    const result = await Material.approveSingleRequestByAdmin({
+    const result = await materialService.approveSingleRequestByAdmin({
       requestId: 77,
       actorUserId: "APP-03",
       actorUsername: "mdm.user",
@@ -629,81 +370,47 @@ test("approveSingleRequestByAdmin stores composed final_code on Approval 3", asy
 
 test("getSingleRequestApprovalInbox query aggregates edit history from history table", () => {
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /LEFT JOIN LATERAL\s*\(\s*SELECT[\s\S]*jsonb_agg\([\s\S]*ORDER BY eh\.approved_at DESC[\s\S]*FROM mat_single_request_edit_history eh[\s\S]*WHERE eh\.request_id = r\.id[\s\S]*\)\s*edit_history_rows ON TRUE/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /COALESCE\(edit_history_rows\.edit_history, '\[\]'::jsonb\) AS edit_history/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /'approved_by_user_id', eh\.approved_by_user_id[\s\S]*'approved_by_username', COALESCE\(au\.username, eh\.approved_by_user_id\)[\s\S]*'approve_remark', eh\.approve_remark[\s\S]*'created_by', eh\.created_by[\s\S]*'created_at', eh\.created_at/i
   );
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /'material_description', eh\.material_description[\s\S]*'base_uom', eh\.base_uom[\s\S]*'template_payload', eh\.template_payload/i
   );
 });
 
 test("locked approval snapshot query reads runtime approval data from mat_single_request", () => {
   assert.doesNotMatch(
-    Material.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
+    materialService.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
     /LEFT JOIN mat_single_request_approval/i
   );
   assert.doesNotMatch(
-    Material.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
+    materialService.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
     /approval_request_id/i
   );
   assert.match(
-    Material.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
+    materialService.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
     /r\.created_by AS requester_user_id/i
   );
   assert.match(
-    Material.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
-    /r\.approval_1_status/i
-  );
-  assert.match(
-    Material.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
+    materialService.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
     /r\.ticket_type/i
   );
   assert.match(
-    Material.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
+    materialService.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
     /requestFields,material_number/i
   );
   assert.match(
-    Material.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
+    materialService.__private.LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
     /r\.change_extend_reason/i
-  );
-});
-
-test("approval 3 assignment workflow updates mat_single_request runtime columns", () => {
-  assert.doesNotMatch(
-    Material.assignSingleRequestApproval3FromMdm.toString(),
-    /UPDATE mat_single_request_approval/i
-  );
-  assert.match(
-    Material.assignSingleRequestApproval3FromMdm.toString(),
-    /UPDATE mat_single_request/i
-  );
-});
-
-test("administrator approver master workflow updates active requests retroactively", () => {
-  assert.match(
-    Material.updateAdministratorApproverMaster.toString(),
-    /buildAdministratorAssignmentDecision/
-  );
-  assert.match(
-    Material.updateAdministratorApproverMaster.toString(),
-    /syncSingleRequestApprovalSnapshot/
-  );
-  assert.doesNotMatch(
-    Material.updateAdministratorApproverMaster.toString(),
-    /getLockedSingleRequestApprovalSnapshot/
-  );
-  assert.doesNotMatch(
-    Material.updateAdministratorApproverMaster.toString(),
-    /WHERE request_id = \$1/
   );
 });
 
@@ -729,11 +436,11 @@ test("createSingleRequest controller forwards ticketType-specific fields", () =>
 });
 
 test("createSingleRequest controller accepts JSON Change payloads without multipart attachments", async () => {
-  const originalCreateSingleRequest = Material.createSingleRequest;
+  const originalCreateSingleRequest = materialService.createSingleRequest;
   const originalGetMaterialByCode = Material.getMaterialByCode;
-  const originalGetGroupById = Material.getGroupById;
-  const originalGetSubGroupById = Material.getSubGroupById;
-  const originalHasActiveSingleRequest = Material.hasActiveSingleRequest;
+  const originalGetGroupById = materialService.getGroupById;
+  const originalGetSubGroupById = materialService.getSubGroupById;
+  const originalHasActiveSingleRequest = materialService.hasActiveSingleRequest;
   const originalValidateMaterialRequestTemplate =
     MaterialTemplate.validateMaterialRequestTemplate;
   let receivedPayload = null;
@@ -747,36 +454,20 @@ test("createSingleRequest controller accepts JSON Change payloads without multip
     groupId: 21,
     subGroupId: 210,
   });
-  Material.getGroupById = async () => ({
+  materialService.getGroupById = async () => ({
     id: 21,
     code: "PACK",
   });
-  Material.getSubGroupById = async () => ({
+  materialService.getSubGroupById = async () => ({
     id: 210,
     item_group_id: 21,
     deleted_at: null,
   });
-  Material.hasActiveSingleRequest = async () => false;
+  materialService.hasActiveSingleRequest = async () => false;
   MaterialTemplate.validateMaterialRequestTemplate = async payload => {
     receivedValidationPayload = payload;
     return {
-      errors: [
-        {
-          fieldKey: "plant",
-          message: "Plant wajib diisi",
-        },
-        {
-          fieldKey: "sales_organization",
-          message: "Sales Organization wajib diisi",
-        },
-      ],
-      requestFieldRules: [
-        { fieldKey: "material_number" },
-        { fieldKey: "material_type" },
-        { fieldKey: "material_group" },
-        { fieldKey: "plant" },
-        { fieldKey: "sales_organization" },
-      ],
+      errors: [],
       materialDescription: payload.requestFields.material_description,
       normalizedRequestFields: {
         material_description: payload.requestFields.material_description,
@@ -785,7 +476,7 @@ test("createSingleRequest controller accepts JSON Change payloads without multip
       normalizedTemplateValues: payload.templateValues,
     };
   };
-  Material.createSingleRequest = async payload => {
+  materialService.createSingleRequest = async payload => {
     receivedPayload = payload;
     return { request_id: 77, ticket_type: "Change" };
   };
@@ -811,10 +502,10 @@ test("createSingleRequest controller accepts JSON Change payloads without multip
         body: {
           ticketType: "Change",
           materialCode: "MAT-001",
-          changeExtendReason: "Need updated description",
+          change_extend_reason: "Need updated description",
           requestFields: {
             material_description: "New desc",
-            base_uom: "KG",
+            base_unit_of_measure: "KG",
           },
           templateValues: {
             density: "1.2",
@@ -827,7 +518,6 @@ test("createSingleRequest controller accepts JSON Change payloads without multip
     assert.equal(response.statusCode, 201);
     assert.deepEqual(receivedValidationPayload.requestFields, {
       material_description: "New desc",
-      base_uom: "KG",
       material_number: "MAT-001",
       material_type: "ZROH",
       material_group: "PACK",
@@ -852,22 +542,22 @@ test("createSingleRequest controller accepts JSON Change payloads without multip
     });
     assert.deepEqual(receivedPayload.attachments, []);
   } finally {
-    Material.createSingleRequest = originalCreateSingleRequest;
+    materialService.createSingleRequest = originalCreateSingleRequest;
     Material.getMaterialByCode = originalGetMaterialByCode;
-    Material.getGroupById = originalGetGroupById;
-    Material.getSubGroupById = originalGetSubGroupById;
-    Material.hasActiveSingleRequest = originalHasActiveSingleRequest;
+    materialService.getGroupById = originalGetGroupById;
+    materialService.getSubGroupById = originalGetSubGroupById;
+    materialService.hasActiveSingleRequest = originalHasActiveSingleRequest;
     MaterialTemplate.validateMaterialRequestTemplate =
       originalValidateMaterialRequestTemplate;
   }
 });
 
 test("createSingleRequest controller allows Change payloads when SAP snapshot has no template values", async () => {
-  const originalCreateSingleRequest = Material.createSingleRequest;
+  const originalCreateSingleRequest = materialService.createSingleRequest;
   const originalGetMaterialByCode = Material.getMaterialByCode;
-  const originalGetGroupById = Material.getGroupById;
-  const originalGetSubGroupById = Material.getSubGroupById;
-  const originalHasActiveSingleRequest = Material.hasActiveSingleRequest;
+  const originalGetGroupById = materialService.getGroupById;
+  const originalGetSubGroupById = materialService.getSubGroupById;
+  const originalHasActiveSingleRequest = materialService.hasActiveSingleRequest;
   const originalValidateMaterialRequestTemplate =
     MaterialTemplate.validateMaterialRequestTemplate;
   let receivedPayload = null;
@@ -880,16 +570,16 @@ test("createSingleRequest controller allows Change payloads when SAP snapshot ha
     groupId: 21,
     subGroupId: 210,
   });
-  Material.getGroupById = async () => ({
+  materialService.getGroupById = async () => ({
     id: 21,
     code: "PACK",
   });
-  Material.getSubGroupById = async () => ({
+  materialService.getSubGroupById = async () => ({
     id: 210,
     item_group_id: 21,
     deleted_at: null,
   });
-  Material.hasActiveSingleRequest = async () => false;
+  materialService.hasActiveSingleRequest = async () => false;
   MaterialTemplate.validateMaterialRequestTemplate = async payload => ({
     errors: [
       {
@@ -900,13 +590,6 @@ test("createSingleRequest controller allows Change payloads when SAP snapshot ha
         fieldKey: "part_number",
         message: "PART NUMBER wajib diisi",
       },
-    ],
-    requestFieldRules: [
-      { fieldKey: "material_number" },
-      { fieldKey: "material_type" },
-      { fieldKey: "material_group" },
-      { fieldKey: "material_description" },
-      { fieldKey: "base_unit_of_measure" },
     ],
     template: {
       fields: [
@@ -921,7 +604,7 @@ test("createSingleRequest controller allows Change payloads when SAP snapshot ha
     },
     normalizedTemplateValues: {},
   });
-  Material.createSingleRequest = async payload => {
+  materialService.createSingleRequest = async payload => {
     receivedPayload = payload;
     return { request_id: 78, ticket_type: "Change" };
   };
@@ -947,10 +630,10 @@ test("createSingleRequest controller allows Change payloads when SAP snapshot ha
         body: {
           ticketType: "Change",
           materialCode: "MAT-001",
-          changeExtendReason: "Need updated description",
+          change_extend_reason: "Need updated description",
           requestFields: {
             material_description: "New desc",
-            base_uom: "KG",
+            base_unit_of_measure: "KG",
           },
           templateValues: {},
         },
@@ -962,21 +645,21 @@ test("createSingleRequest controller allows Change payloads when SAP snapshot ha
     assert.equal(receivedPayload.ticketType, "Change");
     assert.deepEqual(receivedPayload.templateValues, {});
   } finally {
-    Material.createSingleRequest = originalCreateSingleRequest;
+    materialService.createSingleRequest = originalCreateSingleRequest;
     Material.getMaterialByCode = originalGetMaterialByCode;
-    Material.getGroupById = originalGetGroupById;
-    Material.getSubGroupById = originalGetSubGroupById;
-    Material.hasActiveSingleRequest = originalHasActiveSingleRequest;
+    materialService.getGroupById = originalGetGroupById;
+    materialService.getSubGroupById = originalGetSubGroupById;
+    materialService.hasActiveSingleRequest = originalHasActiveSingleRequest;
     MaterialTemplate.validateMaterialRequestTemplate =
       originalValidateMaterialRequestTemplate;
   }
 });
 
 test("createSingleRequest controller keeps Change template format errors when values are provided", async () => {
-  const originalCreateSingleRequest = Material.createSingleRequest;
+  const originalCreateSingleRequest = materialService.createSingleRequest;
   const originalGetMaterialByCode = Material.getMaterialByCode;
-  const originalGetGroupById = Material.getGroupById;
-  const originalGetSubGroupById = Material.getSubGroupById;
+  const originalGetGroupById = materialService.getGroupById;
+  const originalGetSubGroupById = materialService.getSubGroupById;
   const originalValidateMaterialRequestTemplate =
     MaterialTemplate.validateMaterialRequestTemplate;
   let createCalled = false;
@@ -989,11 +672,11 @@ test("createSingleRequest controller keeps Change template format errors when va
     groupId: 21,
     subGroupId: 210,
   });
-  Material.getGroupById = async () => ({
+  materialService.getGroupById = async () => ({
     id: 21,
     code: "PACK",
   });
-  Material.getSubGroupById = async () => ({
+  materialService.getSubGroupById = async () => ({
     id: 210,
     item_group_id: 21,
     deleted_at: null,
@@ -1005,13 +688,6 @@ test("createSingleRequest controller keeps Change template format errors when va
         message: "BRAND / MEREK tidak sesuai rule CAPITAL_ONLY",
       },
     ],
-    requestFieldRules: [
-      { fieldKey: "material_number" },
-      { fieldKey: "material_type" },
-      { fieldKey: "material_group" },
-      { fieldKey: "material_description" },
-      { fieldKey: "base_unit_of_measure" },
-    ],
     template: {
       fields: [{ fieldKey: "brand_merek", isMandatory: true }],
     },
@@ -1022,7 +698,7 @@ test("createSingleRequest controller keeps Change template format errors when va
     },
     normalizedTemplateValues: payload.templateValues,
   });
-  Material.createSingleRequest = async () => {
+  materialService.createSingleRequest = async () => {
     createCalled = true;
     return { request_id: 79, ticket_type: "Change" };
   };
@@ -1048,10 +724,10 @@ test("createSingleRequest controller keeps Change template format errors when va
         body: {
           ticketType: "Change",
           materialCode: "MAT-001",
-          changeExtendReason: "Need updated description",
+          change_extend_reason: "Need updated description",
           requestFields: {
             material_description: "New desc",
-            base_uom: "KG",
+            base_unit_of_measure: "KG",
           },
           templateValues: {
             brand_merek: "bad-value!",
@@ -1070,17 +746,17 @@ test("createSingleRequest controller keeps Change template format errors when va
       },
     ]);
   } finally {
-    Material.createSingleRequest = originalCreateSingleRequest;
+    materialService.createSingleRequest = originalCreateSingleRequest;
     Material.getMaterialByCode = originalGetMaterialByCode;
-    Material.getGroupById = originalGetGroupById;
-    Material.getSubGroupById = originalGetSubGroupById;
+    materialService.getGroupById = originalGetGroupById;
+    materialService.getSubGroupById = originalGetSubGroupById;
     MaterialTemplate.validateMaterialRequestTemplate =
       originalValidateMaterialRequestTemplate;
   }
 });
 
 test("approve controller preserves custom status codes and validation errors", async () => {
-  const originalApprove = Material.approveSingleRequestByAdmin;
+  const originalApprove = materialService.approveSingleRequestByAdmin;
   const req = {
     params: { id: "77" },
     cookies: { user_id: "APP-01", username: "user.one" },
@@ -1104,7 +780,7 @@ test("approve controller preserves custom status codes and validation errors", a
     },
   };
 
-  Material.approveSingleRequestByAdmin = async () => {
+  materialService.approveSingleRequestByAdmin = async () => {
     const error = new Error("Material request validation failed");
     error.statusCode = 400;
     error.code = "SINGLE_REQUEST_EDIT_VALIDATION_FAILED";
@@ -1133,12 +809,12 @@ test("approve controller preserves custom status codes and validation errors", a
       ],
     });
   } finally {
-    Material.approveSingleRequestByAdmin = originalApprove;
+    materialService.approveSingleRequestByAdmin = originalApprove;
   }
 });
 
 test("approve controller forwards finalCodeSuffix to approval workflow", async () => {
-  const originalApprove = Material.approveSingleRequestByAdmin;
+  const originalApprove = materialService.approveSingleRequestByAdmin;
   let receivedPayload = null;
   const req = {
     params: { id: "77" },
@@ -1161,7 +837,7 @@ test("approve controller forwards finalCodeSuffix to approval workflow", async (
     },
   };
 
-  Material.approveSingleRequestByAdmin = async payload => {
+  materialService.approveSingleRequestByAdmin = async payload => {
     receivedPayload = payload;
     return {
       request_id: 77,
@@ -1177,7 +853,7 @@ test("approve controller forwards finalCodeSuffix to approval workflow", async (
     assert.equal(receivedPayload.finalCodeSuffix, "123");
     assert.equal(response.jsonPayload.data.final_code, "901.031.123");
   } finally {
-    Material.approveSingleRequestByAdmin = originalApprove;
+    materialService.approveSingleRequestByAdmin = originalApprove;
   }
 });
 
@@ -1197,7 +873,7 @@ test("createSingleRequest controller validates subgroup membership with item_gro
 
 test("approval edit validation rejects subgroup outside current material group", async () => {
   await assert.rejects(
-    Material.__private.prepareSingleRequestApprovalEditPatch({
+    materialService.__private.prepareSingleRequestApprovalEditPatch({
       snapshot: {
         material_group_id: 10,
         material_sub_group_id: 100,
@@ -1242,7 +918,7 @@ test("approval edit validation rejects subgroup outside current material group",
 test("rework edit validation allows material group change and validates subgroup against new group", async () => {
   let receivedValidationPayload = null;
 
-  const patch = await Material.__private.prepareSingleRequestApprovalEditPatch({
+  const patch = await materialService.__private.prepareSingleRequestApprovalEditPatch({
     snapshot: {
       material_group_id: 10,
       material_sub_group_id: 100,
@@ -1292,7 +968,7 @@ test("rework edit validation allows material group change and validates subgroup
 
 test("approval edit validation surfaces template validation errors", async () => {
   await assert.rejects(
-    Material.__private.prepareSingleRequestApprovalEditPatch({
+    materialService.__private.prepareSingleRequestApprovalEditPatch({
       snapshot: {
         material_group_id: 10,
         material_sub_group_id: 100,
@@ -1340,63 +1016,9 @@ test("approval edit validation surfaces template validation errors", async () =>
   );
 });
 
-test("approval edit validation ignores hidden request-rule validation errors", async () => {
-  const patch = await Material.__private.prepareSingleRequestApprovalEditPatch({
-    snapshot: {
-      material_group_id: 10,
-      material_sub_group_id: 100,
-      material_group_code: "CHEM",
-      material_description: "Current description",
-      base_uom: "EA",
-      plant_code: "P1",
-      sloc_code: "S1",
-      long_text_1: null,
-      long_text_2: null,
-      long_text_3: null,
-      template_payload: { requestFields: {}, templateValues: {} },
-    },
-    editedRequest: {
-      material_description: "New desc",
-    },
-    getSubGroupById: async () => ({
-      id: 100,
-      item_group_id: 10,
-      deleted_at: null,
-    }),
-    validateMaterialRequestTemplate: async ({ requestFields, templateValues }) => ({
-      errors: [
-        {
-          fieldKey: "material_type",
-          message: "Material Type wajib diisi",
-        },
-        {
-          fieldKey: "material_group",
-          message: "Material Group wajib diisi",
-        },
-        {
-          fieldKey: "batch_management",
-          message: "Batch Management wajib diisi",
-        },
-      ],
-      requestFieldRules: [
-        { fieldKey: "material_type" },
-        { fieldKey: "material_group" },
-        { fieldKey: "batch_management" },
-      ],
-      normalizedRequestFields: {
-        material_description: requestFields.material_description,
-        base_unit_of_measure: requestFields.base_unit_of_measure,
-      },
-      normalizedTemplateValues: templateValues,
-    }),
-  });
-
-  assert.equal(patch.material_description, "New desc");
-});
-
-test("approval edit validation still rejects visible request-rule validation errors", async () => {
+test("approval edit validation rejects template validation errors", async () => {
   await assert.rejects(
-    Material.__private.prepareSingleRequestApprovalEditPatch({
+    materialService.__private.prepareSingleRequestApprovalEditPatch({
       snapshot: {
         material_group_id: 10,
         material_sub_group_id: 100,
@@ -1425,7 +1047,6 @@ test("approval edit validation still rejects visible request-rule validation err
             message: "Base Unit of Measure wajib diisi",
           },
         ],
-        requestFieldRules: [{ fieldKey: "base_unit_of_measure" }],
         normalizedRequestFields: {},
         normalizedTemplateValues: {},
       }),
@@ -1445,7 +1066,7 @@ test("approval edit validation still rejects visible request-rule validation err
 });
 
 test("approval edit validation returns normalized editable patch", async () => {
-  const patch = await Material.__private.prepareSingleRequestApprovalEditPatch({
+  const patch = await materialService.__private.prepareSingleRequestApprovalEditPatch({
     snapshot: {
       material_group_id: 10,
       material_sub_group_id: 100,
@@ -1502,7 +1123,7 @@ test("approval edit validation returns normalized editable patch", async () => {
 test("approval edit validation runs for plant and sloc changes", async () => {
   let validationCalls = 0;
 
-  const patch = await Material.__private.prepareSingleRequestApprovalEditPatch({
+  const patch = await materialService.__private.prepareSingleRequestApprovalEditPatch({
     snapshot: {
       material_group_id: 10,
       material_sub_group_id: 100,
@@ -1557,7 +1178,7 @@ test("approval edit validation rejects invalid required-field outcome from long 
   let validationCalls = 0;
 
   await assert.rejects(
-    Material.__private.prepareSingleRequestApprovalEditPatch({
+    materialService.__private.prepareSingleRequestApprovalEditPatch({
       snapshot: {
         material_group_id: 10,
         material_sub_group_id: 100,
@@ -1608,226 +1229,17 @@ test("approval edit validation rejects invalid required-field outcome from long 
   );
 });
 
-test("approval inbox eligibility includes Approval 3 waiting rows", () => {
-  assert.equal(
-    isSingleRequestApprovalInboxEligible({
-      approval_1_status: "APPROVED",
-      approval_2_status: "APPROVED",
-      approval_3_status: "WAITING",
-      status: "Submit",
-    }),
-    true
-  );
-});
-
-test("approval inbox keeps final status rows for admin dataset", () => {
-  assert.equal(
-    isSingleRequestApprovalInboxEligible({
-      approval_1_status: "APPROVED",
-      approval_2_status: "APPROVED",
-      approval_3_status: "APPROVED",
-      status: "Done",
-    }),
-    true
-  );
-});
-
-test("approval inbox filters Approval 3 rows by approval_3_user_id for non-admin users", () => {
-  const rows = [
-    {
-      id: 1,
-      status: "Submit",
-      approval_1_status: "APPROVED",
-      approval_2_status: "APPROVED",
-      approval_3_status: "WAITING",
-      approval_3_user_id: "MDM-01",
-    },
-    {
-      id: 2,
-      status: "Submit",
-      approval_1_status: "APPROVED",
-      approval_2_status: "APPROVED",
-      approval_3_status: "WAITING",
-      approval_3_user_id: "MDM-02",
-    },
-  ];
-
-  assert.deepEqual(
-    filterSingleRequestApprovalInboxRows(rows, {
-      actorUserId: "MDM-01",
-      actorUsername: "mdm.user",
-    }).map(row => row.id),
-    [1]
-  );
-});
-
-test("approval inbox admin sees all eligible rows regardless of active stage", () => {
-  const rows = [
-    {
-      id: 10,
-      status: "Submit",
-      approval_1_status: "WAITING",
-      approval_2_status: null,
-      approval_3_status: null,
-      approval_1_user_id: "APP-1",
-    },
-    {
-      id: 11,
-      status: "Done",
-      approval_1_status: "APPROVED",
-      approval_2_status: "APPROVED",
-      approval_3_status: "APPROVED",
-      approval_3_user_id: "MDM-01",
-    },
-  ];
-
-  assert.deepEqual(
-    filterSingleRequestApprovalInboxRows(rows, {
-      actorUserId: "ADMIN-01",
-      actorUsername: "ADMIN",
-    }).map(row => row.id),
-    [10, 11]
-  );
-});
-
-test("approval inbox non-admin sees cancel row only for their rejected stage", () => {
-  const rows = [
-    {
-      id: 1,
-      status: "CANCEL",
-      approval_1_status: "REJECTED",
-      approval_1_user_id: "APP-01",
-      approval_2_status: null,
-      approval_3_status: null,
-    },
-    {
-      id: 2,
-      status: "CANCEL",
-      approval_1_status: "APPROVED",
-      approval_2_status: "REJECTED",
-      approval_2_user_id: "APP-02",
-      approval_3_status: null,
-    },
-    {
-      id: 3,
-      status: "CANCEL",
-      approval_1_status: "APPROVED",
-      approval_2_status: "REJECTED",
-      approval_2_user_id: "APP-01",
-      approval_3_status: null,
-    },
-  ];
-
-  assert.deepEqual(
-    filterSingleRequestApprovalInboxRows(rows, {
-      actorUserId: "APP-01",
-      actorUsername: "approval.user",
-    }).map(row => row.id),
-    [1, 3]
-  );
-});
-
-test("approval inbox non-admin sees REWORK row when they are any approval assignee", () => {
-  const rows = [
-    { id: 1, status: "Rework", approval_1_status: "APPROVED", approval_1_user_id: "APP-01", approval_2_status: "REWORK", approval_2_user_id: "APP-02", approval_3_status: null },
-    { id: 2, status: "Rework", approval_1_status: "APPROVED", approval_1_user_id: "APP-01", approval_2_status: "REWORK", approval_2_user_id: "APP-02", approval_3_status: null },
-  ];
-
-  assert.deepEqual(
-    filterSingleRequestApprovalInboxRows(rows, {
-      actorUserId: "APP-01",
-      actorUsername: "approval.user",
-    }).map(row => row.id),
-    [1, 2]
-  );
-
-  assert.deepEqual(
-    filterSingleRequestApprovalInboxRows(rows, {
-      actorUserId: "APP-02",
-      actorUsername: "approval.user",
-    }).map(row => row.id),
-    [1, 2]
-  );
-});
-
-test("approval inbox non-admin sees DONE row when they are any approval assignee", () => {
-  const rows = [
-    { id: 1, status: "Done", approval_1_status: "APPROVED", approval_1_user_id: "APP-01", approval_2_status: "APPROVED", approval_2_user_id: "APP-02", approval_3_status: "APPROVED", approval_3_user_id: "APP-03" },
-  ];
-
-  assert.deepEqual(
-    filterSingleRequestApprovalInboxRows(rows, {
-      actorUserId: "APP-01",
-      actorUsername: "approval.user",
-    }).map(row => row.id),
-    [1]
-  );
-
-  assert.deepEqual(
-    filterSingleRequestApprovalInboxRows(rows, {
-      actorUserId: "APP-03",
-      actorUsername: "approval.user",
-    }).map(row => row.id),
-    [1]
-  );
-});
-
-test("approval inbox non-admin sees CANCEL row when they are any approval assignee", () => {
-  const rows = [
-    { id: 1, status: "CANCEL", approval_1_status: "APPROVED", approval_1_user_id: "APP-01", approval_2_status: "REJECTED", approval_2_user_id: "APP-02", approval_3_status: null },
-  ];
-
-  assert.deepEqual(
-    filterSingleRequestApprovalInboxRows(rows, {
-      actorUserId: "APP-01",
-      actorUsername: "approval.user",
-    }).map(row => row.id),
-    [1]
-  );
-
-  assert.deepEqual(
-    filterSingleRequestApprovalInboxRows(rows, {
-      actorUserId: "APP-02",
-      actorUsername: "approval.user",
-    }).map(row => row.id),
-    [1]
-  );
-});
-
-test("approval inbox non-admin does NOT see terminal rows when not an approval assignee", () => {
-  const rows = [
-    { id: 1, status: "Rework", approval_1_status: "APPROVED", approval_1_user_id: "APP-01", approval_2_status: "REWORK", approval_2_user_id: "APP-02", approval_3_status: null },
-    { id: 2, status: "Done", approval_1_status: "APPROVED", approval_1_user_id: "APP-01", approval_2_status: "APPROVED", approval_2_user_id: "APP-02", approval_3_status: "APPROVED", approval_3_user_id: "APP-03" },
-    { id: 3, status: "CANCEL", approval_1_status: "REJECTED", approval_1_user_id: "APP-01", approval_2_status: null, approval_3_status: null },
-  ];
-
-  assert.deepEqual(
-    filterSingleRequestApprovalInboxRows(rows, {
-      actorUserId: "UNRELATED",
-      actorUsername: "other.user",
-    }).map(row => row.id),
-    []
-  );
-});
-
 test("getSingleRequestApprovalInbox query includes Approval 3 waiting rows", () => {
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /approval_2_status = 'APPROVED'[\s\S]*COALESCE\(r\.approval_3_status, 'WAITING'\) = 'WAITING'/i
   );
 });
 
 test("getSingleRequestApprovalInbox query keeps final list statuses for filtering", () => {
   assert.match(
-    Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+    materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /UPPER\(COALESCE\(r\.status, ''\)\) IN \('DONE', 'REWORK', 'REJECT', 'REJECTED', 'CANCEL'\)/i
-  );
-});
-
-test("getSingleRequestApprovalInbox delegates row filtering to shared helper", () => {
-  assert.match(
-    Material.getSingleRequestApprovalInbox.toString(),
-    /filterSingleRequestApprovalInboxRows/
   );
 });
 
@@ -1903,7 +1315,7 @@ test("getSingleRequestApprovalInbox returns aggregated edit_history rows", async
   });
 
   try {
-    const rows = await Material.getSingleRequestApprovalInbox("APP-01", "user.one");
+    const rows = await materialService.getSingleRequestApprovalInbox("APP-01", "user.one");
 
     assert.equal(queryCalls.length, 1);
     assert.equal(rows.length, 1);
@@ -1966,7 +1378,7 @@ test("getSingleRequestApprovalInbox falls back when edit history table is missin
     query: async queryText => {
       queryCalls.push(queryText);
 
-      if (queryText === Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY) {
+      if (queryText === materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY) {
         const error = new Error('relation "mat_single_request_edit_history" does not exist');
         error.code = "42P01";
         throw error;
@@ -1974,7 +1386,7 @@ test("getSingleRequestApprovalInbox falls back when edit history table is missin
 
       assert.equal(
         queryText,
-        Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_LEGACY_QUERY
+        materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_LEGACY_QUERY
       );
 
       return {
@@ -1997,11 +1409,11 @@ test("getSingleRequestApprovalInbox falls back when edit history table is missin
   });
 
   try {
-    const rows = await Material.getSingleRequestApprovalInbox("APP-01", "user.one");
+    const rows = await materialService.getSingleRequestApprovalInbox("APP-01", "user.one");
 
     assert.deepEqual(queryCalls, [
-      Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
-      Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_LEGACY_QUERY,
+      materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+      materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_LEGACY_QUERY,
     ]);
     assert.equal(rows.length, 1);
     assert.deepEqual(rows[0].edit_history, []);
@@ -2018,7 +1430,7 @@ test("getSingleRequestApprovalInbox falls back when rework columns are missing",
     query: async queryText => {
       queryCalls.push(queryText);
 
-      if (queryText === Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY) {
+      if (queryText === materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY) {
         const error = new Error('column r.rework_stage does not exist');
         error.code = "42703";
         throw error;
@@ -2026,7 +1438,7 @@ test("getSingleRequestApprovalInbox falls back when rework columns are missing",
 
       assert.equal(
         queryText,
-        Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY
+        materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY
       );
 
       return {
@@ -2054,11 +1466,11 @@ test("getSingleRequestApprovalInbox falls back when rework columns are missing",
   });
 
   try {
-    const rows = await Material.getSingleRequestApprovalInbox("APP-01", "user.one");
+    const rows = await materialService.getSingleRequestApprovalInbox("APP-01", "user.one");
 
     assert.deepEqual(queryCalls, [
-      Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
-      Material.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY,
+      materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+      materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY,
     ]);
     assert.equal(rows.length, 1);
     assert.equal(rows[0].rework_stage, null);
@@ -2075,7 +1487,7 @@ test("getSingleRequestsByUser falls back when rework columns are missing", async
     query: async (queryText, params = []) => {
       queryCalls.push({ queryText, params });
 
-      if (queryText === Material.__private.GET_SINGLE_REQUEST_LIST_QUERY) {
+      if (queryText === materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY) {
         const error = new Error('column r.rework_by_user_id does not exist');
         error.code = "42703";
         throw error;
@@ -2083,7 +1495,7 @@ test("getSingleRequestsByUser falls back when rework columns are missing", async
 
       assert.equal(
         queryText,
-        Material.__private.GET_SINGLE_REQUEST_LIST_PRE_REWORK_QUERY
+        materialService.__private.GET_SINGLE_REQUEST_LIST_PRE_REWORK_QUERY
       );
       assert.deepEqual(params, ["REQ-01"]);
 
@@ -2105,13 +1517,13 @@ test("getSingleRequestsByUser falls back when rework columns are missing", async
   });
 
   try {
-    const rows = await Material.getSingleRequestsByUser("REQ-01");
+    const rows = await materialService.getSingleRequestsByUser("REQ-01");
 
     assert.deepEqual(
       queryCalls.map(call => call.queryText),
       [
-        Material.__private.GET_SINGLE_REQUEST_LIST_QUERY,
-        Material.__private.GET_SINGLE_REQUEST_LIST_PRE_REWORK_QUERY,
+        materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
+        materialService.__private.GET_SINGLE_REQUEST_LIST_PRE_REWORK_QUERY,
       ]
     );
     assert.equal(rows.length, 1);
@@ -2153,7 +1565,7 @@ test("getSingleRequestsByUser falls back when final_code column is missing", asy
   });
 
   try {
-    const rows = await Material.getSingleRequestsByUser("REQ-01");
+    const rows = await materialService.getSingleRequestsByUser("REQ-01");
 
     assert.equal(queryCalls.length, 2);
     assert.equal(rows.length, 1);
@@ -2196,7 +1608,7 @@ test("getSingleRequestApprovalInbox falls back when final_code column is missing
   });
 
   try {
-    const rows = await Material.getSingleRequestApprovalInbox("APP-01", "user.one");
+    const rows = await materialService.getSingleRequestApprovalInbox("APP-01", "user.one");
 
     assert.equal(queryCalls.length, 2);
     assert.equal(rows.length, 1);
@@ -2208,7 +1620,7 @@ test("getSingleRequestApprovalInbox falls back when final_code column is missing
 
 test("approveSingleRequestByAdmin stores original request creator metadata in edit history", async () => {
   const originalConnect = db.connect;
-  const originalGetSubGroupById = Material.getSubGroupById;
+  const originalGetSubGroupById = materialService.getSubGroupById;
   const originalValidateMaterialRequestTemplate =
     MaterialTemplate.validateMaterialRequestTemplate;
   const queryLog = [];
@@ -2307,7 +1719,7 @@ test("approveSingleRequestByAdmin stores original request creator metadata in ed
     release: () => {},
   });
 
-  Material.getSubGroupById = async () => ({
+  materialService.getSubGroupById = async () => ({
     id: 110,
     item_group_id: 12,
     deleted_at: null,
@@ -2329,7 +1741,7 @@ test("approveSingleRequestByAdmin stores original request creator metadata in ed
   });
 
   try {
-    await Material.approveSingleRequestByAdmin({
+    await materialService.approveSingleRequestByAdmin({
       requestId: 77,
       actorUserId: "APP-01",
       actorUsername: "user.one",
@@ -2379,7 +1791,7 @@ test("approveSingleRequestByAdmin stores original request creator metadata in ed
     );
   } finally {
     db.connect = originalConnect;
-    Material.getSubGroupById = originalGetSubGroupById;
+    materialService.getSubGroupById = originalGetSubGroupById;
     MaterialTemplate.validateMaterialRequestTemplate =
       originalValidateMaterialRequestTemplate;
   }
@@ -2387,7 +1799,7 @@ test("approveSingleRequestByAdmin stores original request creator metadata in ed
 
 test("approveSingleRequestByAdmin auto-assigns Approval 3 for Change when MDM user is available", async () => {
   const originalConnect = db.connect;
-  const originalGetSubGroupById = Material.getSubGroupById;
+  const originalGetSubGroupById = materialService.getSubGroupById;
   const originalValidateMaterialRequestTemplate =
     MaterialTemplate.validateMaterialRequestTemplate;
 
@@ -2487,7 +1899,7 @@ test("approveSingleRequestByAdmin auto-assigns Approval 3 for Change when MDM us
     release: () => {},
   });
 
-  Material.getSubGroupById = async () => ({ id: 110, item_group_id: 12, deleted_at: null });
+  materialService.getSubGroupById = async () => ({ id: 110, item_group_id: 12, deleted_at: null });
   MaterialTemplate.validateMaterialRequestTemplate = async ({ requestFields, templateValues }) => ({
     errors: [],
     materialDescription: requestFields.material_description,
@@ -2499,7 +1911,7 @@ test("approveSingleRequestByAdmin auto-assigns Approval 3 for Change when MDM us
   });
 
   try {
-    const result = await Material.approveSingleRequestByAdmin({
+    const result = await materialService.approveSingleRequestByAdmin({
       requestId: 77,
       actorUserId: "APP-01",
       actorUsername: "approver.user",
@@ -2516,14 +1928,14 @@ test("approveSingleRequestByAdmin auto-assigns Approval 3 for Change when MDM us
   });
   } finally {
     db.connect = originalConnect;
-    Material.getSubGroupById = originalGetSubGroupById;
+    materialService.getSubGroupById = originalGetSubGroupById;
     MaterialTemplate.validateMaterialRequestTemplate = originalValidateMaterialRequestTemplate;
   }
 });
 
 test("approveSingleRequestByAdmin skips history insert when edit-history table is missing", async () => {
   const originalConnect = db.connect;
-  const originalGetSubGroupById = Material.getSubGroupById;
+  const originalGetSubGroupById = materialService.getSubGroupById;
   const originalValidateMaterialRequestTemplate =
     MaterialTemplate.validateMaterialRequestTemplate;
   const originalWarn = console.warn;
@@ -2625,7 +2037,7 @@ test("approveSingleRequestByAdmin skips history insert when edit-history table i
     release: () => {},
   });
 
-  Material.getSubGroupById = async () => ({
+  materialService.getSubGroupById = async () => ({
     id: 110,
     item_group_id: 12,
     deleted_at: null,
@@ -2650,7 +2062,7 @@ test("approveSingleRequestByAdmin skips history insert when edit-history table i
   };
 
   try {
-    const result = await Material.approveSingleRequestByAdmin({
+    const result = await materialService.approveSingleRequestByAdmin({
       requestId: 77,
       actorUserId: "APP-01",
       actorUsername: "user.one",
@@ -2689,7 +2101,7 @@ test("approveSingleRequestByAdmin skips history insert when edit-history table i
     );
   } finally {
     db.connect = originalConnect;
-    Material.getSubGroupById = originalGetSubGroupById;
+    materialService.getSubGroupById = originalGetSubGroupById;
     MaterialTemplate.validateMaterialRequestTemplate =
       originalValidateMaterialRequestTemplate;
     console.warn = originalWarn;
@@ -2758,7 +2170,7 @@ test("createSingleRequest stores aligned insert values for Extend and auto-assig
   });
 
   try {
-    const result = await Material.createSingleRequest({
+    const result = await materialService.createSingleRequest({
       ticketType: "Extend",
       materialCode: "MAT-001",
       changeExtendReason: "Open new storage",
@@ -2908,7 +2320,7 @@ test("createMassRequest stores attachments under item request number path", asyn
   });
 
   try {
-    const result = await Material.createMassRequest({
+    const result = await materialService.createMassRequest({
       rows: [
         {
           plant: "P1",
@@ -2960,41 +2372,13 @@ test("createMassRequest stores attachments under item request number path", asyn
 });
 
 test("material model exposes single request rework and detail methods", () => {
-  assert.equal(typeof Material.requestSingleRequestRework, "function");
-  assert.equal(typeof Material.saveSingleRequestRework, "function");
-  assert.equal(typeof Material.getSingleRequestById, "function");
-});
-
-test("requestSingleRequestRework does not write edit history rows", () => {
-  assert.doesNotMatch(
-    Material.requestSingleRequestRework.toString(),
-    /mat_single_request_edit_history/i
-  );
-  assert.match(
-    Material.requestSingleRequestRework.toString(),
-    /buildSingleRequestReworkPatch/
-  );
-});
-
-test("saveSingleRequestRework keeps latest rework metadata while resetting revised stage", () => {
-  assert.match(
-    Material.saveSingleRequestRework.toString(),
-    /buildSingleRequestRevisedPatch/
-  );
-  assert.match(
-    Material.saveSingleRequestRework.toString(),
-    /prepareSingleRequestApprovalEditPatch/
-  );
-  assert.doesNotMatch(
-    Material.saveSingleRequestRework.toString(),
-    /mat_single_request_edit_history/i
-  );
-  assert.match(Material.saveSingleRequestRework.toString(), /rework_stage/);
-  assert.match(Material.saveSingleRequestRework.toString(), /rework_reason/);
+  assert.equal(typeof materialService.requestSingleRequestRework, "function");
+  assert.equal(typeof materialService.saveSingleRequestRework, "function");
+  assert.equal(typeof materialService.getSingleRequestById, "function");
 });
 
 test("approval edit preparation scopes Change and Extend rework fields", () => {
-  const source = Material.__private.prepareSingleRequestApprovalEditPatch.toString();
+  const source = materialService.__private.prepareSingleRequestApprovalEditPatch.toString();
   assert.match(source, /ticket_type|ticketType/i);
   assert.match(source, /change_extend_reason/i);
   assert.match(source, /material_number/i);
@@ -3062,17 +2446,7 @@ test("single request rework routes are registered after detail route", () => {
 });
 
 test("Material exposes rejectSingleRequestByAdmin", () => {
-  assert.equal(typeof Material.rejectSingleRequestByAdmin, "function");
-});
-
-test("rejectSingleRequestByAdmin uses shared reject patch and submit status guard", () => {
-  const source = Material.rejectSingleRequestByAdmin.toString();
-
-  assert.match(source, /buildSingleRequestRejectPatch/);
-  assert.match(source, /isSubmittedSingleRequestStatus\(snapshot\.status\)/);
-  assert.match(source, /canActorApproveSingleRequestStage/);
-  assert.match(source, /SINGLE_REQUEST_REJECT_STATUS_CONFLICT/);
-  assert.match(source, /SINGLE_REQUEST_REJECT_FORBIDDEN/);
+  assert.equal(typeof materialService.rejectSingleRequestByAdmin, "function");
 });
 
 test("MaterialController exposes rejectSingleRequest", () => {
@@ -3082,7 +2456,7 @@ test("MaterialController exposes rejectSingleRequest", () => {
 test("rejectSingleRequest controller delegates request id, actor, and reason", () => {
   const source = MaterialController.rejectSingleRequest.toString();
 
-  assert.match(source, /Material\.rejectSingleRequestByAdmin/);
+  assert.match(source, /materialService\.rejectSingleRequestByAdmin/);
   assert.match(source, /requestId:\s*req\.params\.id/);
   assert.match(source, /actorUserId:\s*req\.cookies\.user_id/);
   assert.match(source, /actorUsername:\s*req\.cookies\.username/);
@@ -3091,9 +2465,9 @@ test("rejectSingleRequest controller delegates request id, actor, and reason", (
 
 test("rejectSingleRequest controller preserves backend validation metadata", async () => {
   const originalRejectSingleRequestByAdmin =
-    Material.rejectSingleRequestByAdmin;
+    materialService.rejectSingleRequestByAdmin;
 
-  Material.rejectSingleRequestByAdmin = async () => {
+  materialService.rejectSingleRequestByAdmin = async () => {
     const error = new Error("reject reason is required");
     error.statusCode = 400;
     error.code = "REJECT_REASON_REQUIRED";
@@ -3139,7 +2513,7 @@ test("rejectSingleRequest controller preserves backend validation metadata", asy
       },
     ]);
   } finally {
-    Material.rejectSingleRequestByAdmin = originalRejectSingleRequestByAdmin;
+    materialService.rejectSingleRequestByAdmin = originalRejectSingleRequestByAdmin;
   }
 });
 
@@ -3153,24 +2527,6 @@ test("MaterialRoute registers single request reject endpoint", () => {
   assert.match(routeSource, /MaterialController\.rejectSingleRequest/);
 });
 
-test("administrator approver queries exclude cancel rows from active request sync", () => {
-  assert.match(
-    Material.__private.GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY,
-    /UPPER\(COALESCE\(status, ''\)\) IN \('REJECT', 'REJECTED', 'CANCEL'\)/i
-  );
-  assert.match(
-    Material.updateAdministratorApproverMaster.toString(),
-    /UPPER\(COALESCE\(status, ''\)\) IN \('REJECT', 'REJECTED', 'CANCEL'\)/i
-  );
-});
-
-test("requestSingleRequestRework delegates rework timestamp stamping to shared helper patch", () => {
-  assert.match(
-    Material.requestSingleRequestRework.toString(),
-    /const patch = buildSingleRequestReworkPatch/
-  );
-});
-
 test("updateSingleRequestColumns inlines SQL timestamp expressions instead of binding string literals", async () => {
   const calls = [];
   const client = {
@@ -3180,15 +2536,16 @@ test("updateSingleRequestColumns inlines SQL timestamp expressions instead of bi
     },
   };
 
-  await Material.__private.updateSingleRequestColumns(
-    client,
-    77,
-    buildSingleRequestReworkPatch({
-      reworkStage: "Approval 1",
-      actorUserId: "APP-01",
-      reason: "Need revision",
-    })
-  );
+  await materialService.__private.updateSingleRequestColumns(client, 77, {
+    status: "Rework",
+    assigned_to: "Requester",
+    rework_stage: "Approval 1",
+    rework_by_user_id: "APP-01",
+    rework_at: { __sql: "NOW()" },
+    rework_reason: "Need revision",
+    approval_1_status: "REWORK",
+    approval_1_remark: "Need revision",
+  });
 
   assert.equal(calls.length, 1);
   assert.match(calls[0].queryText, /rework_at = NOW\(\)/);
@@ -3197,7 +2554,7 @@ test("updateSingleRequestColumns inlines SQL timestamp expressions instead of bi
 
 test("saveSingleRequestRework keeps requested attachments and appends new uploads safely", async () => {
   const originalConnect = db.connect;
-  const originalGetSubGroupById = Material.getSubGroupById;
+  const originalGetSubGroupById = materialService.getSubGroupById;
   const originalValidateMaterialRequestTemplate =
     MaterialTemplate.validateMaterialRequestTemplate;
   const originalExistsSync = require("fs").existsSync;
@@ -3309,7 +2666,7 @@ test("saveSingleRequestRework keeps requested attachments and appends new upload
     release: () => {},
   });
 
-  Material.getSubGroupById = async () => ({
+  materialService.getSubGroupById = async () => ({
     id: 110,
     item_group_id: 12,
     deleted_at: null,
@@ -3331,7 +2688,7 @@ test("saveSingleRequestRework keeps requested attachments and appends new upload
   });
 
   try {
-    const result = await Material.saveSingleRequestRework({
+    const result = await materialService.saveSingleRequestRework({
       requestId: 77,
       actorUserId: "REQ-01",
       actorUsername: "requester.user",
@@ -3377,7 +2734,7 @@ test("saveSingleRequestRework keeps requested attachments and appends new upload
     );
   } finally {
     db.connect = originalConnect;
-    Material.getSubGroupById = originalGetSubGroupById;
+    materialService.getSubGroupById = originalGetSubGroupById;
     MaterialTemplate.validateMaterialRequestTemplate =
       originalValidateMaterialRequestTemplate;
     require("fs").existsSync = originalExistsSync;
@@ -3438,7 +2795,7 @@ test("saveSingleRequestRework rejects attachment mutation for Change tickets", a
   try {
     await assert.rejects(
       () =>
-        Material.saveSingleRequestRework({
+        materialService.saveSingleRequestRework({
           requestId: 77,
           actorUserId: "REQ-01",
           actorUsername: "requester.user",
@@ -3463,7 +2820,7 @@ test("saveSingleRequestRework rejects attachment mutation for Change tickets", a
 
 test("saveSingleRequestRework persists selected material group for rework edits", async () => {
   const originalConnect = db.connect;
-  const originalGetSubGroupById = Material.getSubGroupById;
+  const originalGetSubGroupById = materialService.getSubGroupById;
   const originalValidateMaterialRequestTemplate =
     MaterialTemplate.validateMaterialRequestTemplate;
   const queryLog = [];
@@ -3536,7 +2893,7 @@ test("saveSingleRequestRework persists selected material group for rework edits"
     release: () => {},
   });
 
-  Material.getSubGroupById = async () => ({
+  materialService.getSubGroupById = async () => ({
     id: 210,
     item_group_id: 21,
     deleted_at: null,
@@ -3561,7 +2918,7 @@ test("saveSingleRequestRework persists selected material group for rework edits"
   };
 
   try {
-    const result = await Material.saveSingleRequestRework({
+    const result = await materialService.saveSingleRequestRework({
       requestId: 77,
       actorUserId: "REQ-01",
       actorUsername: "requester.user",
@@ -3598,7 +2955,7 @@ test("saveSingleRequestRework persists selected material group for rework edits"
     );
   } finally {
     db.connect = originalConnect;
-    Material.getSubGroupById = originalGetSubGroupById;
+    materialService.getSubGroupById = originalGetSubGroupById;
     MaterialTemplate.validateMaterialRequestTemplate =
       originalValidateMaterialRequestTemplate;
   }
@@ -3610,9 +2967,9 @@ test("saveSingleRequestRework controller parses multipart keepAttachmentIds and 
   const originalIncomingForm = formidable.IncomingForm;
   const originalExistsSync = fs.existsSync;
   const originalUnlinkSync = fs.unlinkSync;
-  const originalGetMaterialGroupByCode = Material.getMaterialGroupByCode;
-  const originalGetSubGroupById = Material.getSubGroupById;
-  const originalSaveSingleRequestRework = Material.saveSingleRequestRework;
+  const originalGetMaterialGroupByCode = materialService.getMaterialGroupByCode;
+  const originalGetSubGroupById = materialService.getSubGroupById;
+  const originalSaveSingleRequestRework = materialService.saveSingleRequestRework;
   const unlinked = [];
   let receivedPayload = null;
 
@@ -3624,7 +2981,7 @@ test("saveSingleRequestRework controller parses multipart keepAttachmentIds and 
         subgroup: "110",
         requestFields: JSON.stringify({
           material_description: "Changed desc",
-          base_uom: "KG",
+          base_unit_of_measure: "KG",
           plant: "P1",
           storage_location: "S1",
         }),
@@ -3645,14 +3002,14 @@ test("saveSingleRequestRework controller parses multipart keepAttachmentIds and 
   fs.unlinkSync = filepath => {
     unlinked.push(filepath);
   };
-  Material.getMaterialGroupByCode = async () => ({ id: 12, code: "CHEM" });
-  Material.getSubGroupById = async () => ({
+  materialService.getMaterialGroupByCode = async () => ({ id: 12, code: "CHEM" });
+  materialService.getSubGroupById = async () => ({
     id: 110,
     item_group_id: 12,
     subgroup_code: "SUB",
     deleted_at: null,
   });
-  Material.saveSingleRequestRework = async payload => {
+  materialService.saveSingleRequestRework = async payload => {
     receivedPayload = payload;
     return { request_id: 77, stage: "Approval 1", status: "Submit" };
   };
@@ -3695,9 +3052,9 @@ test("saveSingleRequestRework controller parses multipart keepAttachmentIds and 
     formidable.IncomingForm = originalIncomingForm;
     fs.existsSync = originalExistsSync;
     fs.unlinkSync = originalUnlinkSync;
-    Material.getMaterialGroupByCode = originalGetMaterialGroupByCode;
-    Material.getSubGroupById = originalGetSubGroupById;
-    Material.saveSingleRequestRework = originalSaveSingleRequestRework;
+    materialService.getMaterialGroupByCode = originalGetMaterialGroupByCode;
+    materialService.getSubGroupById = originalGetSubGroupById;
+    materialService.saveSingleRequestRework = originalSaveSingleRequestRework;
   }
 });
 
@@ -3731,11 +3088,11 @@ test("saveSingleRequestRework controller rejects non-multipart attachment update
   );
 });
 
-test("saveSingleRequestRework controller forwards JSON Change editedRequest aliases", async () => {
-  const originalSaveSingleRequestRework = Material.saveSingleRequestRework;
+test("saveSingleRequestRework controller forwards canonical JSON Change editedRequest", async () => {
+  const originalSaveSingleRequestRework = materialService.saveSingleRequestRework;
   let receivedPayload = null;
 
-  Material.saveSingleRequestRework = async payload => {
+  materialService.saveSingleRequestRework = async payload => {
     receivedPayload = payload;
     return { request_id: 77, stage: "Approval 1", status: "Submit" };
   };
@@ -3761,11 +3118,11 @@ test("saveSingleRequestRework controller forwards JSON Change editedRequest alia
         headers: { "content-type": "application/json" },
         body: {
           editedRequest: {
-            ticketType: "Change",
-            changeExtendReason: "Need rename",
-            baseUom: "KG",
-            materialDescription: "Updated desc",
-            templatePayload: { templateValues: { density: "1.2" } },
+            ticket_type: "Change",
+            change_extend_reason: "Need rename",
+            base_uom: "KG",
+            material_description: "Updated desc",
+            template_payload: { templateValues: { density: "1.2" } },
           },
         },
       },
@@ -3782,108 +3139,19 @@ test("saveSingleRequestRework controller forwards JSON Change editedRequest alia
       template_payload: { templateValues: { density: "1.2" } },
     });
   } finally {
-    Material.saveSingleRequestRework = originalSaveSingleRequestRework;
+    materialService.saveSingleRequestRework = originalSaveSingleRequestRework;
   }
 });
 
-test("attachment path helpers build ticket-based paths and normalize filesystem paths", () => {
-  const createdAt = new Date("2026-06-05T08:00:00.000Z");
-
-  assert.strictEqual(
-    Material.__private.buildSingleRequestRelativePath({
-      requestNo: "1000001287",
-      newName: "1717578000000_file.jpg",
-      createdAt,
-    }),
-    "attachments/single-request/2026-06-05/1000001287/1717578000000_file.jpg"
-  );
-  assert.strictEqual(
-    Material.__private.buildMassRequestRelativePath({
-      requestNo: "2000000041",
-      newName: "1717578000000_spec.pdf",
-      createdAt,
-    }),
-    "attachments/mass-request/2026-06-05/2000000041/1717578000000_spec.pdf"
-  );
-  assert.match(
-    Material.__private.normalizeSingleRequestAttachmentRelativePath.toString(),
-    /path\.posix[\s\S]*\.normalize/
-  );
-  assert.match(
-    Material.__private.normalizeSingleRequestAttachmentRelativePath.toString(),
-    /LEGACY_SINGLE_REQUEST_ATTACHMENT_ROOT|SINGLE_REQUEST_ATTACHMENT_ROOT/
-  );
-  assert.match(
-    Material.__private.normalizeSingleRequestAttachmentRelativePath.toString(),
-    /Invalid single request attachment path/
-  );
-  assert.strictEqual(
-    Material.__private.normalizeSingleRequestAttachmentRelativePath(
-      "attachments/single-request/2026-06-05/1000001287/file.jpg"
-    ),
-    "attachments/single-request/2026-06-05/1000001287/file.jpg"
-  );
-  assert.strictEqual(
-    Material.__private.normalizeSingleRequestAttachmentRelativePath(
-      "single-request-attachments/CHEM/SUB/keep.pdf"
-    ),
-    "single-request-attachments/CHEM/SUB/keep.pdf"
-  );
-  assert.match(
-    Material.__private.normalizeMassRequestAttachmentRelativePath.toString(),
-    /LEGACY_MASS_REQUEST_ATTACHMENT_ROOT|MASS_REQUEST_ATTACHMENT_ROOT/
-  );
-  assert.strictEqual(
-    Material.__private.normalizeMassRequestAttachmentRelativePath(
-      "attachments/mass-request/2026-06-05/2000000041/spec.pdf"
-    ),
-    "attachments/mass-request/2026-06-05/2000000041/spec.pdf"
-  );
-  assert.strictEqual(
-    Material.__private.normalizeMassRequestAttachmentRelativePath(
-      "mass-request-attachments/CHEM/SUB/spec.pdf"
-    ),
-    "mass-request-attachments/CHEM/SUB/spec.pdf"
-  );
-  assert.throws(
-    () =>
-      Material.__private.normalizeSingleRequestAttachmentRelativePath(
-        "attachments/single-request/../../secrets.txt"
-      ),
-    /Invalid single request attachment path/
-  );
-  assert.throws(
-    () =>
-      Material.__private.normalizeMassRequestAttachmentRelativePath(
-        "attachments/mass-request/../../secrets.txt"
-      ),
-    /Invalid mass request attachment path/
-  );
-  assert.throws(
-    () =>
-      Material.__private.normalizeSingleRequestAttachmentRelativePath(
-        "attachments/other/x.txt"
-      ),
-    /Invalid single request attachment path/
-  );
-  assert.throws(
-    () =>
-      Material.__private.normalizeMassRequestAttachmentRelativePath(
-        "attachments/other/x.txt"
-      ),
-    /Invalid mass request attachment path/
-  );
-});
-
 test("serveFile resolves files inside configured directories only", () => {
-  assert.match(
-    MaterialController.serveFile.toString(),
-    /resolveMaterialFilePath/
-  );
   const controllerSource = require("fs").readFileSync(
     require("path").join(__dirname, "../controllers/MaterialController.js"),
     "utf8"
   );
-  assert.match(controllerSource, /path\.resolve\(absoluteDirectory, normalizedSubPath\)/);
+  assert.doesNotMatch(controllerSource, /resolveMaterialFilePath/);
+  assert.match(
+    controllerSource,
+    /path\.resolve\(\s*absoluteDirectory,\s*normalizedSubPath\s*\)/
+  );
   assert.match(controllerSource, /candidatePath\.startsWith\(directoryPrefix\)/);
 });

@@ -1,5 +1,4 @@
 const db = require("../config/connection");
-const { buildMaterialSidebarMenu } = require("../helper/materialSidebarMenu");
 
 const PageModel = {};
 
@@ -63,7 +62,7 @@ PageModel.showAll = async (role_id, username) => {
                 children: childMenu,
             });
         });
-        const jsonMenu = buildMaterialSidebarMenu(Object.fromEntries(menuAccess));
+        const jsonMenu = Object.fromEntries(menuAccess);
         const nameMenu = Object.fromEntries(menuName);
         return {
             jsonMenu: jsonMenu,

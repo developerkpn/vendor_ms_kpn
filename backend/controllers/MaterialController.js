@@ -1,4 +1,5 @@
 const Material = require("../models/MaterialModel");
+const materialService = require("../services/materialService");
 const MaterialTemplate = require("../models/MaterialTemplateModel");
 const formidable = require("formidable");
 const fs = require("fs");
@@ -6,652 +7,12 @@ const path = require("path");
 const getMimeType = require("../helper/mimetype");
 const {
     buildMaterialDescriptionAndLongText,
-} = require("../helper/materialTemplateHelper");
+} = require("../services/materialService");
 const {
     isAdminMaterialApprover,
     normalizeSingleRequestTicketType,
-} = require("../helper/singleRequestApproval");
-
-const MATERIAL_FILE_DIRECTORIES = [
-    path.join(path.resolve(), "backend", "public"),
-    path.join(path.resolve(), "public"),
-];
-const SINGLE_REQUEST_FILE_EXTENSIONS = [
-    "pdf",
-    "doc",
-    "docx",
-    "png",
-    "jpg",
-    "jpeg",
-];
-const MAX_SINGLE_REQUEST_ATTACHMENTS = 3;
-
-const resolveMaterialFilePath = subPath => {
-    const normalizedSubPath = String(subPath || "").replace(/\\/g, "/");
-
-    return MATERIAL_FILE_DIRECTORIES.map(directory => {
-        const absoluteDirectory = path.resolve(directory);
-        const candidatePath = path.resolve(absoluteDirectory, normalizedSubPath);
-        const directoryPrefix = `${absoluteDirectory}${path.sep}`;
-
-        if (
-            candidatePath !== absoluteDirectory &&
-            !candidatePath.startsWith(directoryPrefix)
-        ) {
-            return null;
-        }
-
-        return candidatePath;
-    }).find(filepath => filepath && fs.existsSync(filepath));
-};
-
-const toFieldValue = value => (Array.isArray(value) ? value[0] : value);
-
-const parseJsonField = value => {
-    const normalized = toFieldValue(value);
-    if (!normalized) {
-        return {};
-    }
-
-    if (typeof normalized === "object") {
-        return normalized;
-    }
-
-    return JSON.parse(normalized);
-};
-
-const cleanupTempFiles = filepaths => {
-    for (const filepath of filepaths) {
-        if (!filepath) {
-            continue;
-        }
-
-        try {
-            if (fs.existsSync(filepath)) {
-                fs.unlinkSync(filepath);
-            }
-        } catch (error) {
-            console.error("Failed to clean up temp upload:", error);
-        }
-    }
-};
-
-const sanitizeUploadName = filename => {
-    const safeOriginalName = path.basename(String(filename || ""));
-    const extensionWithDot = path.extname(safeOriginalName);
-    const extension = extensionWithDot.replace(".", "").toLowerCase();
-    const baseName = path
-        .basename(safeOriginalName, extensionWithDot)
-        .replace(/[^A-Za-z0-9._-]/g, "_")
-        .replace(/_+/g, "_")
-        .replace(/^_+|_+$/g, "");
-
-    return {
-        extension,
-        safeOriginalName: safeOriginalName || "attachment",
-        safeBaseName: baseName || "attachment",
-    };
-};
-
-const sanitizePathSegment = value =>
-    String(value || "")
-        .trim()
-        .replace(/[^A-Za-z0-9._-]/g, "_")
-        .replace(/_+/g, "_")
-        .replace(/^_+|_+$/g, "") || "unknown";
-
-const REQUEST_FIELD_ALIASES = {
-    base_uom: "base_unit_of_measure",
-    materialType: "material_type",
-    materialGroup: "material_group",
-    storageLocation: "storage_location",
-    longText1: "long_text_1",
-    longText2: "long_text_2",
-    longText3: "long_text_3",
-};
-
-const SINGLE_REQUEST_EDITED_REQUEST_ALIASES = {
-    ticketType: "ticket_type",
-    materialCode: "material_code",
-    changeExtendReason: "change_extend_reason",
-    materialGroupId: "material_group_id",
-    materialSubGroupId: "material_sub_group_id",
-    plantCode: "plant_code",
-    slocCode: "sloc_code",
-    materialDescription: "material_description",
-    baseUom: "base_uom",
-    templatePayload: "template_payload",
-    longText1: "long_text_1",
-    longText2: "long_text_2",
-    longText3: "long_text_3",
-};
-
-const SINGLE_REQUEST_LONG_TEXT_FIELD_KEYS = [
-    "long_text_1",
-    "long_text_2",
-    "long_text_3",
-];
-
-const SINGLE_REQUEST_NON_FORM_FIELD_KEYS = new Set([
-    "profit_center",
-    "sales_organization",
-    "distribution_channel",
-    "valuation_class",
-    "valuation_class_project_stock",
-]);
-
-const SINGLE_REQUEST_CHANGE_REQUEST_FIELD_KEYS = new Set([
-    "material_number",
-    "material_type",
-    "material_group",
-    "material_description",
-    "base_uom",
-    "base_unit_of_measure",
-    "long_text_1",
-    "long_text_2",
-    "long_text_3",
-]);
-
-const normalizeRequestFields = payload => {
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-        return {};
-    }
-
-    const normalized = { ...payload };
-
-    for (const [legacyKey, canonicalKey] of Object.entries(
-        REQUEST_FIELD_ALIASES
-    )) {
-        if (
-            normalized[canonicalKey] === undefined &&
-            normalized[legacyKey] !== undefined
-        ) {
-            normalized[canonicalKey] = normalized[legacyKey];
-        }
-    }
-
-    return normalized;
-};
-
-const buildNormalizedSingleRequestFields = ({
-    requestFields = {},
-    validation = {},
-}) => {
-    const normalizedRequestFields = validation.normalizedRequestFields || {};
-    const normalized = {
-        ...normalizedRequestFields,
-        material_description:
-            requestFields.material_description ||
-            validation.materialDescription ||
-            normalizedRequestFields.material_description,
-        storage_location:
-            requestFields.storage_location ||
-            requestFields.storageLocation ||
-            null,
-        plant: requestFields.plant || null,
-    };
-
-    for (const fieldKey of SINGLE_REQUEST_LONG_TEXT_FIELD_KEYS) {
-        if (
-            requestFields[fieldKey] !== undefined &&
-            requestFields[fieldKey] !== null
-        ) {
-            normalized[fieldKey] = requestFields[fieldKey];
-        }
-    }
-
-    return normalized;
-};
-
-const hydrateSingleRequestSapRequestFields = ({
-    ticketType,
-    requestFields = {},
-    sapMaterial = null,
-    materialGroup = null,
-    materialCode = null,
-}) => {
-    const normalized = {
-        ...requestFields,
-    };
-
-    if (!sapMaterial || ticketType === "Create") {
-        return normalized;
-    }
-
-    normalized.material_number =
-        normalized.material_number ??
-        (String(materialCode || sapMaterial.code || "").trim() || null);
-    normalized.material_type =
-        normalized.material_type ??
-        (String(sapMaterial.type || "").trim() || null);
-    normalized.material_group =
-        normalized.material_group ??
-        (String(materialGroup?.code || sapMaterial.groupCode || "").trim() ||
-            null);
-    normalized.base_unit_of_measure =
-        normalized.base_unit_of_measure ??
-        normalized.base_uom ??
-        (String(sapMaterial.unit_of_measurement || "").trim() || null);
-
-    return normalized;
-};
-
-const isSingleRequestCreateValidationErrorVisible = ({
-    error = {},
-    validation = {},
-    ticketType,
-    templateValues = {},
-}) => {
-    const fieldKey = error.fieldKey ?? error.field_key;
-
-    if (!fieldKey || SINGLE_REQUEST_NON_FORM_FIELD_KEYS.has(fieldKey)) {
-        return false;
-    }
-
-    if (ticketType !== "Change") {
-        return true;
-    }
-
-    const isRequestRuleError = (validation.requestFieldRules || []).some(
-        rule => (rule?.fieldKey ?? rule?.field_key) === fieldKey
-    );
-
-    if (
-        isRequestRuleError &&
-        !SINGLE_REQUEST_CHANGE_REQUEST_FIELD_KEYS.has(fieldKey)
-    ) {
-        return false;
-    }
-
-    const matchingTemplateField = Array.isArray(validation.template?.fields)
-        ? validation.template.fields.find(
-              field => (field?.fieldKey ?? field?.field_key) === fieldKey
-          )
-        : null;
-    const templateValue = templateValues[fieldKey];
-    const hasTemplateValue =
-        templateValue !== undefined &&
-        templateValue !== null &&
-        !(
-            typeof templateValue === "string" &&
-            templateValue.trim() === ""
-        );
-    const isMissingTemplateValueError =
-        Boolean(matchingTemplateField?.isMandatory) &&
-        !hasTemplateValue &&
-        /wajib diisi/i.test(String(error.message || ""));
-
-    if (isMissingTemplateValueError) {
-        return false;
-    }
-
-    return true;
-};
-
-const normalizeSingleRequestEditedRequest = payload => {
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-        return payload;
-    }
-
-    const normalized = { ...payload };
-
-    for (const [legacyKey, canonicalKey] of Object.entries(
-        SINGLE_REQUEST_EDITED_REQUEST_ALIASES
-    )) {
-        if (
-            normalized[canonicalKey] === undefined &&
-            normalized[legacyKey] !== undefined
-        ) {
-            normalized[canonicalKey] = normalized[legacyKey];
-        }
-
-        if (legacyKey !== canonicalKey) {
-            delete normalized[legacyKey];
-        }
-    }
-
-    return normalized;
-};
-
-const normalizeUploadedFiles = rawFiles => {
-    const normalized = rawFiles || [];
-    return (Array.isArray(normalized) ? normalized : [normalized]).filter(Boolean);
-};
-
-const parseAttachmentInstructions = value => {
-    const parsed = parseJsonField(value);
-
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return {};
-    }
-
-    return parsed;
-};
-
-const buildSingleRequestAttachmentDescriptors = ({ files = [] } = {}) => {
-    return files.map(file => {
-        const originalFilename = file.originalFilename || file.newFilename;
-        const { extension, safeOriginalName, safeBaseName } =
-            sanitizeUploadName(originalFilename);
-
-        if (!SINGLE_REQUEST_FILE_EXTENSIONS.includes(extension)) {
-            const error = new Error(
-                "Invalid file format. Please upload files with valid extensions: " +
-                    SINGLE_REQUEST_FILE_EXTENSIONS.join(", ")
-            );
-            error.statusCode = 400;
-            throw error;
-        }
-
-        const timestamp = Date.now().toString();
-        const newName = `${timestamp}_${safeBaseName}.${extension}`;
-
-        return {
-            tempPath: file.filepath,
-            originalName: safeOriginalName,
-            newName,
-            extension,
-            mimeType: getMimeType(extension),
-        };
-    });
-};
-
-const buildReworkEditedRequestPayload = ({
-    materialGroup,
-    materialSubGroupId,
-    requestFields = {},
-    templateValues = {},
-}) => ({
-    material_group_id: materialGroup?.id ?? null,
-    material_group_code: materialGroup?.code ?? null,
-    material_sub_group_id: materialSubGroupId,
-    plant_code: requestFields.plant ?? null,
-    sloc_code: requestFields.storage_location ?? requestFields.storageLocation ?? null,
-    material_description: requestFields.material_description ?? null,
-    base_uom:
-        requestFields.base_unit_of_measure ?? requestFields.base_uom ?? null,
-    long_text_1: requestFields.long_text_1 ?? null,
-    long_text_2: requestFields.long_text_2 ?? null,
-    long_text_3: requestFields.long_text_3 ?? null,
-    template_payload: {
-        requestFields,
-        templateValues,
-    },
-});
-
-const withMaterialTemplateAliases = payload => {
-    if (!payload || typeof payload !== "object") {
-        return payload;
-    }
-
-    return {
-        ...payload,
-        material_description:
-            payload.material_description ?? payload.materialDescription ?? null,
-        full_description:
-            payload.full_description ?? payload.fullDescription ?? null,
-        exceeds_material_description_limit:
-            payload.exceeds_material_description_limit ??
-            payload.exceedsMaterialDescriptionLimit ??
-            false,
-        normalized_request_fields:
-            payload.normalized_request_fields ??
-            payload.normalizedRequestFields ??
-            null,
-        normalized_template_values:
-            payload.normalized_template_values ??
-            payload.normalizedTemplateValues ??
-            null,
-        duplicate_suggestions:
-            payload.duplicate_suggestions ?? payload.duplicateSuggestions ?? [],
-        request_field_rules:
-            payload.request_field_rules ?? payload.requestFieldRules ?? [],
-    };
-};
-
-// ---------------------------------------------------------------------------
-// Mass material request (create) helpers
-// ---------------------------------------------------------------------------
-const MASS_MAX_ROWS = 10;
-const MASS_MIN_ROWS = 2;
-const MASS_MAX_ATTACHMENTS_PER_ROW = 3;
-const MASS_MIN_ATTACHMENTS_PER_ROW = 1;
-const MASS_REQUEST_FILE_EXTENSIONS = SINGLE_REQUEST_FILE_EXTENSIONS;
-const MASS_REQUEST_TEXT_FIELDS = [
-    "plant",
-    "sloc",
-    "materialGroup",
-    "materialSubGroup",
-    "description",
-    "poText",
-    "uom",
-    "spesifikasiTambahan",
-];
-
-const createEmptyMassRequestRow = () => ({
-    plant: "",
-    sloc: "",
-    materialGroup: "",
-    materialSubGroup: "",
-    description: "",
-    poText: "",
-    uom: "",
-    spesifikasiTambahan: "",
-});
-
-const normalizeMassRequestRow = (row = {}) => {
-    if (!row || typeof row !== "object" || Array.isArray(row)) {
-        return createEmptyMassRequestRow();
-    }
-
-    const normalized = createEmptyMassRequestRow();
-    for (const fieldKey of MASS_REQUEST_TEXT_FIELDS) {
-        normalized[fieldKey] = String(row[fieldKey] ?? "").trim();
-    }
-    return normalized;
-};
-
-const parseMassRequestRows = value => {
-    const parsed = parseJsonField(value);
-    const source = Array.isArray(parsed) ? parsed : [];
-    const rows = source.map(normalizeMassRequestRow);
-
-    if (rows.length >= MASS_MAX_ROWS) {
-        return rows.slice(0, MASS_MAX_ROWS);
-    }
-
-    const padded = rows.slice();
-    while (padded.length < MASS_MAX_ROWS) {
-        padded.push(createEmptyMassRequestRow());
-    }
-    return padded;
-};
-
-const parseMassRequestFileRowIndexes = value => {
-    if (value === undefined || value === null || value === "") {
-        return [];
-    }
-
-    const raw = Array.isArray(value) ? value : [value];
-    return raw
-        .map(entry => Number.parseInt(toFieldValue(entry), 10))
-        .filter(index => Number.isInteger(index) && index >= 0);
-};
-
-const isMassRequestRowFilled = row =>
-    MASS_REQUEST_TEXT_FIELDS.some(
-        fieldKey => String(row?.[fieldKey] || "").trim() !== ""
-    );
-
-const validateMassRequestRowText = row => {
-    const errors = [];
-    for (const fieldKey of MASS_REQUEST_TEXT_FIELDS) {
-        if (fieldKey === "poText" || fieldKey === "spesifikasiTambahan") {
-            continue;
-        }
-        if (String(row?.[fieldKey] || "").trim() === "") {
-            errors.push({
-                fieldKey,
-                message: fieldKeyToIndonesianMessage(fieldKey),
-            });
-        }
-    }
-    return errors;
-};
-
-const fieldKeyToIndonesianMessage = fieldKey => {
-    switch (fieldKey) {
-        case "plant":
-            return "Plant wajib diisi.";
-        case "sloc":
-            return "Sloc wajib diisi.";
-        case "materialGroup":
-            return "Material group wajib diisi.";
-        case "materialSubGroup":
-            return "Sub material group wajib diisi.";
-        case "description":
-            return "Material description wajib diisi.";
-        case "uom":
-            return "Base UoM wajib diisi.";
-        default:
-            return "Field wajib diisi.";
-    }
-};
-
-const validateMassRequestBatch = ({ rows, files, fileRowIndexes }) => {
-    const errors = [];
-    const filledRowIndexes = [];
-    const filesByRow = Array.from({ length: MASS_MAX_ROWS }, () => 0);
-
-    for (let i = 0; i < fileRowIndexes.length && i < files.length; i += 1) {
-        const index = fileRowIndexes[i];
-        if (
-            Number.isInteger(index) &&
-            index >= 0 &&
-            index < MASS_MAX_ROWS
-        ) {
-            filesByRow[index] = (filesByRow[index] || 0) + 1;
-        }
-    }
-
-    if (rows.length > MASS_MAX_ROWS) {
-        errors.push({
-            rowIndex: -1,
-            fieldKey: "rows",
-            message: `Maksimal ${MASS_MAX_ROWS} baris per submit.`,
-        });
-    }
-
-    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
-        const row = rows[rowIndex];
-        if (!isMassRequestRowFilled(row)) {
-            continue;
-        }
-        filledRowIndexes.push(rowIndex);
-
-        for (const fieldError of validateMassRequestRowText(row)) {
-            errors.push({ rowIndex, ...fieldError });
-        }
-
-        if (String(row.description || "").length > 40) {
-            errors.push({
-                rowIndex,
-                fieldKey: "description",
-                message: "Material description maksimal 40 karakter.",
-            });
-        }
-
-        const attachmentCount = filesByRow[rowIndex] || 0;
-        if (attachmentCount < MASS_MIN_ATTACHMENTS_PER_ROW) {
-            errors.push({
-                rowIndex,
-                fieldKey: "attachments",
-                message: `Minimal ${MASS_MIN_ATTACHMENTS_PER_ROW} attachment per baris.`,
-            });
-        } else if (attachmentCount > MASS_MAX_ATTACHMENTS_PER_ROW) {
-            errors.push({
-                rowIndex,
-                fieldKey: "attachments",
-                message: `Maksimal ${MASS_MAX_ATTACHMENTS_PER_ROW} attachment per baris.`,
-            });
-        }
-    }
-
-    if (filledRowIndexes.length < MASS_MIN_ROWS && errors.length === 0) {
-        errors.push({
-            rowIndex: -1,
-            fieldKey: "rows",
-            message: "Minimal 2 baris harus diisi.",
-        });
-    }
-
-    return { errors, filledRowIndexes };
-};
-const buildMassRequestAttachmentDescriptor = ({
-    file,
-    row,
-}) => {
-    const originalFilename =
-        file.originalFilename || file.newFilename || "attachment";
-    const { extension, safeOriginalName, safeBaseName } =
-        sanitizeUploadName(originalFilename);
-
-    if (!MASS_REQUEST_FILE_EXTENSIONS.includes(extension)) {
-        const error = new Error(
-            "Invalid file format. Please upload files with valid extensions: " +
-                MASS_REQUEST_FILE_EXTENSIONS.join(", ")
-        );
-        error.statusCode = 400;
-        throw error;
-    }
-
-    const safeRowMaterialGroup = sanitizePathSegment(row?.materialGroup);
-    const safeRowSubgroup = sanitizePathSegment(row?.materialSubGroup);
-    const timestamp = Date.now().toString();
-    const newName = `${timestamp}_${safeBaseName}.${extension}`;
-
-    return {
-        tempPath: file.filepath,
-        originalName: safeOriginalName,
-        newName,
-        extension,
-        mimeType: getMimeType(extension),
-        // Kept for legacy callers / audit trails. The model recomposes the
-        // final relative path using the persisted request id + item id, so
-        // these values are not used for storage.
-        legacyGroup: safeRowMaterialGroup,
-        legacySubgroup: safeRowSubgroup,
-    };
-};
-
-const buildMassRequestAttachmentsByRow = ({ rows, files, fileRowIndexes }) => {
-    const result = Array.from({ length: MASS_MAX_ROWS }, () => []);
-
-    for (let i = 0; i < files.length; i += 1) {
-        const file = files[i];
-        const rawIndex = fileRowIndexes[i];
-        const rowIndex = Number.parseInt(rawIndex, 10);
-
-        if (
-            !Number.isInteger(rowIndex) ||
-            rowIndex < 0 ||
-            rowIndex >= MASS_MAX_ROWS
-        ) {
-            const error = new Error(
-                "Invalid file row mapping. Each file must be linked to a valid row index."
-            );
-            error.statusCode = 400;
-            throw error;
-        }
-
-        const row = rows[rowIndex] || createEmptyMassRequestRow();
-        result[rowIndex].push(
-            buildMassRequestAttachmentDescriptor({ file, row })
-        );
-    }
-
-    return result;
-};
+} = require("../services/materialService");
+const { sanitizeUploadName } = require("../utils/uploadName");
 
 const MaterialController = {
     // Create a new material group
@@ -742,7 +103,7 @@ const MaterialController = {
             const { groupId } = req.params;
             const deletedBy = req.cookies.user_id;
             // Validation: check if group exists and is not already deleted
-            const groupCheck = await Material.getGroupById(groupId);
+            const groupCheck = await materialService.getGroupById(groupId);
             if (!groupCheck) {
                 throw new Error("Group not found");
             }
@@ -881,7 +242,7 @@ const MaterialController = {
             const { subGroupId } = req.params;
             const deletedBy = req.cookies.user_id;
             // Validation: check if subgroup exists and is not already deleted
-            const subGroupCheck = await Material.getSubGroupById(subGroupId);
+            const subGroupCheck = await materialService.getSubGroupById(subGroupId);
             if (!subGroupCheck) {
                 throw new Error("Subgroup not found");
             }
@@ -1589,7 +950,24 @@ const MaterialController = {
                         ? req.params.subPath
                         : "";
             const subPath = rawSubPath.replace(/^\/+/, "");
-            const filepath = resolveMaterialFilePath(subPath);
+            const normalizedSubPath = String(subPath).replace(/\\/g, "/");
+            const absoluteDirectory = path.join(
+                path.resolve(),
+                "backend",
+                "public"
+            );
+            const candidatePath = path.resolve(
+                absoluteDirectory,
+                normalizedSubPath
+            );
+            const directoryPrefix = `${absoluteDirectory}${path.sep}`;
+            const filepath =
+                candidatePath !== absoluteDirectory &&
+                !candidatePath.startsWith(directoryPrefix)
+                    ? null
+                    : fs.existsSync(candidatePath)
+                      ? candidatePath
+                      : undefined;
 
             // Check if file exists
             if (!filepath) {
@@ -1829,7 +1207,7 @@ const MaterialController = {
             return res.status(200).json({
                 success: true,
                 message: "Material description preview generated successfully",
-                data: withMaterialTemplateAliases(preview),
+                data: preview,
             });
         } catch (error) {
             const statusCode =
@@ -1871,7 +1249,7 @@ const MaterialController = {
             return res.status(200).json({
                 success: true,
                 message: "Material template validated successfully",
-                data: withMaterialTemplateAliases(validation),
+                data: validation,
             });
         } catch (error) {
             const statusCode =
@@ -1907,7 +1285,7 @@ const MaterialController = {
                 });
             }
 
-            const hasActive = await Material.hasActiveSingleRequest({
+            const hasActive = await materialService.hasActiveSingleRequest({
                 materialCode,
                 ticketType,
             });
@@ -1929,34 +1307,36 @@ const MaterialController = {
 
         try {
             const userId = req.cookies.user_id;
+            const allowedFileExtensions = [
+                "pdf",
+                "doc",
+                "docx",
+                "png",
+                "jpg",
+                "jpeg",
+            ];
+            const maxAttachments = 3;
             const isMultipartRequest = String(
                 req.headers?.["content-type"] || ""
             ).includes("multipart/form-data");
             let materialGroupCode = "";
             let materialGroupId = Number.parseInt(
-                req.body?.materialGroupId ?? req.body?.material_group_id,
+                req.body?.materialGroupId,
                 10
             );
             let ticketType = normalizeSingleRequestTicketType(
-                req.body?.ticketType ?? req.body?.ticket_type
-            );
-            let materialCode = String(
-                req.body?.materialCode ??
-                    req.body?.material_code ??
-                    ""
+                req.body?.ticketType
             ).trim();
+            let materialCode = String(req.body?.materialCode || "").trim();
             let changeExtendReason = String(
-                req.body?.changeExtendReason ??
-                    req.body?.change_extend_reason ??
-                    ""
+                req.body?.change_extend_reason || ""
             ).trim();
             let materialSubGroupId = Number.parseInt(
-                req.body?.materialSubGroupId ??
-                    req.body?.material_sub_group_id,
+                req.body?.materialSubGroupId,
                 10
             );
-            let requestFields = normalizeRequestFields(req.body?.requestFields);
-            let templateValues = parseJsonField(req.body?.templateValues);
+            let requestFields = req.body?.requestFields || {};
+            let templateValues = req.body?.templateValues || {};
             let files = [];
             let sapMaterial = null;
 
@@ -1966,28 +1346,18 @@ const MaterialController = {
                 form.options.maxFileSize = 5 * 1024 * 1024;
 
                 const [fields, items] = await form.parse(req);
-                materialGroupCode = String(
-                    toFieldValue(fields.materialGroupCode) || ""
-                ).trim();
+                materialGroupCode = String(fields.materialGroupCode || "").trim();
                 ticketType = normalizeSingleRequestTicketType(
-                    toFieldValue(fields.ticketType)
+                    fields.ticketType
                 );
-                materialCode = String(
-                    toFieldValue(fields.materialCode) || ""
-                ).trim();
+                materialCode = String(fields.materialCode || "").trim();
                 changeExtendReason = String(
-                    toFieldValue(fields.changeExtendReason) || ""
+                    fields.changeExtendReason || ""
                 ).trim();
-                const subgroupValue = toFieldValue(fields.subgroup);
-                materialSubGroupId = Number.parseInt(subgroupValue, 10);
-                requestFields = normalizeRequestFields(
-                    parseJsonField(fields.requestFields)
-                );
-                templateValues = parseJsonField(fields.templateValues);
-                const rawFiles = items.files || items.file || [];
-                files = (
-                    Array.isArray(rawFiles) ? rawFiles : [rawFiles]
-                ).filter(Boolean);
+                materialSubGroupId = Number.parseInt(fields.subgroup, 10);
+                requestFields = JSON.parse(fields.requestFields);
+                templateValues = JSON.parse(fields.templateValues);
+                files = (items.files || []).filter(Boolean);
                 tempFilePaths = files.map(file => file.filepath).filter(Boolean);
             }
 
@@ -2070,16 +1440,16 @@ const MaterialController = {
                 });
             }
 
-            if (files.length > MAX_SINGLE_REQUEST_ATTACHMENTS) {
+            if (files.length > maxAttachments) {
                 return res.status(400).json({
                     success: false,
-                    message: `Maximum ${MAX_SINGLE_REQUEST_ATTACHMENTS} attachments are allowed`,
+                    message: `Maximum ${maxAttachments} attachments are allowed`,
                 });
             }
 
             const materialGroup = isMultipartRequest
-                ? await Material.getMaterialGroupByCode(materialGroupCode)
-                : await Material.getGroupById(materialGroupId);
+                ? await materialService.getMaterialGroupByCode(materialGroupCode)
+                : await materialService.getGroupById(materialGroupId);
             if (!materialGroup) {
                 return res.status(404).json({
                     success: false,
@@ -2087,7 +1457,7 @@ const MaterialController = {
                 });
             }
 
-            const subgroup = await Material.getSubGroupById(materialSubGroupId);
+            const subgroup = await materialService.getSubGroupById(materialSubGroupId);
             if (!subgroup || subgroup.deleted_at) {
                 return res.status(404).json({
                     success: false,
@@ -2103,25 +1473,54 @@ const MaterialController = {
                 });
             }
 
-            const attachments = buildSingleRequestAttachmentDescriptors({
-                files,
+            const attachments = files.map(file => {
+                const originalFilename = file.originalFilename || file.newFilename;
+                const { extension, safeOriginalName, safeBaseName } =
+                    sanitizeUploadName(originalFilename);
+
+                if (!allowedFileExtensions.includes(extension)) {
+                    const error = new Error(
+                        "Invalid file format. Please upload files with valid extensions: " +
+                            allowedFileExtensions.join(", ")
+                    );
+                    error.statusCode = 400;
+                    throw error;
+                }
+
+                return {
+                    tempPath: file.filepath,
+                    originalName: safeOriginalName,
+                    newName: `${Date.now()}_${safeBaseName}.${extension}`,
+                    extension,
+                    mimeType: getMimeType(extension),
+                };
             });
 
-            const hydratedRequestFields =
-                hydrateSingleRequestSapRequestFields({
-                    ticketType,
-                    requestFields,
-                    sapMaterial,
-                    materialGroup,
-                    materialCode,
-                });
+            const hydratedRequestFields = { ...requestFields };
+            if (sapMaterial && ticketType !== "Create") {
+                hydratedRequestFields.material_number =
+                    hydratedRequestFields.material_number ??
+                    (String(materialCode || sapMaterial.code || "").trim() ||
+                        null);
+                hydratedRequestFields.material_type =
+                    hydratedRequestFields.material_type ??
+                    (String(sapMaterial.type || "").trim() || null);
+                hydratedRequestFields.material_group =
+                    hydratedRequestFields.material_group ??
+                    (String(
+                        materialGroup?.code || sapMaterial.groupCode || ""
+                    ).trim() || null);
+                hydratedRequestFields.base_unit_of_measure =
+                    hydratedRequestFields.base_unit_of_measure ??
+                    (String(sapMaterial.unit_of_measurement || "").trim() ||
+                        null);
+            }
             const validation =
                 ticketType === "Extend"
                     ? {
                           errors: [],
                           normalizedRequestFields: hydratedRequestFields,
                           normalizedTemplateValues: templateValues,
-                          requestFieldRules: [],
                       }
                     : await MaterialTemplate.validateMaterialRequestTemplate({
                           materialGroupCode,
@@ -2129,15 +1528,36 @@ const MaterialController = {
                           templateValues,
                       });
 
-            const validationErrors = (validation.errors || []).filter(
-                error =>
-                    isSingleRequestCreateValidationErrorVisible({
-                        error,
-                        validation,
-                        ticketType,
-                        templateValues,
-                    })
-            );
+            const validationErrors = (validation.errors || []).filter(error => {
+                const fieldKey = error.fieldKey ?? error.field_key;
+                if (!fieldKey) {
+                    return false;
+                }
+                if (ticketType !== "Change") {
+                    return true;
+                }
+                const matchingTemplateField = Array.isArray(
+                    validation.template?.fields
+                )
+                    ? validation.template.fields.find(
+                          field =>
+                              (field?.fieldKey ?? field?.field_key) === fieldKey
+                      )
+                    : null;
+                const templateValue = templateValues[fieldKey];
+                const hasTemplateValue =
+                    templateValue !== undefined &&
+                    templateValue !== null &&
+                    !(
+                        typeof templateValue === "string" &&
+                        templateValue.trim() === ""
+                    );
+                const isMissingTemplateValueError =
+                    Boolean(matchingTemplateField?.isMandatory) &&
+                    !hasTemplateValue &&
+                    /wajib diisi/i.test(String(error.message || ""));
+                return !isMissingTemplateValueError;
+            });
 
             if (validationErrors.length > 0) {
                 return res.status(400).json({
@@ -2147,10 +1567,37 @@ const MaterialController = {
                 });
             }
 
-            const normalizedRequestFields = buildNormalizedSingleRequestFields({
-                requestFields,
-                validation,
-            });
+            const baseNormalizedFields =
+                validation.normalizedRequestFields || {};
+            const normalizedRequestFields = {
+                ...baseNormalizedFields,
+                material_description:
+                    requestFields.material_description ||
+                    validation.materialDescription ||
+                    baseNormalizedFields.material_description,
+                storage_location: requestFields.storage_location || null,
+                plant: requestFields.plant || null,
+            };
+            for (const fieldKey of [
+                "long_text_1",
+                "long_text_2",
+                "long_text_3",
+            ]) {
+                if (
+                    requestFields[fieldKey] !== undefined &&
+                    requestFields[fieldKey] !== null
+                ) {
+                    normalizedRequestFields[fieldKey] = requestFields[fieldKey];
+                }
+            }
+
+            if (
+                hydratedRequestFields.base_unit_of_measure !== undefined &&
+                hydratedRequestFields.base_unit_of_measure !== null
+            ) {
+                normalizedRequestFields.base_unit_of_measure =
+                    hydratedRequestFields.base_unit_of_measure;
+            }
 
             if (
                 ticketType !== "Extend" &&
@@ -2184,7 +1631,7 @@ const MaterialController = {
             }
 
             if (ticketType !== "Create") {
-                const hasActive = await Material.hasActiveSingleRequest({
+                const hasActive = await materialService.hasActiveSingleRequest({
                     materialCode,
                     ticketType,
                 });
@@ -2197,7 +1644,7 @@ const MaterialController = {
                 }
             }
 
-            const createdRequest = await Material.createSingleRequest({
+            const createdRequest = await materialService.createSingleRequest({
                 ticketType,
                 materialCode,
                 changeExtendReason,
@@ -2231,7 +1678,19 @@ const MaterialController = {
                 errors: error.errors || [],
             });
         } finally {
-            cleanupTempFiles(tempFilePaths);
+            for (const filepath of tempFilePaths) {
+                if (!filepath) {
+                    continue;
+                }
+
+                try {
+                    if (fs.existsSync(filepath)) {
+                        fs.unlinkSync(filepath);
+                    }
+                } catch (error) {
+                    console.error("Failed to clean up temp upload:", error);
+                }
+            }
         }
     },
     // Create a batch of material-create requests (1..10 rows per submit).
@@ -2240,6 +1699,36 @@ const MaterialController = {
 
         try {
             const userId = req.cookies.user_id;
+            const maxRows = 10;
+            const minRows = 2;
+            const maxAttachmentsPerRow = 3;
+            const minAttachmentsPerRow = 1;
+            const allowedFileExtensions = [
+                "pdf",
+                "doc",
+                "docx",
+                "png",
+                "jpg",
+                "jpeg",
+            ];
+            const textFields = [
+                "plant",
+                "sloc",
+                "materialGroup",
+                "materialSubGroup",
+                "description",
+                "poText",
+                "uom",
+                "spesifikasiTambahan",
+            ];
+            const requiredFieldMessages = {
+                plant: "Plant wajib diisi.",
+                sloc: "Sloc wajib diisi.",
+                materialGroup: "Material group wajib diisi.",
+                materialSubGroup: "Sub material group wajib diisi.",
+                description: "Material description wajib diisi.",
+                uom: "Base UoM wajib diisi.",
+            };
             const isMultipartRequest = String(
                 req.headers?.["content-type"] || ""
             ).includes("multipart/form-data");
@@ -2264,18 +1753,14 @@ const MaterialController = {
             form.options.maxFileSize = 5 * 1024 * 1024;
 
             const [fields, items] = await form.parse(req);
-            const rows = parseMassRequestRows(toFieldValue(fields.rows));
-            const rawFiles = items.files || items.file || [];
-            const files = (
-                Array.isArray(rawFiles) ? rawFiles : [rawFiles]
-            ).filter(Boolean);
+            const rows = JSON.parse(fields.rows);
+            const files = (items.files || []).filter(Boolean);
             tempFilePaths = files.map(file => file.filepath).filter(Boolean);
-            const fileRowIndexes = parseMassRequestFileRowIndexes(
-                fields.fileRowIndex
+            const fileRowIndexes = (fields.fileRowIndex || []).map(index =>
+                Number.parseInt(index, 10)
             );
-            const massRequestReason = String(
-                toFieldValue(fields.massRequestReason) || ""
-            ).trim() || null;
+            const massRequestReason =
+                String(fields.massRequestReason || "").trim() || null;
 
             if (!massRequestReason) {
                 return res.status(400).json({
@@ -2284,32 +1769,138 @@ const MaterialController = {
                 });
             }
 
-            const validation = validateMassRequestBatch({
-                rows,
-                files,
-                fileRowIndexes,
-            });
+            const errors = [];
+            const filledRowIndexes = [];
+            const filesByRow = Array.from({ length: maxRows }, () => 0);
+            for (let i = 0; i < fileRowIndexes.length && i < files.length; i += 1) {
+                const index = fileRowIndexes[i];
+                if (
+                    Number.isInteger(index) &&
+                    index >= 0 &&
+                    index < maxRows
+                ) {
+                    filesByRow[index] += 1;
+                }
+            }
+            if (rows.length > maxRows) {
+                errors.push({
+                    rowIndex: -1,
+                    fieldKey: "rows",
+                    message: `Maksimal ${maxRows} baris per submit.`,
+                });
+            }
+            for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+                const row = rows[rowIndex];
+                const isFilled = textFields.some(
+                    fieldKey => String(row?.[fieldKey] || "").trim() !== ""
+                );
+                if (!isFilled) {
+                    continue;
+                }
+                filledRowIndexes.push(rowIndex);
 
-            if (validation.errors.length > 0) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Material request validation failed",
-                    errors: validation.errors,
+                for (const fieldKey of textFields) {
+                    if (
+                        fieldKey === "poText" ||
+                        fieldKey === "spesifikasiTambahan"
+                    ) {
+                        continue;
+                    }
+                    if (String(row?.[fieldKey] || "").trim() === "") {
+                        errors.push({
+                            rowIndex,
+                            fieldKey,
+                            message:
+                                requiredFieldMessages[fieldKey] ||
+                                "Field wajib diisi.",
+                        });
+                    }
+                }
+
+                if (String(row.description || "").length > 40) {
+                    errors.push({
+                        rowIndex,
+                        fieldKey: "description",
+                        message: "Material description maksimal 40 karakter.",
+                    });
+                }
+
+                const attachmentCount = filesByRow[rowIndex] || 0;
+                if (attachmentCount < minAttachmentsPerRow) {
+                    errors.push({
+                        rowIndex,
+                        fieldKey: "attachments",
+                        message: `Minimal ${minAttachmentsPerRow} attachment per baris.`,
+                    });
+                } else if (attachmentCount > maxAttachmentsPerRow) {
+                    errors.push({
+                        rowIndex,
+                        fieldKey: "attachments",
+                        message: `Maksimal ${maxAttachmentsPerRow} attachment per baris.`,
+                    });
+                }
+            }
+
+            if (filledRowIndexes.length < minRows && errors.length === 0) {
+                errors.push({
+                    rowIndex: -1,
+                    fieldKey: "rows",
+                    message: "Minimal 2 baris harus diisi.",
                 });
             }
 
-            const attachmentsByRow = buildMassRequestAttachmentsByRow({
-                rows,
-                files,
-                fileRowIndexes,
-            });
+            if (errors.length > 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Material request validation failed",
+                    errors,
+                });
+            }
 
-            const createdMassRequest = await Material.createMassRequest({
-                rows: rows.filter((_, idx) =>
-                    validation.filledRowIndexes.includes(idx)
-                ),
+            const attachmentsByRow = Array.from(
+                { length: maxRows },
+                () => []
+            );
+            for (let i = 0; i < files.length; i += 1) {
+                const file = files[i];
+                const rowIndex = Number.parseInt(fileRowIndexes[i], 10);
+                if (
+                    !Number.isInteger(rowIndex) ||
+                    rowIndex < 0 ||
+                    rowIndex >= maxRows
+                ) {
+                    const error = new Error(
+                        "Invalid file row mapping. Each file must be linked to a valid row index."
+                    );
+                    error.statusCode = 400;
+                    throw error;
+                }
+
+                const originalFilename =
+                    file.originalFilename || file.newFilename || "attachment";
+                const { extension, safeOriginalName, safeBaseName } =
+                    sanitizeUploadName(originalFilename);
+                if (!allowedFileExtensions.includes(extension)) {
+                    const error = new Error(
+                        "Invalid file format. Please upload files with valid extensions: " +
+                            allowedFileExtensions.join(", ")
+                    );
+                    error.statusCode = 400;
+                    throw error;
+                }
+
+                attachmentsByRow[rowIndex].push({
+                    tempPath: file.filepath,
+                    originalName: safeOriginalName,
+                    newName: `${Date.now()}_${safeBaseName}.${extension}`,
+                    mimeType: getMimeType(extension),
+                });
+            }
+
+            const createdMassRequest = await materialService.createMassRequest({
+                rows: rows.filter((_, idx) => filledRowIndexes.includes(idx)),
                 attachmentsByRow: attachmentsByRow.filter((_, idx) =>
-                    validation.filledRowIndexes.includes(idx)
+                    filledRowIndexes.includes(idx)
                 ),
                 createdBy: userId,
                 createdByUsername: req.cookies?.username ?? null,
@@ -2334,7 +1925,19 @@ const MaterialController = {
                 errors: error.errors || [],
             });
         } finally {
-            cleanupTempFiles(tempFilePaths);
+            for (const filepath of tempFilePaths) {
+                if (!filepath) {
+                    continue;
+                }
+
+                try {
+                    if (fs.existsSync(filepath)) {
+                        fs.unlinkSync(filepath);
+                    }
+                } catch (error) {
+                    console.error("Failed to clean up temp upload:", error);
+                }
+            }
         }
     },
 
@@ -2342,7 +1945,7 @@ const MaterialController = {
     getSingleRequests: async (req, res) => {
         try {
             const userId = req.cookies.user_id;
-            const rows = await Material.getSingleRequestsByUser(userId);
+            const rows = await materialService.getSingleRequestsByUser(userId);
 
             return res.status(200).json({
                 success: true,
@@ -2360,7 +1963,7 @@ const MaterialController = {
     getMassRequests: async (req, res) => {
         try {
             const userId = req.cookies.user_id;
-            const rows = await Material.getMassRequestsByUser(userId);
+            const rows = await materialService.getMassRequestsByUser(userId);
 
             return res.status(200).json({
                 success: true,
@@ -2377,7 +1980,7 @@ const MaterialController = {
 
     getSingleRequestById: async (req, res) => {
         try {
-            const row = await Material.getSingleRequestById({
+            const row = await materialService.getSingleRequestById({
                 requestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
@@ -2406,7 +2009,7 @@ const MaterialController = {
             const actorUsername = req.cookies?.username;
             const actorUserId = req.cookies?.user_id;
 
-            const rows = await Material.getMassRequestApprovalInbox(actorUserId, actorUsername);
+            const rows = await materialService.getMassRequestApprovalInbox(actorUserId, actorUsername);
 
             return res.status(200).json({
                 success: true,
@@ -2424,7 +2027,7 @@ const MaterialController = {
 
     approveMassRequest: async (req, res) => {
         try {
-            const result = await Material.approveMassRequest({
+            const result = await materialService.approveMassRequest({
                 massRequestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
@@ -2455,7 +2058,7 @@ const MaterialController = {
 
     requestMassRequestRework: async (req, res) => {
         try {
-            const result = await Material.requestMassRequestRework({
+            const result = await materialService.requestMassRequestRework({
                 massRequestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
@@ -2482,7 +2085,7 @@ const MaterialController = {
 
     rejectMassRequest: async (req, res) => {
         try {
-            const result = await Material.rejectMassRequestByAdmin({
+            const result = await materialService.rejectMassRequestByAdmin({
                 massRequestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
@@ -2509,7 +2112,7 @@ const MaterialController = {
 
     getMassRequestItems: async (req, res) => {
         try {
-            const items = await Material.getMassRequestItems(req.params.id);
+            const items = await materialService.getMassRequestItems(req.params.id);
 
             return res.status(200).json({
                 success: true,
@@ -2528,7 +2131,7 @@ const MaterialController = {
             const actorUsername = req.cookies?.username;
             const actorUserId = req.cookies?.user_id;
 
-            const rows = await Material.getSingleRequestApprovalInbox(actorUserId, actorUsername);
+            const rows = await materialService.getSingleRequestApprovalInbox(actorUserId, actorUsername);
 
             return res.status(200).json({
                 success: true,
@@ -2546,7 +2149,7 @@ const MaterialController = {
 
     requestSingleRequestRework: async (req, res) => {
         try {
-            const result = await Material.requestSingleRequestRework({
+            const result = await materialService.requestSingleRequestRework({
                 requestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
@@ -2575,9 +2178,16 @@ const MaterialController = {
         let tempFilePaths = [];
 
         try {
-            let editedRequest = normalizeSingleRequestEditedRequest(
-                req.body?.editedRequest ?? null
-            );
+            const allowedFileExtensions = [
+                "pdf",
+                "doc",
+                "docx",
+                "png",
+                "jpg",
+                "jpeg",
+            ];
+            const maxAttachments = 3;
+            let editedRequest = req.body?.editedRequest ?? null;
             let attachments = null;
             const isMultipartRequest = String(
                 req.headers?.["content-type"] || ""
@@ -2601,18 +2211,13 @@ const MaterialController = {
 
                 const [fields, items] = await form.parse(req);
                 const materialGroupCode = String(
-                    toFieldValue(fields.materialGroupCode) || ""
+                    fields.materialGroupCode || ""
                 ).trim();
-                const subgroupValue = toFieldValue(fields.subgroup);
-                const materialSubGroupId = Number.parseInt(subgroupValue, 10);
-                const requestFields = normalizeRequestFields(
-                    parseJsonField(fields.requestFields)
-                );
-                const templateValues = parseJsonField(fields.templateValues);
-                const attachmentInstructions = parseAttachmentInstructions(
-                    fields.attachments
-                );
-                const files = normalizeUploadedFiles(items.files || items.file);
+                const materialSubGroupId = Number.parseInt(fields.subgroup, 10);
+                const requestFields = JSON.parse(fields.requestFields);
+                const templateValues = JSON.parse(fields.templateValues);
+                const attachmentInstructions = JSON.parse(fields.attachments);
+                const files = items.files ? items.files.filter(Boolean) : [];
                 tempFilePaths = files.map(file => file.filepath).filter(Boolean);
 
                 if (!materialGroupCode) {
@@ -2641,15 +2246,15 @@ const MaterialController = {
                     });
                 }
 
-                if (files.length > MAX_SINGLE_REQUEST_ATTACHMENTS) {
+                if (files.length > maxAttachments) {
                     return res.status(400).json({
                         success: false,
-                        message: `Maximum ${MAX_SINGLE_REQUEST_ATTACHMENTS} attachments are allowed`,
+                        message: `Maximum ${maxAttachments} attachments are allowed`,
                     });
                 }
 
                 const materialGroup =
-                    await Material.getMaterialGroupByCode(materialGroupCode);
+                    await materialService.getMaterialGroupByCode(materialGroupCode);
                 if (!materialGroup) {
                     return res.status(404).json({
                         success: false,
@@ -2663,7 +2268,8 @@ const MaterialController = {
                     });
                 }
 
-                const subgroup = await Material.getSubGroupById(materialSubGroupId);
+                const subgroup =
+                    await materialService.getSubGroupById(materialSubGroupId);
                 if (!subgroup || subgroup.deleted_at) {
                     return res.status(404).json({
                         success: false,
@@ -2677,7 +2283,7 @@ const MaterialController = {
                     });
                 }
 
-                    if (Number(subgroup.item_group_id) !== Number(materialGroup.id)) {
+                if (Number(subgroup.item_group_id) !== Number(materialGroup.id)) {
                     return res.status(400).json({
                         success: false,
                         message:
@@ -2721,27 +2327,54 @@ const MaterialController = {
                     }
                 } catch (_) {}
 
-                editedRequest = buildReworkEditedRequestPayload({
-                    materialGroup,
-                    materialSubGroupId,
-                    requestFields,
-                    templateValues,
-                });
+                editedRequest = {
+                    material_group_id: materialGroup?.id ?? null,
+                    material_group_code: materialGroup?.code ?? null,
+                    material_sub_group_id: materialSubGroupId,
+                    plant_code: requestFields.plant ?? null,
+                    sloc_code: requestFields.storage_location ?? null,
+                    material_description:
+                        requestFields.material_description ?? null,
+                    base_uom: requestFields.base_unit_of_measure ?? null,
+                    long_text_1: requestFields.long_text_1 ?? null,
+                    long_text_2: requestFields.long_text_2 ?? null,
+                    long_text_3: requestFields.long_text_3 ?? null,
+                    template_payload: {
+                        requestFields,
+                        templateValues,
+                    },
+                };
                 attachments = {
-                    keepAttachmentIds: Array.isArray(
-                        attachmentInstructions.keepAttachmentIds
-                    )
-                        ? attachmentInstructions.keepAttachmentIds
-                              .map(id => Number.parseInt(id, 10))
-                              .filter(Number.isInteger)
-                        : undefined,
-                    newAttachments: buildSingleRequestAttachmentDescriptors({
-                        files,
+                    keepAttachmentIds: attachmentInstructions.keepAttachmentIds
+                        .map(id => Number.parseInt(id, 10))
+                        .filter(Number.isInteger),
+                    newAttachments: files.map(file => {
+                        const originalFilename =
+                            file.originalFilename || file.newFilename;
+                        const { extension, safeOriginalName, safeBaseName } =
+                            sanitizeUploadName(originalFilename);
+
+                        if (!allowedFileExtensions.includes(extension)) {
+                            const error = new Error(
+                                "Invalid file format. Please upload files with valid extensions: " +
+                                    allowedFileExtensions.join(", ")
+                            );
+                            error.statusCode = 400;
+                            throw error;
+                        }
+
+                        return {
+                            tempPath: file.filepath,
+                            originalName: safeOriginalName,
+                            newName: `${Date.now()}_${safeBaseName}.${extension}`,
+                            extension,
+                            mimeType: getMimeType(extension),
+                        };
                     }),
                 };
             }
 
-            const result = await Material.saveSingleRequestRework({
+            const result = await materialService.saveSingleRequestRework({
                 requestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
@@ -2778,13 +2411,25 @@ const MaterialController = {
                 error: error.message,
             });
         } finally {
-            cleanupTempFiles(tempFilePaths);
+            for (const filepath of tempFilePaths) {
+                if (!filepath) {
+                    continue;
+                }
+
+                try {
+                    if (fs.existsSync(filepath)) {
+                        fs.unlinkSync(filepath);
+                    }
+                } catch (error) {
+                    console.error("Failed to clean up temp upload:", error);
+                }
+            }
         }
     },
 
     rejectSingleRequest: async (req, res) => {
         try {
-            const result = await Material.rejectSingleRequestByAdmin({
+            const result = await materialService.rejectSingleRequestByAdmin({
                 requestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
@@ -2818,7 +2463,7 @@ const MaterialController = {
 
     approveSingleRequest: async (req, res) => {
         try {
-            const result = await Material.approveSingleRequestByAdmin({
+            const result = await materialService.approveSingleRequestByAdmin({
                 requestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
@@ -2892,7 +2537,7 @@ const MaterialController = {
             }
 
             const result =
-                await Material.assignSingleRequestApproversByAdmin(
+                await materialService.assignSingleRequestApproversByAdmin(
                     assignmentPayload
                 );
 
@@ -2923,7 +2568,7 @@ const MaterialController = {
 
             // Optional pagination + search (omit page/limit to get all). Aliases: pageSize, q.
             const { page, limit, pageSize, search, q } = req.query || {};
-            const result = await Material.getAdministratorApproverMasters({
+            const result = await materialService.getAdministratorApproverMasters({
                 page,
                 limit: limit ?? pageSize,
                 search: search ?? q,
@@ -2949,7 +2594,7 @@ const MaterialController = {
             const manualApproverIds =
                 req.body?.manualApprovers ?? req.body?.manualApproverIds;
 
-            const result = await Material.saveRequesterApproverChain({
+            const result = await materialService.saveRequesterApproverChain({
                 requesterUserId: req.params.requesterUserId,
                 manualApproverIds,
                 actorUsername: req.cookies.username,
@@ -2984,7 +2629,7 @@ const MaterialController = {
     // Master Data (final) step of a single request.
     claimSingleRequestMdmStep: async (req, res) => {
         try {
-            const result = await Material.claimSingleRequestMdmStepByUser({
+            const result = await materialService.claimSingleRequestMdmStepByUser({
                 requestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
@@ -3015,7 +2660,7 @@ const MaterialController = {
     // all items of the batch atomically (single winner).
     claimMassRequestMdmStep: async (req, res) => {
         try {
-            const result = await Material.claimMassRequestMdmStepByUser({
+            const result = await materialService.claimMassRequestMdmStepByUser({
                 massRequestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
@@ -3187,8 +2832,8 @@ const MaterialController = {
     getInitialScreenData: async (req, res) => {
         try {
             const [locations, types] = await Promise.all([
-                Material.getLocationAndPlant(),
-                Material.getMaterialTypes(),
+                materialService.getLocationAndPlant(),
+                materialService.getMaterialTypes(),
             ]);
 
             res.status(200).json({
@@ -3202,7 +2847,7 @@ const MaterialController = {
 
     saveMassRequestRework: async (req, res) => {
         try {
-            const result = await Material.saveMassRequestRework({
+            const result = await materialService.saveMassRequestRework({
                 massRequestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 items: req.body?.items ?? null,
@@ -3230,7 +2875,7 @@ const MaterialController = {
 
     getUomMaster: async (req, res) => {
         try {
-            const uomList = await Material.getUomMaster();
+            const uomList = await materialService.getUomMaster();
             res.status(200).json({ success: true, data: uomList });
         } catch (error) {
             res.status(500).json({ success: false, error: error.message });
@@ -3239,7 +2884,7 @@ const MaterialController = {
 
     getPlantMaster: async (req, res) => {
         try {
-            const plantList = await Material.getPlantMaster();
+            const plantList = await materialService.getPlantMaster();
             res.status(200).json({ success: true, data: plantList });
         } catch (error) {
             res.status(500).json({ success: false, error: error.message });
@@ -3248,17 +2893,12 @@ const MaterialController = {
 
     getStorageLocationMaster: async (req, res) => {
         try {
-            const slocList = await Material.getStorageLocationMaster();
+            const slocList = await materialService.getStorageLocationMaster();
             res.status(200).json({ success: true, data: slocList });
         } catch (error) {
             res.status(500).json({ success: false, error: error.message });
         }
     },
-};
-
-MaterialController.__private = {
-    buildNormalizedSingleRequestFields,
-    normalizeRequestFields,
 };
 
 module.exports = MaterialController;

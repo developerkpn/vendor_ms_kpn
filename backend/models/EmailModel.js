@@ -1,7 +1,6 @@
 const mailer = require("nodemailer");
 const Email = require("../helper/generateemail");
 const EmailVerif = require("../helper/generateemailverif");
-const MaterialEmail = require("../helper/generateemailmaterial");
 const db = require("../config/connection");
 const fs = require("fs");
 const os = require("os");
@@ -1072,42 +1071,6 @@ const Emailer = {
         }
     },
 
-    materialEditNotification: async (
-        materialEdits,
-        timeWindow,
-        hostname,
-        mdmMaterialEmails
-    ) => {
-        try {
-            const html = MaterialEmail.materialEditNotification(
-                materialEdits,
-                timeWindow,
-                hostname
-            );
-
-            if (!mdmMaterialEmails) {
-                throw new Error("MDM_MATERIAL emails are required");
-            }
-
-            const emailRecipients = mdmMaterialEmails
-                .split(",")
-                .map(email => email.trim())
-                .filter(email => email.length > 0);
-
-            const setup = {
-                from: process.env.SMTP_USERNAME,
-                to: emailRecipients,
-                subject: `Material Edit Notification - ${timeWindow} (${materialEdits.length} materials)`,
-                html: html,
-            };
-
-            const result = await tp.sendMail(setup);
-            return result;
-        } catch (error) {
-            console.error("Error sending material edit notification:", error);
-            throw error;
-        }
-    },
 };
 
 module.exports = Emailer;

@@ -7,10 +7,7 @@ const crud = require("../helper/crudquery.js");
 const moment = require("moment");
 const PageModel = require("../models/PageModel.js");
 const { param } = require("../routes/UserRoute.js");
-const { buildLoginUserGroupInfo } = require("../helper/singleRequestApproval.js");
-const {
-    buildMaterialSidebarPermission,
-} = require("../helper/materialSidebarMenu.js");
+const { buildLoginUserGroupInfo } = require("../services/materialService.js");
 
 const User = {
     showAll: async ({ page, limit, search } = {}) => {
@@ -500,7 +497,6 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
                     delete: item.fdelete,
                 };
             });
-            authPerm = buildMaterialSidebarPermission(authPerm, username);
             if (!userData.rows[0].is_active) {
                 throw new Error("User is inactive");
             }
@@ -697,10 +693,6 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
                         delete: item.fdelete,
                     };
                 });
-                authPerm = buildMaterialSidebarPermission(
-                    authPerm,
-                    user.username
-                );
                 if (user.role === "VENDOR") {
                     // IF USER VENDOR, CHECK RESET PASS
                     // SELECT IS_RESET_PWD
@@ -786,7 +778,7 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
                     delete: item.fdelete,
                 };
             });
-            return buildMaterialSidebarPermission(authPerm);
+            return authPerm;
         } catch (error) {
             console.error(error);
             throw error;

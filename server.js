@@ -127,28 +127,6 @@ cron.schedule(
     }
 );
 
-// Schedule material edit notification emails at 12 PM daily
-cron.schedule(
-    "* 12 * * *",
-    async () => {
-        await Material.EmailNotificationEditMaterial("12");
-    },
-    {
-        timezone: "Asia/Jakarta",
-    }
-);
-
-// Schedule material edit notification emails at 6 PM daily
-cron.schedule(
-    "0 18 * * *",
-    async () => {
-        await Material.EmailNotificationEditMaterial("18");
-    },
-    {
-        timezone: "Asia/Jakarta",
-    }
-);
-
 async function startServer() {
     await ensureSingleRequestSchema(db);
 

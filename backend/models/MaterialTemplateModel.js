@@ -1,14 +1,13 @@
 const DBClientWrapper = require("../helper/DBClientWrapper.js");
 const {
-    MAX_MATERIAL_DESCRIPTION_LENGTH,
     hasValue,
     mapTemplateConfigRows,
     normalizeTemplateValue,
     validateTemplateValues,
-} = require("../helper/materialTemplateHelper.js");
+} = require("../services/materialService.js");
 const {
     buildMaterialFormSchema,
-} = require("../helper/materialFormSchemaHelper.js");
+} = require("../services/materialService.js");
 
 function parseWildcardSearch(term) {
     if (!term || !term.includes('*')) return null;
@@ -43,22 +42,10 @@ const MaterialTemplate = {
 
     getMaterialTemplateByGroupCode: async materialGroupCode => {
         return DBClientWrapper(async client => {
-            const requestRuleResult = await client.query(`
-                SELECT
-                    field_key,
-                    section_name,
-                    field_label,
-                    display_order,
-                    is_required,
-                    is_locked,
-                    default_value,
-                    source_type,
-                    source_reference,
-                    notes
-                FROM mat_request_field_rules
-                ORDER BY display_order ASC
-            `);
-
+            // Standard request fields (material_type/industry_sector/division,
+            // tax, batch, …) are no longer table-driven — SAP hardcodes/derives
+            // them. The form renders Material Group / Base UoM / spec fields from
+            // hardcoded JSX + the template tables, so requestFieldRules is empty.
             const templateResult = await client.query(
                 `
                     SELECT
@@ -130,18 +117,6 @@ const MaterialTemplate = {
 
             return {
                 materialGroupCode,
-                requestFieldRules: requestRuleResult.rows.map(row => ({
-                    fieldKey: row.field_key,
-                    sectionName: row.section_name,
-                    fieldLabel: row.field_label,
-                    displayOrder: row.display_order,
-                    isRequired: row.is_required,
-                    isLocked: row.is_locked,
-                    defaultValue: row.default_value,
-                    sourceType: row.source_type,
-                    sourceReference: row.source_reference,
-                    notes: row.notes,
-                })),
                 template: templateConfig,
             };
         });
@@ -207,10 +182,6 @@ const MaterialTemplate = {
                     code: row.code,
                     name: row.name,
                 })),
-                requestFieldRules: materialTemplate
-                    ? materialTemplate.requestFieldRules
-                    : [],
-                uiMetadata: [],
             });
         });
     },
@@ -247,43 +218,6 @@ const MaterialTemplate = {
                 );
             const errors = [];
             const normalizedRequestFields = {};
-
-            for (const fieldRule of materialTemplate.requestFieldRules) {
-                let currentValue = requestFields[fieldRule.fieldKey];
-                const isComputedField =
-                    fieldRule.sourceType === "COMPUTED_TEMPLATE";
-
-                if (fieldRule.isLocked && hasValue(fieldRule.defaultValue)) {
-                    currentValue = fieldRule.defaultValue;
-                } else if (
-                    !hasValue(currentValue) &&
-                    hasValue(fieldRule.defaultValue)
-                ) {
-                    currentValue = fieldRule.defaultValue;
-                }
-
-                if (typeof currentValue === "string") {
-                    currentValue = normalizeTemplateValue(currentValue);
-                }
-
-                if (
-                    fieldRule.isRequired &&
-                    !hasValue(currentValue) &&
-                    !isComputedField
-                ) {
-                    errors.push({
-                        fieldKey: fieldRule.fieldKey,
-                        fieldLabel: fieldRule.fieldLabel,
-                        message: `${fieldRule.fieldLabel} wajib diisi`,
-                    });
-                }
-
-                normalizedRequestFields[fieldRule.fieldKey] = hasValue(
-                    currentValue
-                )
-                    ? currentValue
-                    : null;
-            }
 
             const preview = validateTemplateValues(
                 materialTemplate.template,
@@ -337,7 +271,6 @@ const MaterialTemplate = {
 
             return {
                 materialGroupCode,
-                requestFieldRules: materialTemplate.requestFieldRules,
                 template: materialTemplate.template,
                 normalizedRequestFields,
                 normalizedTemplateValues: preview.normalizedValues,
