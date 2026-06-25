@@ -494,37 +494,33 @@ const hasValue = value =>
     value !== null &&
     !(typeof value === "string" && normalizeWhitespace(value) === "");
 
-const splitIntoChunks = (text, maxChunkLength = MAX_MATERIAL_DESCRIPTION_LENGTH) => {
-    const normalized = normalizeWhitespace(text);
-    if (!normalized) {
-        return [];
-    }
-
-    if (normalized.length <= maxChunkLength) {
-        return [normalized];
-    }
-
-    const chunks = [];
-    let remaining = normalized;
-
-    while (remaining.length > 0) {
-        if (remaining.length <= maxChunkLength) {
-            chunks.push(remaining);
-            break;
-        }
-
-        let splitIndex = remaining.lastIndexOf(" ", maxChunkLength);
-        if (splitIndex <= 0) {
-            splitIndex = maxChunkLength;
-        } else {
-            splitIndex += 1;
-        }
-
-        chunks.push(remaining.substring(0, splitIndex).trim());
-        remaining = remaining.substring(splitIndex).trim();
-    }
-
-    return chunks;
+// Partition a full description into the four 40-char SAP columns (material
+// description + 3 long-text continuation columns) by fixed position. This is a
+// plain positional slice — NOT word-aware — so concatenating the columns back
+// reproduces the source exactly. The UI's splitMaterialDescription
+// (ui_vms/src/helper/materialDescription.js) uses the same positional partition;
+// it differs only in that this create path collapses internal whitespace runs
+// up-front (normalizeWhitespace) while an approver edit is preserved verbatim.
+const partitionIntoColumns = text => {
+    const capped = normalizeWhitespace(text).slice(
+        0,
+        MAX_MATERIAL_DESCRIPTION_LENGTH * 4
+    );
+    return {
+        material_description: capped.slice(0, MAX_MATERIAL_DESCRIPTION_LENGTH),
+        long_text_1: capped.slice(
+            MAX_MATERIAL_DESCRIPTION_LENGTH,
+            MAX_MATERIAL_DESCRIPTION_LENGTH * 2
+        ),
+        long_text_2: capped.slice(
+            MAX_MATERIAL_DESCRIPTION_LENGTH * 2,
+            MAX_MATERIAL_DESCRIPTION_LENGTH * 3
+        ),
+        long_text_3: capped.slice(
+            MAX_MATERIAL_DESCRIPTION_LENGTH * 3,
+            MAX_MATERIAL_DESCRIPTION_LENGTH * 4
+        ),
+    };
 };
 
 const buildMaterialDescriptionAndLongText = (templateValues = {}, templateConfig = {}) => {
@@ -544,14 +540,7 @@ const buildMaterialDescriptionAndLongText = (templateValues = {}, templateConfig
     }
 
     const fullDescription = normalizeWhitespace(descriptionParts.join(" "));
-    const chunks = splitIntoChunks(fullDescription, MAX_MATERIAL_DESCRIPTION_LENGTH);
-
-    return {
-        material_description: chunks[0] || "",
-        long_text_1: chunks[1] || "",
-        long_text_2: chunks[2] || "",
-        long_text_3: chunks[3] || "",
-    };
+    return partitionIntoColumns(fullDescription);
 };
 
 const TEMPLATE_VALIDATORS = {
@@ -1617,6 +1606,32 @@ const prepareSingleRequestApprovalEditPatch = async ({
                 mergedTemplatePayload.templateValues ||
                 {},
         };
+    }
+
+    // Defense-in-depth: the four SAP description columns are 40 chars wide and
+    // the approver UI already partitions at 40, but the server must not trust
+    // the client — clamp here so a crafted/oversized value can never be
+    // persisted past the column width and pushed to Oracle VMS_MATERIALDATA.
+    // Clamp both the persisted columns (editablePatch) and the template_payload
+    // copies (normalizedRequestFields, shared by reference into template_payload)
+    // so the two can never disagree.
+    for (const fieldKey of [
+        "material_description",
+        "long_text_1",
+        "long_text_2",
+        "long_text_3",
+    ]) {
+        if (typeof editablePatch[fieldKey] === "string") {
+            editablePatch[fieldKey] = editablePatch[fieldKey].slice(
+                0,
+                MAX_MATERIAL_DESCRIPTION_LENGTH
+            );
+        }
+        if (typeof normalizedRequestFields[fieldKey] === "string") {
+            normalizedRequestFields[fieldKey] = normalizedRequestFields[
+                fieldKey
+            ].slice(0, MAX_MATERIAL_DESCRIPTION_LENGTH);
+        }
     }
 
     return Object.entries(editablePatch).reduce((patch, [field, value]) => {
