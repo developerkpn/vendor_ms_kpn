@@ -35,19 +35,17 @@ CREATE TABLE VMS_MATERIALDATA (
     PURCHASE_ORDER_TEXT     VARCHAR2(132),       -- SAP TDLINE (STXH/STXL)
 
     -- ===== Audit =====
-    CREATED_AT              VARCHAR2(10),        -- DD.MM.YYYY (Asia/Jakarta)
-    UPDATED_AT              VARCHAR2(10),
-    CREATED_BY              VARCHAR2(100),
-    UPDATED_BY              VARCHAR2(100),
+    CREATED_AT              VARCHAR2(10),        -- Date returned from SAP material created
+    APPROVED_AT              VARCHAR2(10),       -- Current date MDM approved at 
+    CREATED_BY              VARCHAR2(100),       -- SAP User id 
+    APPROVED_BY              VARCHAR2(100),      -- Local mst_user email
 
     -- ===== SAP-bridge control columns =====
     FLAG                    VARCHAR2(1) DEFAULT 'I'
-                                CHECK (FLAG IN ('I', 'U')),
+                                CHECK (FLAG IN ('I', 'S', 'E')),
     ISRETREIVEDBYSAP        VARCHAR2(5) DEFAULT 'FALSE'
                                 CHECK (ISRETREIVEDBYSAP IN ('TRUE', 'FALSE')),
-    ERRORMSG_PULL           VARCHAR2(100),
     ERRORMSG_POST           VARCHAR2(100),
-    SYNCED_MATERIAL_NUMBER  VARCHAR2(40),
 
     CONSTRAINT PK_VMS_MATERIALDATA PRIMARY KEY (APP_REQUEST_NO)
 );
