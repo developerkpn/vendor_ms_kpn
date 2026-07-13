@@ -32,10 +32,6 @@ const normalizeTicketType = value => {
     return "Create";
 };
 
-// Create => 'I' (insert/create), Change|Extend => 'U' (update).
-const flagForTicketType = ticketType =>
-    normalizeTicketType(ticketType) === "Create" ? "I" : "U";
-
 // MATNR: Create uses the generated running code (final_code); Change/Extend
 // reuse the existing SAP material code.
 const resolveMaterialNumber = snapshot => {
@@ -75,15 +71,17 @@ const readRequestFields = snapshot => {
 /**
  * @param {object} opts
  * @param {object} opts.snapshot       request row joined with material_group_code
- * @param {string} [opts.pushedBy]     audit user written to CREATED_BY/UPDATED_BY
- * @param {Date}   [opts.now]          timestamp for the audit date
+ * @param {string} [opts.approvedBy]   local mst_user email of the MDM approver,
+ *                                      written to APPROVED_BY (CREATED_BY is left
+ *                                      for SAP to fill on write-back)
+ * @param {Date}   [opts.now]          timestamp for the approval/push date
  * @returns {object} payload keyed by VMS_MATERIALDATA column names — the KEY
  *                   ORDER is the Oracle column list contract (Crud.insertItemOra
  *                   builds INSERT (cols) from these keys); do not reorder.
  */
 const buildMaterialStagingPayload = ({
     snapshot,
-    pushedBy = "SYSTEM",
+    approvedBy = null,
     now = new Date(),
 }) => {
     const rf = readRequestFields(snapshot);
@@ -134,19 +132,23 @@ const buildMaterialStagingPayload = ({
             extractSapCode(userField("material_group")),
         DIVISION: "90", // SAP SPART, fixed constant
         PURCHASE_ORDER_TEXT: tdline,
+        MOVING_AVG_PRICE:
+            userField("moving_avg_price") ?? userField("MOVING_AVG_PRICE"),
 
         // ===== Audit =====
-        CREATED_AT: auditDate,
-        UPDATED_AT: auditDate,
-        CREATED_BY: pushedBy,
-        UPDATED_BY: pushedBy,
+        // CREATED_AT / CREATED_BY (SAP material-created date + SAP user id) are
+        // filled by SAP on write-back, so they go in NULL. APPROVED_* carry our
+        // side: the MDM approval/push date and the approver's mst_user email.
+        CREATED_AT: null,
+        APPROVED_AT: auditDate,
+        CREATED_BY: null,
+        APPROVED_BY: approvedBy,
 
         // ===== SAP-bridge control columns =====
-        FLAG: flagForTicketType(ticketType),
+        // FLAG push status: 'I' inserted (here) / 'S' synced / 'E' error (SAP).
+        FLAG: "I",
         ISRETREIVEDBYSAP: "FALSE",
-        ERRORMSG_PULL: null,
         ERRORMSG_POST: null,
-        SYNCED_MATERIAL_NUMBER: null,
     };
 };
 
@@ -185,7 +187,12 @@ const pushPendingMaterialsToSapStaging = async function ({
                 r.template_payload,
                 r.created_by,
                 -- Sales org derived from the plant's company (one per company):
-                so.sales_org_code AS derived_sales_org
+                so.sales_org_code AS derived_sales_org,
+                -- MDM approver email (one MDM step per request) -> APPROVED_BY:
+                (SELECT mu.email
+                   FROM mat_single_request_approval_step s
+                   JOIN mst_user mu ON mu.user_id = s.approver_user_id
+                  WHERE s.request_id = r.id AND s.kind = 'MDM') AS approved_by_email
              FROM mat_single_request r
              LEFT JOIN mat_item_group mig ON mig.id = r.material_group_id
              LEFT JOIN mst_plant mp ON mp.plant_code = r.plant_code
@@ -229,8 +236,18 @@ const pushPendingMaterialsToSapStaging = async function ({
             try {
                 const payload = buildMaterialStagingPayload({
                     snapshot: row,
-                    pushedBy: row.created_by || "SYSTEM",
+                    approvedBy: row.approved_by_email || null,
                 });
+                // Idempotent (re)stage: drop any prior row for this request first
+                // so an MDM re-approval after a SAP error replaces the stale
+                // (FLAG='E') row with a fresh FLAG='I' row carrying the corrected
+                // data, instead of colliding on the APP_REQUEST_NO primary key.
+                // This also keeps a benign inline-push/cron overlap on the same
+                // PENDING row safe — whichever commits last leaves the same row.
+                await oraclient.execute(
+                    `DELETE FROM ${MATERIAL_SAP_STAGING_TABLE} WHERE APP_REQUEST_NO = :1`,
+                    [row.request_no]
+                );
                 const [insertSql, values] = Crud.insertItemOra(
                     MATERIAL_SAP_STAGING_TABLE,
                     payload
@@ -295,9 +312,12 @@ const pushPendingMaterialsToSapStaging = async function ({
     }
 };
 
-// Reads SAP's write-back on already-pushed rows: when ISRETREIVEDBYSAP='TRUE',
-// promote the Postgres request to SYNCED (capturing SYNCED_MATERIAL_NUMBER) or
-// ERROR (capturing ERRORMSG_POST). Rows SAP hasn't pulled yet stay PUSHED.
+// Reads SAP's write-back (run by the reconcile cron in server.js): a row whose
+// FLAG SAP flipped to 'S' promotes the Postgres request to SYNCED (created in
+// SAP); FLAG 'E' marks it ERROR with ERRORMSG_POST. Rows still FLAG 'I' stay
+// PUSHED ("waiting for SAP"). MATERIAL_NUMBER is the code we pushed (not a
+// SAP-returned value), so it is not read back. Confirm the exact SAP write-back
+// contract with the SAP team.
 const syncMaterialStagingFromSap = async function () {
     const psql = await db.connect();
     let oraclient;
@@ -328,32 +348,37 @@ const syncMaterialStagingFromSap = async function () {
             const chunk = requestNos.slice(i, i + CHUNK);
             const binds = chunk.map((_value, ix) => `:${ix + 1}`).join(", ");
             const { rows: oraRows } = await oraclient.execute(
-                `SELECT APP_REQUEST_NO, SYNCED_MATERIAL_NUMBER, ERRORMSG_POST
+                `SELECT APP_REQUEST_NO, ERRORMSG_POST, FLAG
                  FROM VMS_MATERIALDATA
-                 WHERE ISRETREIVEDBYSAP = 'TRUE'
+                 WHERE FLAG IN ('S', 'E')
                    AND APP_REQUEST_NO IN (${binds})`,
                 chunk
             );
 
             for (const oraRow of oraRows) {
                 // oracledb default outFormat is ARRAY:
-                // [APP_REQUEST_NO, SYNCED_MATERIAL_NUMBER, ERRORMSG_POST]
+                // [APP_REQUEST_NO, ERRORMSG_POST, FLAG]
                 const appRequestNo = oraRow[0];
-                const syncedMaterialNumber = oraRow[1];
-                const errorPost = oraRow[2];
+                const errorPost = oraRow[1];
+                const flag = oraRow[2];
                 const id = idByRequestNo.get(String(appRequestNo));
                 if (!id) {
                     continue;
                 }
 
-                if (errorPost) {
+                if (flag === "E" || errorPost) {
                     await psql.query(
                         `UPDATE mat_single_request
                          SET sap_push_status = 'ERROR',
                              sap_error_msg = $2,
                              updated_at = NOW()
                          WHERE id = $1`,
-                        [id, String(errorPost).slice(0, 500)]
+                        [
+                            id,
+                            String(
+                                errorPost ?? "SAP error (no message returned)"
+                            ).slice(0, 500),
+                        ]
                     );
                     failed.push({
                         request_no: appRequestNo,
@@ -363,11 +388,10 @@ const syncMaterialStagingFromSap = async function () {
                     await psql.query(
                         `UPDATE mat_single_request
                          SET sap_push_status = 'SYNCED',
-                             sap_synced_matnr = $2,
                              sap_error_msg = NULL,
                              updated_at = NOW()
                          WHERE id = $1`,
-                        [id, syncedMaterialNumber ?? null]
+                        [id]
                     );
                     synced.push(appRequestNo);
                 }
@@ -394,7 +418,6 @@ module.exports = {
     MATERIAL_SAP_STAGING_TABLE,
     extractSapCode,
     normalizeTicketType,
-    flagForTicketType,
     resolveMaterialNumber,
     formatSapDate,
     buildMaterialStagingPayload,

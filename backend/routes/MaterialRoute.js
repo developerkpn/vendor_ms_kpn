@@ -254,6 +254,11 @@ router.put(
     AuthToken.authSession,
     MaterialController.saveSingleRequestRework
 );
+router.post(
+    "/requests/single/:id/sap-resubmit",
+    AuthToken.authSession,
+    MaterialController.requestSapErrorRework
+);
 router.put(
     "/requests/mass/:id/rework",
     AuthToken.authSession,

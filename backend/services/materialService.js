@@ -874,6 +874,8 @@ const LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY = `SELECT
             r.created_by,
             r.created_at,
             r.status,
+            r.sap_push_status,
+            r.sap_error_msg,
             r.ticket_type,
             ${SINGLE_REQUEST_MATERIAL_CODE_SQL} AS material_code,
             r.final_code,
@@ -1484,6 +1486,9 @@ const prepareSingleRequestApprovalEditPatch = async ({
             editablePatch.material_description ?? snapshot.material_description,
         base_uom: editablePatch.base_uom ?? snapshot.base_uom,
         base_unit_of_measure: editablePatch.base_uom ?? snapshot.base_uom,
+        moving_avg_price:
+            (mergedTemplatePayload.requestFields || {}).moving_avg_price ??
+            currentRequestFields.moving_avg_price,
         long_text_1: editablePatch.long_text_1 ?? snapshot.long_text_1,
         long_text_2: editablePatch.long_text_2 ?? snapshot.long_text_2,
         long_text_3: editablePatch.long_text_3 ?? snapshot.long_text_3,
@@ -1564,6 +1569,14 @@ const prepareSingleRequestApprovalEditPatch = async ({
         ) {
             normalizedRequestFields[fieldKey] = requestFields[fieldKey];
         }
+    }
+
+    if (
+        requestFields.moving_avg_price !== undefined &&
+        requestFields.moving_avg_price !== null
+    ) {
+        normalizedRequestFields.moving_avg_price =
+            requestFields.moving_avg_price;
     }
 
     if (
@@ -1810,6 +1823,9 @@ const buildSingleRequestSelectFields = ({
                         r.long_text_3,
                         r.template_payload,
                         r.status,
+                        r.sap_push_status,
+                        r.sap_error_msg,
+                        TO_CHAR(r.sap_pushed_at, 'YYYY-MM-DD HH24:MI') AS sap_pushed_at,
                         r.created_by AS requester_user_id,
                         ${SINGLE_REQUEST_STEP_SELECT_FIELDS},
                           ${
@@ -1889,6 +1905,9 @@ const buildSingleRequestApprovalInboxQuery = ({
                         r.long_text_3,
                         r.template_payload,
                         r.status,
+                        r.sap_push_status,
+                        r.sap_error_msg,
+                        TO_CHAR(r.sap_pushed_at, 'YYYY-MM-DD HH24:MI') AS sap_pushed_at,
                         r.created_by AS requester_user_id,
                         COALESCE(u.username, r.created_by) AS created_by,
                         TO_CHAR(r.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
@@ -2665,6 +2684,23 @@ const MaterialRequests = {
                             client,
                             requestId
                         );
+
+                    // Only a request actively awaiting approval can be approved.
+                    // Guards against approving one sitting in Rework (e.g. after a
+                    // SAP-error resubmit) before the requester has fixed the data
+                    // — mirrors the rework/reject handlers.
+                    if (snapshot.status !== "Submit") {
+                        throw Object.assign(
+                            new Error(
+                                "Single request can only be approved while status is Submit"
+                            ),
+                            {
+                                statusCode: 409,
+                                code: "SINGLE_REQUEST_APPROVAL_STATUS_CONFLICT",
+                            }
+                        );
+                    }
+
                     const normalizedTicketType =
                         normalizeSingleRequestTicketType(snapshot.ticket_type);
                     const safeRemark = remark ?? null;
@@ -2912,6 +2948,43 @@ const MaterialRequests = {
                                   finalCodeSuffix,
                               })
                             : null;
+
+                    // Uniqueness guard: the assembled code must not collide with
+                    // an existing SAP material (mat_sap_data mirror) nor with a
+                    // final_code already taken by another request still on its
+                    // way to SAP (DONE but not yet synced into mat_sap_data).
+                    if (finalCode) {
+                        const buildDuplicateFinalCodeError = message =>
+                            Object.assign(new Error(message), {
+                                statusCode: 409,
+                                code: "SINGLE_REQUEST_FINAL_CODE_ALREADY_EXISTS",
+                                errors: [
+                                    { fieldKey: "finalCodeSuffix", message },
+                                ],
+                            });
+
+                        const sapDuplicate = await client.query(
+                            `SELECT 1 FROM mat_sap_data WHERE code = $1 LIMIT 1`,
+                            [finalCode]
+                        );
+                        if (sapDuplicate.rowCount > 0) {
+                            throw buildDuplicateFinalCodeError(
+                                `Material code ${finalCode} already exists in SAP master data. Use a different running number.`
+                            );
+                        }
+
+                        const requestDuplicate = await client.query(
+                            `SELECT request_no FROM mat_single_request
+                             WHERE final_code = $1 AND id <> $2
+                             LIMIT 1`,
+                            [finalCode, requestId]
+                        );
+                        if (requestDuplicate.rowCount > 0) {
+                            throw buildDuplicateFinalCodeError(
+                                `Material code ${finalCode} is already used by request ${requestDuplicate.rows[0].request_no}. Use a different running number.`
+                            );
+                        }
+                    }
 
                     // Advance: mark the active step APPROVED. For MANUAL the
                     // approver is already fixed; for MDM, set the approver to the
@@ -3707,6 +3780,114 @@ const MaterialRequests = {
             });
         } catch (error) {
             console.error("Error rejecting single request by admin:", error);
+            throw error;
+        }
+    },
+
+    // SAP rejected the request (sap_push_status='ERROR'). Send it back to the
+    // MDM stage as a rework: the requester then revises through the normal
+    // rework flow, MDM re-approves, and the inline push re-stages the row
+    // (idempotent DELETE+INSERT -> fresh FLAG='I' with the corrected data). The
+    // manual approvers are NOT re-run — only the Master Data (MDM) stage.
+    requestSapErrorRework: async ({ requestId, actorUserId, actorUsername }) => {
+        try {
+            return await DBClientWrapper(async client => {
+                await client.query("BEGIN");
+                try {
+                    const snapshot =
+                        await getLockedSingleRequestApprovalSnapshot(
+                            client,
+                            requestId
+                        );
+
+                    if (
+                        String(snapshot.sap_push_status || "").toUpperCase() !==
+                        "ERROR"
+                    ) {
+                        throw Object.assign(
+                            new Error(
+                                "Only a request rejected by SAP can be resubmitted"
+                            ),
+                            {
+                                statusCode: 409,
+                                code: "SINGLE_REQUEST_SAP_RETRY_CONFLICT",
+                            }
+                        );
+                    }
+
+                    if (
+                        !canActorReviseSingleRequest({
+                            request: snapshot,
+                            actorUserId,
+                            actorUsername,
+                        })
+                    ) {
+                        throw Object.assign(
+                            new Error(
+                                "Forbidden: only requester or ADMIN can resubmit this request"
+                            ),
+                            {
+                                statusCode: 403,
+                                code: "SINGLE_REQUEST_SAP_RETRY_FORBIDDEN",
+                            }
+                        );
+                    }
+
+                    const steps = await loadSingleRequestSteps(
+                        client,
+                        requestId,
+                        { forUpdate: true }
+                    );
+                    const mdmStep = steps.find(
+                        step => stepKindOf(step) === STEP_KINDS.MDM
+                    );
+                    if (!mdmStep) {
+                        throw Object.assign(
+                            new Error(
+                                "Master Data (MDM) stage not found for this request"
+                            ),
+                            {
+                                statusCode: 409,
+                                code: "SINGLE_REQUEST_SAP_RETRY_NO_MDM",
+                            }
+                        );
+                    }
+
+                    const reason = String(
+                        `SAP error: ${snapshot.sap_error_msg || "rejected by SAP"}`
+                    ).slice(0, 500);
+                    const reworkPatch = buildStepReworkPatch({
+                        activeStep: mdmStep,
+                        actorUserId,
+                        reason,
+                    });
+
+                    // Reopen the MDM stage as a rework, preserving the last MDM
+                    // grabber, and clear the SAP error state — the request is back
+                    // in the approval flow until MDM re-approves and re-stages it.
+                    await updateSingleRequestStepRow(client, mdmStep.id, {
+                        ...reworkPatch.step,
+                        approver_user_id: mdmStep.approver_user_id ?? null,
+                    });
+                    await updateSingleRequestColumns(client, requestId, {
+                        ...reworkPatch.header,
+                        sap_push_status: null,
+                        sap_error_msg: null,
+                    });
+
+                    await client.query("COMMIT");
+                    return {
+                        request_id: Number(requestId),
+                        stage: stepLabel(mdmStep),
+                        status: reworkPatch.header.status,
+                    };
+                } catch (error) {
+                    await client.query("ROLLBACK");
+                    throw error;
+                }
+            });
+        } catch (error) {
+            console.error("Error starting SAP-error rework:", error);
             throw error;
         }
     },

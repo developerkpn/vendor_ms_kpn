@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS public.mat_single_request (
     CONSTRAINT chk_mat_single_request_approval_3_status
         CHECK (approval_3_status IS NULL OR approval_3_status IN ('WAITING', 'APPROVED', 'REWORK', 'REJECTED')),
     CONSTRAINT chk_mat_single_request_rework_stage
-        CHECK (rework_stage IS NULL OR rework_stage IN ('Approval 1', 'Approval 2', 'Approval 3'))
+        CHECK (rework_stage IS NULL OR rework_stage IN ('Approval 1', 'Approval 2', 'Approval 3', 'Master Data'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_mat_single_request_status

@@ -1582,6 +1582,7 @@ const MaterialController = {
                 "long_text_1",
                 "long_text_2",
                 "long_text_3",
+                "moving_avg_price",
             ]) {
                 if (
                     requestFields[fieldKey] !== undefined &&
@@ -2169,6 +2170,36 @@ const MaterialController = {
                     statusCode === 500
                         ? "Failed to request single request rework"
                         : error.message,
+                error: statusCode === 500 ? error.message : undefined,
+            });
+        }
+    },
+
+    // Start a SAP-error resubmit: send the request back to the Master Data (MDM)
+    // stage as a rework. The requester then fixes the data through the normal
+    // revise flow; MDM re-approval re-stages it to Oracle (FLAG='I').
+    requestSapErrorRework: async (req, res) => {
+        try {
+            const result = await materialService.requestSapErrorRework({
+                requestId: req.params.id,
+                actorUserId: req.cookies.user_id,
+                actorUsername: req.cookies.username,
+            });
+
+            return res.status(200).json({
+                success: true,
+                message: "Request sent back to Master Data for resubmission",
+                data: result,
+            });
+        } catch (error) {
+            const statusCode = error.statusCode || 500;
+            return res.status(statusCode).json({
+                success: false,
+                message:
+                    statusCode === 500
+                        ? "Failed to resubmit single request to SAP"
+                        : error.message,
+                code: error.code,
                 error: statusCode === 500 ? error.message : undefined,
             });
         }

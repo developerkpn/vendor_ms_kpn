@@ -4,12 +4,11 @@
 --   NULL     -> never flagged (mass requests / pre-feature rows)
 --   PENDING  -> completed, awaiting push to Oracle
 --   PUSHED   -> inserted into VMS_MATERIALDATA, awaiting SAP pull/post
---   SYNCED   -> SAP confirmed (SYNCED_MATNR written back)
+--   SYNCED   -> SAP confirmed the material was created (FLAG='S')
 --   ERROR    -> push or SAP post failed (see sap_error_msg)
 ALTER TABLE mat_single_request
     ADD COLUMN IF NOT EXISTS sap_push_status  varchar(20) NULL,
     ADD COLUMN IF NOT EXISTS sap_pushed_at    timestamptz NULL,
-    ADD COLUMN IF NOT EXISTS sap_synced_matnr varchar(40) NULL,
     ADD COLUMN IF NOT EXISTS sap_error_msg    text NULL;
 
 -- Cron lookups filter on sap_push_status; keep them index-assisted.

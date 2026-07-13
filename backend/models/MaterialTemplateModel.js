@@ -219,6 +219,27 @@ const MaterialTemplate = {
             const errors = [];
             const normalizedRequestFields = {};
 
+            // Moving Avg Price is optional, but when supplied it must be numeric.
+            // The Oracle staging column is VARCHAR2(50) (no DB constraint) and the
+            // value flows straight to SAP MBEW moving price, so enforce it here —
+            // the single chokepoint shared by the create + edit paths.
+            const movingAvgPriceRaw = requestFields.moving_avg_price;
+            if (
+                movingAvgPriceRaw !== undefined &&
+                movingAvgPriceRaw !== null &&
+                String(movingAvgPriceRaw).trim() !== ""
+            ) {
+                const movingAvgPrice = String(movingAvgPriceRaw).trim();
+                if (/^\d+(\.\d+)?$/.test(movingAvgPrice)) {
+                    normalizedRequestFields.moving_avg_price = movingAvgPrice;
+                } else {
+                    errors.push({
+                        fieldKey: "moving_avg_price",
+                        message: "Moving Avg Price harus berupa angka.",
+                    });
+                }
+            }
+
             const preview = validateTemplateValues(
                 materialTemplate.template,
                 templateValues || {}

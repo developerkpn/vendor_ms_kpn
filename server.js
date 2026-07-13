@@ -21,6 +21,7 @@ const {
 const VerifyLogin = require("./backend/middleware/VerifyLogin");
 const { SchedulerSyncStaged } = require("./backend/helper/Scheduler");
 const Material = require("./backend/models/MaterialModel");
+const materialSapStagingService = require("./backend/services/materialSapStagingService");
 const cron = require("node-cron");
 const moment = require("moment-timezone");
 
@@ -125,6 +126,45 @@ cron.schedule(
     {
         timezone: "Asia/Jakarta",
     }
+);
+
+// Reconcile the Oracle SAP staging table (VMS_MATERIALDATA) — runs every minute
+// for now (testing); raise the interval for production. Pulls SAP's write-back —
+// FLAG 'S' (success, material created) or 'E' (error + message) — back into
+// mat_single_request.sap_push_status (the source of truth the UI reads), and
+// also pushes any PENDING stragglers the inline post-MDM push may have missed.
+cron.schedule(
+    "* * * * *",
+    async () => {
+        try {
+            const pushed =
+                await materialSapStagingService.pushPendingMaterialsToSapStaging(
+                    { limit: 50 }
+                );
+            const synced =
+                await materialSapStagingService.syncMaterialStagingFromSap();
+            if (
+                pushed.pushed.length ||
+                pushed.errors.length ||
+                synced.synced.length ||
+                synced.failed.length
+            ) {
+                console.log("[CRON] SAP material staging:", {
+                    pushed: pushed.pushed.length,
+                    pushErrors: pushed.errors.length,
+                    synced: synced.synced.length,
+                    syncFailed: synced.failed.length,
+                });
+            }
+        } catch (error) {
+            console.error(
+                "[CRON] SAP material staging reconcile failed:",
+                error
+            );
+        }
+    },
+    // Don't let a slow tick overlap the next one.
+    { noOverlap: true }
 );
 
 async function startServer() {
