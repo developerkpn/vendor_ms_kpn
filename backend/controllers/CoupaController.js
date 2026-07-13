@@ -3,6 +3,7 @@ const CoupaService = require("../class/CoupaService");
 const { isAxiosError } = require("axios");
 const Ticket = require("../models/TicketModel");
 const EmailModel = require("../models/EmailModelv2");
+const CoupaModel = require("../models/CoupaModel");
 const db = require("../config/connection");
 const Coupa = require("../models/CoupaModel");
 
@@ -317,5 +318,31 @@ exports.sendEmail = async (req, res) => {
         });
     } finally {
         client.release();
+    }
+};
+
+exports.getSubmitted = async (req, res) => {
+    try {
+        const data = await CoupaModel.getSubmitted();
+        res.status(200).send({ message: "Success Get Data", data });
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({
+            message: error?.message ?? "Internal server error",
+        });
+    }
+};
+
+exports.detailVendor = async (req, res) => {
+    const { code } = req.body;
+    try {
+        console.log(req.body);
+        const data = await CoupaModel.detailVendor(code);
+        res.status(200).send({ message: "Success Get Data", data });
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({
+            message: error?.message ?? "Internal server error",
+        });
     }
 };

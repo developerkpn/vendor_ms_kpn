@@ -54,5 +54,42 @@ const Coupa = {
             client.release();
         }
     },
+    async getSubmitted() {
+        const client = await db.connect();
+        try {
+            let q = `SELECT V.VEN_ID as id, V.COUPA_ID, V.NAME_1 as VEN_NAME, V.VEN_CODE FROM VENDOR V
+                        WHERE V.is_pushsap is true AND V.COUPA_ID IS NOT NULL`;
+            const vals = [];
+            const result = await client.query(q, vals);
+            return result.rows;
+        } catch (err) {
+            console.error(err);
+            throw err;
+        } finally {
+            client.release();
+        }
+    },
+    async detailVendor(code) {
+        const client = await db.connect();
+        console.log(code);
+        try {
+            const result = await client.query(
+                `SELECT
+                    v.*,
+                    json_agg(vb.*) AS banks
+                FROM vendor v
+                LEFT JOIN ven_bank vb ON vb.ven_id = v.ven_id
+                WHERE v.ven_code = $1
+                GROUP BY v.ven_id`,
+                [code]
+            );
+            return result.rows;
+        } catch (err) {
+            console.error(err);
+            throw err;
+        } finally {
+            client.release();
+        }
+    },
 };
 module.exports = Coupa;
