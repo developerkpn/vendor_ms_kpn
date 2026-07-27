@@ -28,7 +28,11 @@ const SINGLE_REQUEST_TICKET_TYPES = Object.freeze({
 });
 
 // --- Template / form schema ------------------------------------------------
+// SAP MAKTX is hard-capped at 40; the 3 long-text continuation columns go to
+// SAP via SAVE_TEXT (TDLINE, 132/line) so they can be wider. Combined PO text
+// max = 40 + 3*70 = 250.
 const MAX_MATERIAL_DESCRIPTION_LENGTH = 40;
+const MAX_LONG_TEXT_COLUMN_LENGTH = 70;
 
 const SECTION_TITLES = {
     basic_info: "Basic Info",
@@ -67,6 +71,7 @@ module.exports = {
     SQL_NOW_EXPRESSION,
     SINGLE_REQUEST_TICKET_TYPES,
     MAX_MATERIAL_DESCRIPTION_LENGTH,
+    MAX_LONG_TEXT_COLUMN_LENGTH,
     SECTION_TITLES,
     SECTION_ORDER,
     MATERIAL_SAP_STAGING_TABLE,

@@ -93,12 +93,16 @@ const buildMaterialStagingPayload = ({
         return String(v).trim() === "" ? null : v;
     };
 
+    // 3 long-text columns of ≤70 chars = 210; PURCHASE_ORDER_TEXT is
+    // VARCHAR2(210) (widened from 132 alongside the 250-char combined
+    // description max: 40 MAKTX + 210 long text). The 2 join newlines can push
+    // the raw string to 212, so cap at 210 to always fit the column.
     const tdline =
         [snapshot.long_text_1, snapshot.long_text_2, snapshot.long_text_3]
             .map(v => (v == null ? "" : String(v).trim()))
             .filter(Boolean)
             .join("\n")
-            .slice(0, 132) || null;
+            .slice(0, 210) || null;
 
     const ticketType = normalizeTicketType(snapshot.ticket_type);
     const auditDate = formatSapDate(now);

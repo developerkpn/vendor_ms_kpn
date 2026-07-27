@@ -1413,13 +1413,6 @@ const MaterialController = {
                 });
             }
 
-            if (!Number.isInteger(materialSubGroupId)) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Sub material group is required",
-                });
-            }
-
             if (
                 ticketType === "Create" &&
                 files.length === 0
@@ -1457,20 +1450,28 @@ const MaterialController = {
                 });
             }
 
-            const subgroup = await materialService.getSubGroupById(materialSubGroupId);
-            if (!subgroup || subgroup.deleted_at) {
-                return res.status(404).json({
-                    success: false,
-                    message: "Sub material group not found",
-                });
-            }
+            // Sub material group is optional at submission time — MDM can fill
+            // it in later via the approval-edit patch. Only validated when the
+            // requester did pick one.
+            if (Number.isInteger(materialSubGroupId)) {
+                const subgroup =
+                    await materialService.getSubGroupById(materialSubGroupId);
+                if (!subgroup || subgroup.deleted_at) {
+                    return res.status(404).json({
+                        success: false,
+                        message: "Sub material group not found",
+                    });
+                }
 
-            if (Number(subgroup.item_group_id) !== Number(materialGroup.id)) {
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Sub material group does not belong to the selected material group",
-                });
+                if (Number(subgroup.item_group_id) !== Number(materialGroup.id)) {
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            "Sub material group does not belong to the selected material group",
+                    });
+                }
+            } else {
+                materialSubGroupId = null;
             }
 
             const attachments = files.map(file => {
@@ -2175,9 +2176,10 @@ const MaterialController = {
         }
     },
 
-    // Start a SAP-error resubmit: send the request back to the Master Data (MDM)
-    // stage as a rework. The requester then fixes the data through the normal
-    // revise flow; MDM re-approval re-stages it to Oracle (FLAG='I').
+    // Start a SAP-error resubmit: only an active MDM_MATERIAL user (or ADMIN)
+    // may do this. Reopens the Master Data step directly (WAITING, grabber
+    // preserved) so the MDM user edits the data in the approval dialog and
+    // re-approves; re-approval re-stages the row to Oracle (fresh FLAG='I').
     requestSapErrorRework: async (req, res) => {
         try {
             const result = await materialService.requestSapErrorRework({
@@ -2244,7 +2246,7 @@ const MaterialController = {
                 const materialGroupCode = String(
                     fields.materialGroupCode || ""
                 ).trim();
-                const materialSubGroupId = Number.parseInt(fields.subgroup, 10);
+                let materialSubGroupId = Number.parseInt(fields.subgroup, 10);
                 const requestFields = JSON.parse(fields.requestFields);
                 const templateValues = JSON.parse(fields.templateValues);
                 const attachmentInstructions = JSON.parse(fields.attachments);
@@ -2259,19 +2261,6 @@ const MaterialController = {
                             {
                                 fieldKey: "material_group",
                                 message: "Material group is required",
-                            },
-                        ],
-                    });
-                }
-
-                if (!Number.isInteger(materialSubGroupId)) {
-                    return res.status(400).json({
-                        success: false,
-                        message: "Sub material group is required",
-                        errors: [
-                            {
-                                fieldKey: "material_sub_group_id",
-                                message: "Sub material group is required",
                             },
                         ],
                     });
@@ -2299,34 +2288,43 @@ const MaterialController = {
                     });
                 }
 
-                const subgroup =
-                    await materialService.getSubGroupById(materialSubGroupId);
-                if (!subgroup || subgroup.deleted_at) {
-                    return res.status(404).json({
-                        success: false,
-                        message: "Sub material group not found",
-                        errors: [
-                            {
-                                fieldKey: "material_sub_group_id",
-                                message: "Sub material group not found",
-                            },
-                        ],
-                    });
-                }
+                // Sub material group is optional — MDM can fill it in later via
+                // the approval-edit patch. Only validated when picked.
+                if (Number.isInteger(materialSubGroupId)) {
+                    const subgroup =
+                        await materialService.getSubGroupById(materialSubGroupId);
+                    if (!subgroup || subgroup.deleted_at) {
+                        return res.status(404).json({
+                            success: false,
+                            message: "Sub material group not found",
+                            errors: [
+                                {
+                                    fieldKey: "material_sub_group_id",
+                                    message: "Sub material group not found",
+                                },
+                            ],
+                        });
+                    }
 
-                if (Number(subgroup.item_group_id) !== Number(materialGroup.id)) {
-                    return res.status(400).json({
-                        success: false,
-                        message:
-                            "Sub material group does not belong to the selected material group",
-                        errors: [
-                            {
-                                fieldKey: "material_sub_group_id",
-                                message:
-                                    "Sub material group does not belong to the selected material group",
-                            },
-                        ],
-                    });
+                    if (
+                        Number(subgroup.item_group_id) !==
+                        Number(materialGroup.id)
+                    ) {
+                        return res.status(400).json({
+                            success: false,
+                            message:
+                                "Sub material group does not belong to the selected material group",
+                            errors: [
+                                {
+                                    fieldKey: "material_sub_group_id",
+                                    message:
+                                        "Sub material group does not belong to the selected material group",
+                                },
+                            ],
+                        });
+                    }
+                } else {
+                    materialSubGroupId = null;
                 }
 
                 try {

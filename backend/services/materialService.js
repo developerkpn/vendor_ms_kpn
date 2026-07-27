@@ -20,6 +20,7 @@ const {
     SQL_NOW_EXPRESSION,
     SINGLE_REQUEST_TICKET_TYPES,
     MAX_MATERIAL_DESCRIPTION_LENGTH,
+    MAX_LONG_TEXT_COLUMN_LENGTH,
     SECTION_TITLES,
     SECTION_ORDER,
     SINGLE_REQUEST_MATERIAL_CODE_SQL,
@@ -226,6 +227,16 @@ const matchesActorUserId = (assigneeUserId, actorUserId) =>
     actorUserId != null &&
     String(assigneeUserId) === String(actorUserId);
 
+// Separation of duties on the Master Data grab: whoever already acted as an
+// approver on an earlier step of the same request must not also claim its MDM
+// step, even when they are (or their group doubles as) MDM_MATERIAL.
+const hasActorApprovedEarlierStep = (steps = [], activeStep, actorUserId) =>
+    steps.some(
+        step =>
+            Number(step.level) < Number(activeStep?.level) &&
+            matchesActorUserId(step.approver_user_id, actorUserId)
+    );
+
 const assertRequiredActionReason = (reason, actionLabel = "action") => {
     if (!String(reason || "").trim()) {
         const error = new Error(`${actionLabel} reason is required`);
@@ -267,7 +278,7 @@ const buildSingleRequestFinalCode = ({
 } = {}) => {
     const groupCode = normalizeCodeSegment(materialGroupCode);
     const subGroupCode = normalizeCodeSegment(materialSubGroupCode);
-    const suffix = normalizeCodeSegment(finalCodeSuffix);
+    const suffix = normalizeCodeSegment(finalCodeSuffix).toUpperCase();
 
     if (!/^\d{3}$/.test(groupCode)) {
         throw buildFinalCodeValidationError(
@@ -285,9 +296,10 @@ const buildSingleRequestFinalCode = ({
         );
     }
 
-    if (!/^\d{3}$/.test(suffix)) {
+    // Running number may be letters and/or digits (e.g. "A01"), still 3 chars.
+    if (!/^[A-Z0-9]{3}$/.test(suffix)) {
         throw buildFinalCodeValidationError(
-            "Final code suffix must be exactly 3 digits",
+            "Final code suffix must be exactly 3 letters or digits",
             "SINGLE_REQUEST_FINAL_CODE_SUFFIX_INVALID",
             "finalCodeSuffix"
         );
@@ -494,31 +506,34 @@ const hasValue = value =>
     value !== null &&
     !(typeof value === "string" && normalizeWhitespace(value) === "");
 
-// Partition a full description into the four 40-char SAP columns (material
-// description + 3 long-text continuation columns) by fixed position. This is a
-// plain positional slice — NOT word-aware — so concatenating the columns back
-// reproduces the source exactly. The UI's splitMaterialDescription
-// (ui_vms/src/helper/materialDescription.js) uses the same positional partition;
-// it differs only in that this create path collapses internal whitespace runs
-// up-front (normalizeWhitespace) while an approver edit is preserved verbatim.
+// Partition a full description into the four SAP columns (material description,
+// 40 chars = SAP MAKTX cap, + 3 long-text continuation columns of 70 each →
+// 250 total) by fixed position. This is a plain positional slice — NOT
+// word-aware — so concatenating the columns back reproduces the source exactly.
+// The UI's splitMaterialDescription (ui_vms/src/helper/materialDescription.js)
+// uses the same positional partition; it differs only in that this create path
+// collapses internal whitespace runs up-front (normalizeWhitespace) while an
+// approver edit is preserved verbatim.
+const MAX_COMBINED_DESCRIPTION_LENGTH =
+    MAX_MATERIAL_DESCRIPTION_LENGTH + MAX_LONG_TEXT_COLUMN_LENGTH * 3; // 250
 const partitionIntoColumns = text => {
     const capped = normalizeWhitespace(text).slice(
         0,
-        MAX_MATERIAL_DESCRIPTION_LENGTH * 4
+        MAX_COMBINED_DESCRIPTION_LENGTH
     );
     return {
         material_description: capped.slice(0, MAX_MATERIAL_DESCRIPTION_LENGTH),
         long_text_1: capped.slice(
             MAX_MATERIAL_DESCRIPTION_LENGTH,
-            MAX_MATERIAL_DESCRIPTION_LENGTH * 2
+            MAX_MATERIAL_DESCRIPTION_LENGTH + MAX_LONG_TEXT_COLUMN_LENGTH
         ),
         long_text_2: capped.slice(
-            MAX_MATERIAL_DESCRIPTION_LENGTH * 2,
-            MAX_MATERIAL_DESCRIPTION_LENGTH * 3
+            MAX_MATERIAL_DESCRIPTION_LENGTH + MAX_LONG_TEXT_COLUMN_LENGTH,
+            MAX_MATERIAL_DESCRIPTION_LENGTH + MAX_LONG_TEXT_COLUMN_LENGTH * 2
         ),
         long_text_3: capped.slice(
-            MAX_MATERIAL_DESCRIPTION_LENGTH * 3,
-            MAX_MATERIAL_DESCRIPTION_LENGTH * 4
+            MAX_MATERIAL_DESCRIPTION_LENGTH + MAX_LONG_TEXT_COLUMN_LENGTH * 2,
+            MAX_MATERIAL_DESCRIPTION_LENGTH + MAX_LONG_TEXT_COLUMN_LENGTH * 3
         ),
     };
 };
@@ -567,11 +582,14 @@ const TEMPLATE_VALIDATORS = {
             normalizedValue,
         };
     },
+    // Special characters are allowed in every spec input; the CAPITAL_* rules
+    // only reject lowercase letters (normalizeTemplateValue uppercases anyway)
+    // and NUMERIC_ONLY only rejects letters.
     CAPITAL_ONLY: value => {
         if (!hasValue(value)) return { valid: true, normalizedValue: "" };
         const normalizedValue = normalizeTemplateValue(value);
         return {
-            valid: /^[A-Z ]+$/.test(normalizedValue),
+            valid: /^[^a-z]+$/.test(normalizedValue),
             normalizedValue,
         };
     },
@@ -579,7 +597,7 @@ const TEMPLATE_VALIDATORS = {
         if (!hasValue(value)) return { valid: true, normalizedValue: "" };
         const normalizedValue = normalizeTemplateValue(value);
         return {
-            valid: /^[A-Z ]+$/.test(normalizedValue),
+            valid: /^[^a-z]+$/.test(normalizedValue),
             normalizedValue,
         };
     },
@@ -587,7 +605,7 @@ const TEMPLATE_VALIDATORS = {
         if (!hasValue(value)) return { valid: true, normalizedValue: "" };
         const normalizedValue = normalizeTemplateValue(value);
         return {
-            valid: /^[A-Z0-9 ]+$/.test(normalizedValue),
+            valid: /^[^a-z]+$/.test(normalizedValue),
             normalizedValue,
         };
     },
@@ -595,7 +613,7 @@ const TEMPLATE_VALIDATORS = {
         if (!hasValue(value)) return { valid: true, normalizedValue: "" };
         const normalizedValue = normalizeTemplateValue(value);
         return {
-            valid: /^[A-Z0-9 .,\-\/()%]+$/.test(normalizedValue),
+            valid: true,
             normalizedValue,
         };
     },
@@ -606,7 +624,7 @@ const TEMPLATE_VALIDATORS = {
             "."
         );
         return {
-            valid: /^[0-9]+(\.[0-9]+)?$/.test(normalizedValue),
+            valid: /^[^A-Za-z]+$/.test(normalizedValue),
             normalizedValue,
         };
     },
@@ -1622,28 +1640,29 @@ const prepareSingleRequestApprovalEditPatch = async ({
     }
 
     // Defense-in-depth: the four SAP description columns are 40 chars wide and
-    // the approver UI already partitions at 40, but the server must not trust
+    // the approver UI already partitions per column (40 + 3×70), but the
+    // server must not trust
     // the client — clamp here so a crafted/oversized value can never be
     // persisted past the column width and pushed to Oracle VMS_MATERIALDATA.
     // Clamp both the persisted columns (editablePatch) and the template_payload
     // copies (normalizedRequestFields, shared by reference into template_payload)
     // so the two can never disagree.
-    for (const fieldKey of [
-        "material_description",
-        "long_text_1",
-        "long_text_2",
-        "long_text_3",
+    for (const [fieldKey, maxLength] of [
+        ["material_description", MAX_MATERIAL_DESCRIPTION_LENGTH],
+        ["long_text_1", MAX_LONG_TEXT_COLUMN_LENGTH],
+        ["long_text_2", MAX_LONG_TEXT_COLUMN_LENGTH],
+        ["long_text_3", MAX_LONG_TEXT_COLUMN_LENGTH],
     ]) {
         if (typeof editablePatch[fieldKey] === "string") {
             editablePatch[fieldKey] = editablePatch[fieldKey].slice(
                 0,
-                MAX_MATERIAL_DESCRIPTION_LENGTH
+                maxLength
             );
         }
         if (typeof normalizedRequestFields[fieldKey] === "string") {
             normalizedRequestFields[fieldKey] = normalizedRequestFields[
                 fieldKey
-            ].slice(0, MAX_MATERIAL_DESCRIPTION_LENGTH);
+            ].slice(0, maxLength);
         }
     }
 
@@ -2209,14 +2228,27 @@ const actorMatchesStep = (step, actorUserId) => {
 };
 
 // Non-admin inbox visibility over step rows:
-//   in-flight (active step exists) => canActorActOnStep on the active step;
-//   terminal status                => visible if the actor acted on (was the
-//                                     approver of) any step.
+//   already acted on any step (any status) => always visible, so e.g.
+//                                              Approval 1 doesn't lose sight
+//                                              of a request just because it
+//                                              moved on to Approval 2/MDM;
+//   otherwise, in-flight (active step exists) => canActorActOnStep on the
+//                                                 active step (it's currently
+//                                                 their turn);
+//   otherwise                                  => not visible.
 const isStepRowVisibleForActor = (
     steps,
     { actorUserId, actorUsername, actorIsMdmMaterial }
 ) => {
     if (isAdminMaterialApprover(actorUsername)) {
+        return true;
+    }
+
+    if (
+        (Array.isArray(steps) ? steps : []).some(step =>
+            actorMatchesStep(step, actorUserId)
+        )
+    ) {
         return true;
     }
 
@@ -2230,9 +2262,7 @@ const isStepRowVisibleForActor = (
         });
     }
 
-    return (Array.isArray(steps) ? steps : []).some(step =>
-        actorMatchesStep(step, actorUserId)
-    );
+    return false;
 };
 
 // Spread the step payload onto every row and (for non-admins) filter by
@@ -2557,6 +2587,10 @@ const MaterialRequests = {
                         throw Object.assign(new Error("Master Data step is not currently open for this request"), { statusCode: 409, code: "SINGLE_REQUEST_MDM_STEP_NOT_ACTIVE" });
                     }
 
+                    if (hasActorApprovedEarlierStep(steps, activeStep, actorUserId)) {
+                        throw Object.assign(new Error("Forbidden: you already acted as an approver on this request and cannot claim its Master Data step"), { statusCode: 403, code: "SINGLE_REQUEST_MDM_CLAIM_PRIOR_APPROVER" });
+                    }
+
                     const won = await claimMdmSingleRequestStep(
                         client,
                         activeStep.id,
@@ -2627,6 +2661,10 @@ const MaterialRequests = {
 
                     if (!activeStep || activeStep.kind !== STEP_KINDS.MDM) {
                         throw Object.assign(new Error("Master Data step is not currently open for this mass request"), { statusCode: 409, code: "MASS_REQUEST_MDM_STEP_NOT_ACTIVE" });
+                    }
+
+                    if (hasActorApprovedEarlierStep(firstItemSteps, activeStep, actorUserId)) {
+                        throw Object.assign(new Error("Forbidden: you already acted as an approver on this request and cannot claim its Master Data step"), { statusCode: 403, code: "MASS_REQUEST_MDM_CLAIM_PRIOR_APPROVER" });
                     }
 
                     const won = await claimMdmMassItemStep(
@@ -3785,10 +3823,14 @@ const MaterialRequests = {
     },
 
     // SAP rejected the request (sap_push_status='ERROR'). Send it back to the
-    // MDM stage as a rework: the requester then revises through the normal
-    // rework flow, MDM re-approves, and the inline push re-stages the row
-    // (idempotent DELETE+INSERT -> fresh FLAG='I' with the corrected data). The
-    // manual approvers are NOT re-run — only the Master Data (MDM) stage.
+    // MDM stage. mode "requester" (default): reopen as a rework — the requester
+    // reopens the Master Data step directly (WAITING, last grabber preserved)
+    // so the MDM user edits the data in the approval dialog and re-approves.
+    // Only an active MDM_MATERIAL user (or ADMIN) may do this — requesters and
+    // manual approvers cannot resubmit. Re-approval sets sap_push_status back
+    // to 'PENDING' and the inline push re-stages the row (idempotent
+    // DELETE+INSERT -> fresh FLAG='I' with the corrected data). The manual
+    // approvers are NOT re-run — only the Master Data (MDM) stage reopens.
     requestSapErrorRework: async ({ requestId, actorUserId, actorUsername }) => {
         try {
             return await DBClientWrapper(async client => {
@@ -3815,16 +3857,17 @@ const MaterialRequests = {
                         );
                     }
 
+                    const actorIsMdmMaterial = await isActorMdmMaterialUser(
+                        client,
+                        actorUserId
+                    );
                     if (
-                        !canActorReviseSingleRequest({
-                            request: snapshot,
-                            actorUserId,
-                            actorUsername,
-                        })
+                        !actorIsMdmMaterial &&
+                        !isAdminMaterialApprover(actorUsername)
                     ) {
                         throw Object.assign(
                             new Error(
-                                "Forbidden: only requester or ADMIN can resubmit this request"
+                                "Forbidden: only an active MDM_MATERIAL user or ADMIN can resubmit this request"
                             ),
                             {
                                 statusCode: 403,
@@ -3853,24 +3896,19 @@ const MaterialRequests = {
                         );
                     }
 
-                    const reason = String(
-                        `SAP error: ${snapshot.sap_error_msg || "rejected by SAP"}`
-                    ).slice(0, 500);
-                    const reworkPatch = buildStepReworkPatch({
-                        activeStep: mdmStep,
-                        actorUserId,
-                        reason,
-                    });
-
-                    // Reopen the MDM stage as a rework, preserving the last MDM
-                    // grabber, and clear the SAP error state — the request is back
-                    // in the approval flow until MDM re-approves and re-stages it.
+                    // Reopen the Master Data step in place: WAITING with the
+                    // last grabber's approver_user_id untouched, request back
+                    // to Submit so the MDM user can edit + re-approve. The
+                    // re-approval resets the staging row to freshly-submitted
+                    // state (PENDING -> push -> FLAG='I').
                     await updateSingleRequestStepRow(client, mdmStep.id, {
-                        ...reworkPatch.step,
-                        approver_user_id: mdmStep.approver_user_id ?? null,
+                        status: "WAITING",
+                        acted_at: null,
+                        remark: null,
                     });
                     await updateSingleRequestColumns(client, requestId, {
-                        ...reworkPatch.header,
+                        status: "Submit",
+                        assigned_to: stepLabel(mdmStep),
                         sap_push_status: null,
                         sap_error_msg: null,
                     });
@@ -3879,7 +3917,7 @@ const MaterialRequests = {
                     return {
                         request_id: Number(requestId),
                         stage: stepLabel(mdmStep),
-                        status: reworkPatch.header.status,
+                        status: "Submit",
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");

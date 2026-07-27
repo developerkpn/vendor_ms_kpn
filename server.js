@@ -30,6 +30,7 @@ const whitelist = [
     "http://172.29.0.1:3000",
     "http://localhost:3000",
     "https://localhost:3000",
+    "https://localhost:3004",
     "https://localhost:4173",
     "https://4c59-49-156-20-130.ngrok-free.app",
 ];

@@ -29,13 +29,24 @@ test("buildSingleRequestFinalCode composes dotted code from group, subgroup, and
   );
 });
 
-test("buildSingleRequestFinalCode requires exactly three numeric suffix digits", () => {
+test("buildSingleRequestFinalCode accepts a 3-char alphanumeric suffix (uppercased)", () => {
+  assert.equal(
+    buildSingleRequestFinalCode({
+      materialGroupCode: "901",
+      materialSubGroupCode: "031",
+      finalCodeSuffix: "a1b",
+    }),
+    "901.031.A1B"
+  );
+});
+
+test("buildSingleRequestFinalCode requires exactly three alphanumeric suffix chars", () => {
   assert.throws(
     () =>
       buildSingleRequestFinalCode({
         materialGroupCode: "901",
         materialSubGroupCode: "031",
-        finalCodeSuffix: "12A",
+        finalCodeSuffix: "1-A",
       }),
     error => {
       assert.equal(error.statusCode, 400);
@@ -43,7 +54,7 @@ test("buildSingleRequestFinalCode requires exactly three numeric suffix digits",
       assert.deepEqual(error.errors, [
         {
           fieldKey: "finalCodeSuffix",
-          message: "Final code suffix must be exactly 3 digits",
+          message: "Final code suffix must be exactly 3 letters or digits",
         },
       ]);
       return true;
