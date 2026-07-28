@@ -1821,9 +1821,14 @@ test("getSingleRequestApprovalInbox scope=mdmAll adds rows grabbed by another Ma
       defaultRows.map(row => row.id),
       [902, 904]
     );
+
+    // Every request a Master Data user has ever grabbed, whatever the step's
+    // status became afterwards: still waiting (901), reworked (905), rejected
+    // (906), approved and finished (907). A grab is never released, so each of
+    // these still names the Master Data user who took it.
     assert.deepEqual(
       scopedRows.map(row => row.id),
-      [901, 902, 904]
+      [901, 902, 904, 905, 906, 907]
     );
 
     // Superset, so switching filters in the UI can never drop a row.
@@ -1831,16 +1836,9 @@ test("getSingleRequestApprovalInbox scope=mdmAll adds rows grabbed by another Ma
       defaultRows.every(row => scopedRows.some(scoped => scoped.id === row.id))
     );
 
-    // MANUAL queues stay private even under the widened scope.
+    // MANUAL queues stay private even under the widened scope: 903 is parked on
+    // Approval 1 and its Master Data step has never been grabbed.
     assert.ok(!scopedRows.some(row => row.id === 903));
-
-    // Grabbed but no longer actionable on the Master Data step: reworked (905)
-    // and rejected (906) rows keep their approver_user_id but have left the
-    // Master Data desk, and an approved one (907) is finished. None of the three
-    // shows a Master Data user under Assigned To, so the shared queue skips them.
-    for (const id of [905, 906, 907]) {
-      assert.ok(!scopedRows.some(row => row.id === id));
-    }
 
     // The grabber's name has to ride along for the Assigned To column.
     const grabbedRow = scopedRows.find(row => row.id === 901);
@@ -1905,7 +1903,7 @@ test("approveSingleRequestByAdmin still forbids a Master Data step grabbed by an
   ];
 
   // The widened scope makes this row visible...
-  assert.equal(materialService.isGrabbedMdmStepRowVisible(grabbedSteps), true);
+  assert.equal(materialService.hasGrabbedMdmStep(grabbedSteps), true);
 
   // ...while permission is unchanged: visibility is not permission.
   assert.equal(
