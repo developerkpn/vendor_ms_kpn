@@ -2011,7 +2011,11 @@ const MaterialController = {
             const actorUsername = req.cookies?.username;
             const actorUserId = req.cookies?.user_id;
 
-            const rows = await materialService.getMassRequestApprovalInbox(actorUserId, actorUsername);
+            const rows = await materialService.getMassRequestApprovalInbox(
+                actorUserId,
+                actorUsername,
+                req.query?.scope
+            );
 
             return res.status(200).json({
                 success: true,
@@ -2133,7 +2137,11 @@ const MaterialController = {
             const actorUsername = req.cookies?.username;
             const actorUserId = req.cookies?.user_id;
 
-            const rows = await materialService.getSingleRequestApprovalInbox(actorUserId, actorUsername);
+            const rows = await materialService.getSingleRequestApprovalInbox(
+                actorUserId,
+                actorUsername,
+                req.query?.scope
+            );
 
             return res.status(200).json({
                 success: true,
