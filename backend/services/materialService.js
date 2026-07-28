@@ -2282,28 +2282,34 @@ const normalizeInboxScope = value =>
         ? INBOX_SCOPES.MDM_ALL
         : INBOX_SCOPES.DEFAULT;
 
-// MDM_ALL companion to isStepRowVisibleForActor: a row sitting on its Master
-// Data step, grabbed by some MDM_MATERIAL user, and still actionable there.
-// WAITING only, on purpose — this is the shared "who is working what right now"
-// queue. A REWORK/REJECTED step keeps its approver_user_id but the request has
-// left the Master Data desk (back with the requester / cancelled) and shows no
-// Master Data user under Assigned To, and an APPROVED MDM step is not active at
-// all, so resolveActiveStep already drops it. Unioned with the normal predicate
-// rather than replacing it, so the widened result is always a superset — rows
-// the actor grabbed themselves already pass the normal path. MANUAL steps are
-// excluded: the Approval 1/2 queues stay private. Visibility only —
-// canActorActOnStep is deliberately untouched, so approve / rework / reject /
-// claim on somebody else's grabbed row still 403s.
-const isGrabbedMdmStepRowVisible = steps => {
-    const activeStep = resolveActiveStep(steps);
-
-    return (
-        Boolean(activeStep) &&
-        stepKindOf(activeStep) === STEP_KINDS.MDM &&
-        stepApproverUserId(activeStep) != null &&
-        normalizeStepStatus(activeStep.status) === STEP_STATUS.WAITING
+// MDM_ALL companion to isStepRowVisibleForActor: every request a Master Data
+// user has ever grabbed. This is the exact generalization of the "already acted
+// on any step (any status) => always visible" rule above, widened from "me" to
+// "any Master Data user".
+//
+// Neither the step's status nor which step is currently active is consulted, on
+// purpose. A grab is never released, so the Master Data user who took a request
+// still holds it while the request sits in REWORK with the requester (grabber
+// kept, status flipped to REWORK), after a REJECT, and after the final APPROVED
+// that completes it. Keying off the active step would drop completed requests
+// entirely — their MDM step is APPROVED, so resolveActiveStep returns null —
+// and would keep REWORK only by accident.
+//
+// On an MDM step a non-null approver_user_id can only mean a grab:
+// claimMdmSingleRequestStep is its only writer, and nothing auto-assigns the
+// step (see the note on the approve advance step).
+//
+// Unioned with the normal predicate rather than replacing it, so the widened
+// result is always a superset — rows the actor grabbed themselves already pass
+// the normal path. MANUAL steps are excluded: the Approval 1/2 queues stay
+// private. Visibility only — canActorActOnStep is deliberately untouched, so
+// approve / rework / reject / claim on somebody else's grabbed row still 403s.
+const hasGrabbedMdmStep = steps =>
+    (Array.isArray(steps) ? steps : []).some(
+        step =>
+            stepKindOf(step) === STEP_KINDS.MDM &&
+            stepApproverUserId(step) != null
     );
-};
 
 // Spread the step payload onto every row and (for non-admins) filter by
 // per-step visibility. Always returns the payload-enriched rows.
@@ -2333,7 +2339,7 @@ const applyStepInboxVisibility = (
                     actorUsername,
                     actorIsMdmMaterial,
                 }) ||
-                (includeGrabbedMdmRows && isGrabbedMdmStepRowVisible(steps))
+                (includeGrabbedMdmRows && hasGrabbedMdmStep(steps))
         )
         .map(({ row }) => row);
 };
@@ -5301,7 +5307,7 @@ module.exports = {
     INBOX_SCOPES,
     INBOX_SCOPE_MDM_ALL_PARAM,
     normalizeInboxScope,
-    isGrabbedMdmStepRowVisible,
+    hasGrabbedMdmStep,
     applyStepInboxVisibility,
     GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY,
 };
