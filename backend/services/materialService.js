@@ -2265,13 +2265,65 @@ const isStepRowVisibleForActor = (
     return false;
 };
 
+// Inbox scope: an opt-in widening of the visibility filter above, requested per
+// call. Anything absent or unrecognized reads as DEFAULT, so a caller that sends
+// nothing keeps exactly the response it has today.
+const INBOX_SCOPES = {
+    DEFAULT: "DEFAULT",
+    MDM_ALL: "MDM_ALL",
+};
+
+// Wire value of the widened scope (`?scope=mdmAll` on the approval-inbox routes).
+const INBOX_SCOPE_MDM_ALL_PARAM = "mdmAll";
+
+const normalizeInboxScope = value =>
+    String(value ?? "").trim().toLowerCase() ===
+    INBOX_SCOPE_MDM_ALL_PARAM.toLowerCase()
+        ? INBOX_SCOPES.MDM_ALL
+        : INBOX_SCOPES.DEFAULT;
+
+// MDM_ALL companion to isStepRowVisibleForActor: every request a Master Data
+// user has ever grabbed. This is the exact generalization of the "already acted
+// on any step (any status) => always visible" rule above, widened from "me" to
+// "any Master Data user".
+//
+// Neither the step's status nor which step is currently active is consulted, on
+// purpose. A grab is never released, so the Master Data user who took a request
+// still holds it while the request sits in REWORK with the requester (grabber
+// kept, status flipped to REWORK), after a REJECT, and after the final APPROVED
+// that completes it. Keying off the active step would drop completed requests
+// entirely — their MDM step is APPROVED, so resolveActiveStep returns null —
+// and would keep REWORK only by accident.
+//
+// On an MDM step a non-null approver_user_id can only mean a grab:
+// claimMdmSingleRequestStep is its only writer, and nothing auto-assigns the
+// step (see the note on the approve advance step).
+//
+// Unioned with the normal predicate rather than replacing it, so the widened
+// result is always a superset — rows the actor grabbed themselves already pass
+// the normal path. MANUAL steps are excluded: the Approval 1/2 queues stay
+// private. Visibility only — canActorActOnStep is deliberately untouched, so
+// approve / rework / reject / claim on somebody else's grabbed row still 403s.
+const hasGrabbedMdmStep = steps =>
+    (Array.isArray(steps) ? steps : []).some(
+        step =>
+            stepKindOf(step) === STEP_KINDS.MDM &&
+            stepApproverUserId(step) != null
+    );
+
 // Spread the step payload onto every row and (for non-admins) filter by
 // per-step visibility. Always returns the payload-enriched rows.
 const applyStepInboxVisibility = (
     rows = [],
-    { actorUserId, actorUsername, actorIsMdmMaterial } = {}
+    { actorUserId, actorUsername, actorIsMdmMaterial, scope } = {}
 ) => {
     const isAdmin = isAdminMaterialApprover(actorUsername);
+    // Authorization for the widened scope is decided here, off the DB-backed
+    // actorIsMdmMaterial flag the caller resolved — never off a client-supplied
+    // one. A non-Master-Data caller asking for MDM_ALL just gets its normal list.
+    const includeGrabbedMdmRows =
+        normalizeInboxScope(scope) === INBOX_SCOPES.MDM_ALL &&
+        Boolean(actorIsMdmMaterial);
 
     return rows
         .map(row => {
@@ -2286,7 +2338,8 @@ const applyStepInboxVisibility = (
                     actorUserId,
                     actorUsername,
                     actorIsMdmMaterial,
-                })
+                }) ||
+                (includeGrabbedMdmRows && hasGrabbedMdmStep(steps))
         )
         .map(({ row }) => row);
 };
@@ -3639,7 +3692,7 @@ const MaterialRequests = {
         }
     },
 
-    getSingleRequestApprovalInbox: async (actorUserId, actorUsername) => {
+    getSingleRequestApprovalInbox: async (actorUserId, actorUsername, scope) => {
         try {
             return await DBClientWrapper(async client => {
                 const result = await runSingleRequestApprovalInboxQuery(client);
@@ -3652,6 +3705,7 @@ const MaterialRequests = {
                     actorUserId,
                     actorUsername,
                     actorIsMdmMaterial,
+                    scope,
                 });
             });
         } catch (error) {
@@ -4375,7 +4429,7 @@ const MaterialRequests = {
         });
     },
 
-    getMassRequestApprovalInbox: async (actorUserId, actorUsername) => {
+    getMassRequestApprovalInbox: async (actorUserId, actorUsername, scope) => {
         try {
             return await DBClientWrapper(async client => {
                 const result = await client.query(
@@ -4390,6 +4444,7 @@ const MaterialRequests = {
                     actorUserId,
                     actorUsername,
                     actorIsMdmMaterial,
+                    scope,
                 });
             });
         } catch (error) {
@@ -5249,6 +5304,10 @@ module.exports = {
     attachStepPayloadToRow,
     actorMatchesStep,
     isStepRowVisibleForActor,
+    INBOX_SCOPES,
+    INBOX_SCOPE_MDM_ALL_PARAM,
+    normalizeInboxScope,
+    hasGrabbedMdmStep,
     applyStepInboxVisibility,
     GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY,
 };

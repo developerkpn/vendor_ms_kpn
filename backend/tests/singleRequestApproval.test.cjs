@@ -1629,6 +1629,354 @@ test("getSingleRequestApprovalInbox falls back when final_code column is missing
   }
 });
 
+// Fixture for the inbox scope tests (IBE-009). Rebuilt per call because
+// applyStepInboxVisibility attaches its step payload onto the rows in place.
+//   901 => MDM step grabbed by another Master Data user
+//   902 => MDM step grabbed by the acting Master Data user
+//   903 => still on a MANUAL step owned by APP-09
+//   904 => MDM step nobody has grabbed yet
+//   905 => MDM step grabbed by another Master Data user, then reworked
+//   906 => MDM step grabbed by another Master Data user, then rejected
+//   907 => MDM step grabbed by another Master Data user, then approved
+const buildMdmScopeInboxRows = () => [
+  {
+    id: 901,
+    request_no: "1000000901",
+    status: "Submit",
+    approval_steps: [
+      {
+        level: 1,
+        kind: "MANUAL",
+        approver_user_id: "APP-77",
+        approver_name: "Approver Seven Seven",
+        status: "APPROVED",
+      },
+      {
+        level: 2,
+        kind: "MDM",
+        approver_user_id: "MDM-02",
+        approver_name: "Master Data Two",
+        status: "WAITING",
+      },
+    ],
+  },
+  {
+    id: 902,
+    request_no: "1000000902",
+    status: "Submit",
+    approval_steps: [
+      {
+        level: 1,
+        kind: "MANUAL",
+        approver_user_id: "APP-77",
+        approver_name: "Approver Seven Seven",
+        status: "APPROVED",
+      },
+      {
+        level: 2,
+        kind: "MDM",
+        approver_user_id: "MDM-01",
+        approver_name: "Master Data One",
+        status: "WAITING",
+      },
+    ],
+  },
+  {
+    id: 903,
+    request_no: "1000000903",
+    status: "Submit",
+    approval_steps: [
+      {
+        level: 1,
+        kind: "MANUAL",
+        approver_user_id: "APP-09",
+        approver_name: "Approver Nine",
+        status: "WAITING",
+      },
+      {
+        level: 2,
+        kind: "MDM",
+        approver_user_id: null,
+        approver_name: null,
+        status: "WAITING",
+      },
+    ],
+  },
+  {
+    id: 904,
+    request_no: "1000000904",
+    status: "Submit",
+    approval_steps: [
+      {
+        level: 1,
+        kind: "MANUAL",
+        approver_user_id: "APP-77",
+        approver_name: "Approver Seven Seven",
+        status: "APPROVED",
+      },
+      {
+        level: 2,
+        kind: "MDM",
+        approver_user_id: null,
+        approver_name: null,
+        status: "WAITING",
+      },
+    ],
+  },
+  {
+    id: 905,
+    request_no: "1000000905",
+    status: "Rework",
+    approval_steps: [
+      {
+        level: 1,
+        kind: "MANUAL",
+        approver_user_id: "APP-77",
+        approver_name: "Approver Seven Seven",
+        status: "APPROVED",
+      },
+      {
+        level: 2,
+        kind: "MDM",
+        approver_user_id: "MDM-02",
+        approver_name: "Master Data Two",
+        status: "REWORK",
+      },
+    ],
+  },
+  {
+    id: 906,
+    request_no: "1000000906",
+    status: "CANCEL",
+    approval_steps: [
+      {
+        level: 1,
+        kind: "MANUAL",
+        approver_user_id: "APP-77",
+        approver_name: "Approver Seven Seven",
+        status: "APPROVED",
+      },
+      {
+        level: 2,
+        kind: "MDM",
+        approver_user_id: "MDM-02",
+        approver_name: "Master Data Two",
+        status: "REJECTED",
+      },
+    ],
+  },
+  {
+    id: 907,
+    request_no: "1000000907",
+    status: "Done",
+    approval_steps: [
+      {
+        level: 1,
+        kind: "MANUAL",
+        approver_user_id: "APP-77",
+        approver_name: "Approver Seven Seven",
+        status: "APPROVED",
+      },
+      {
+        level: 2,
+        kind: "MDM",
+        approver_user_id: "MDM-02",
+        approver_name: "Master Data Two",
+        status: "APPROVED",
+      },
+    ],
+  },
+];
+
+// Stub client for the inbox scope tests: the MDM_MATERIAL membership probe is
+// the only other query the inbox path issues, and it decides authorization.
+const connectMdmScopeInboxStub = isMdmMaterial => async () => ({
+  query: async queryText => {
+    if (/mst_page_access/i.test(queryText)) {
+      return { rows: isMdmMaterial ? [{ exists: 1 }] : [], rowCount: isMdmMaterial ? 1 : 0 };
+    }
+
+    return { rows: buildMdmScopeInboxRows() };
+  },
+  release: () => {},
+});
+
+test("getSingleRequestApprovalInbox scope=mdmAll adds rows grabbed by another Master Data user", async () => {
+  const originalConnect = db.connect;
+  db.connect = connectMdmScopeInboxStub(true);
+
+  try {
+    const defaultRows = await materialService.getSingleRequestApprovalInbox(
+      "MDM-01",
+      "master.data.one"
+    );
+    const scopedRows = await materialService.getSingleRequestApprovalInbox(
+      "MDM-01",
+      "master.data.one",
+      "mdmAll"
+    );
+
+    // 901 is the widening: grabbed by MDM-02, so it never reaches this user today.
+    assert.deepEqual(
+      defaultRows.map(row => row.id),
+      [902, 904]
+    );
+
+    // Every request a Master Data user has ever grabbed, whatever the step's
+    // status became afterwards: still waiting (901), reworked (905), rejected
+    // (906), approved and finished (907). A grab is never released, so each of
+    // these still names the Master Data user who took it.
+    assert.deepEqual(
+      scopedRows.map(row => row.id),
+      [901, 902, 904, 905, 906, 907]
+    );
+
+    // Superset, so switching filters in the UI can never drop a row.
+    assert.ok(
+      defaultRows.every(row => scopedRows.some(scoped => scoped.id === row.id))
+    );
+
+    // MANUAL queues stay private even under the widened scope: 903 is parked on
+    // Approval 1 and its Master Data step has never been grabbed.
+    assert.ok(!scopedRows.some(row => row.id === 903));
+
+    // The grabber's name has to ride along for the Assigned To column.
+    const grabbedRow = scopedRows.find(row => row.id === 901);
+    assert.equal(grabbedRow.approvalSteps[1].approverUserId, "MDM-02");
+    assert.equal(grabbedRow.approvalSteps[1].approverName, "Master Data Two");
+    assert.equal(grabbedRow.currentStageLabel, "Master Data");
+  } finally {
+    db.connect = originalConnect;
+  }
+});
+
+test("getSingleRequestApprovalInbox scope=mdmAll is ignored for a non-Master-Data actor", async () => {
+  const originalConnect = db.connect;
+  db.connect = connectMdmScopeInboxStub(false);
+
+  try {
+    const defaultRows = await materialService.getSingleRequestApprovalInbox(
+      "APP-09",
+      "approval.user.nine"
+    );
+    const scopedRows = await materialService.getSingleRequestApprovalInbox(
+      "APP-09",
+      "approval.user.nine",
+      "mdmAll"
+    );
+
+    // Authorization is decided server-side off the DB membership probe, so the
+    // param buys a manual approver nothing.
+    assert.deepEqual(
+      defaultRows.map(row => row.id),
+      [903]
+    );
+    assert.deepEqual(
+      scopedRows.map(row => row.id),
+      defaultRows.map(row => row.id)
+    );
+  } finally {
+    db.connect = originalConnect;
+  }
+});
+
+test("approveSingleRequestByAdmin still forbids a Master Data step grabbed by another Master Data user", async () => {
+  const grabbedSteps = [
+    {
+      id: 9011,
+      request_id: 901,
+      level: 1,
+      kind: "MANUAL",
+      approver_user_id: "APP-77",
+      approver_name: "Approver Seven Seven",
+      status: "APPROVED",
+    },
+    {
+      id: 9012,
+      request_id: 901,
+      level: 2,
+      kind: "MDM",
+      approver_user_id: "MDM-02",
+      approver_name: "Master Data Two",
+      status: "WAITING",
+    },
+  ];
+
+  // The widened scope makes this row visible...
+  assert.equal(materialService.hasGrabbedMdmStep(grabbedSteps), true);
+
+  // ...while permission is unchanged: visibility is not permission.
+  assert.equal(
+    materialService.canActorActOnStep(materialService.resolveActiveStep(grabbedSteps), {
+      actorUserId: "MDM-01",
+      actorUsername: "master.data.one",
+      actorIsMdmMaterial: true,
+    }),
+    false
+  );
+
+  const originalConnect = db.connect;
+  const queryLog = [];
+
+  db.connect = async () => ({
+    query: async queryText => {
+      queryLog.push(queryText);
+
+      if (queryText === "BEGIN" || queryText === "COMMIT" || queryText === "ROLLBACK") {
+        return { rows: [], rowCount: null };
+      }
+
+      if (/FOR UPDATE OF r/.test(queryText)) {
+        return {
+          rows: [
+            {
+              request_id: 901,
+              request_no: "1000000901",
+              status: "Submit",
+              ticket_type: "CREATE",
+              created_by: "REQ-01",
+              material_group_id: 12,
+              material_group_code: "901",
+            },
+          ],
+        };
+      }
+
+      if (/FOR UPDATE OF s/.test(queryText)) {
+        return { rows: grabbedSteps };
+      }
+
+      if (/mst_page_access/i.test(queryText)) {
+        return { rows: [{ exists: 1 }], rowCount: 1 };
+      }
+
+      throw new Error(`Unexpected query: ${queryText}`);
+    },
+    release: () => {},
+  });
+
+  try {
+    await assert.rejects(
+      materialService.approveSingleRequestByAdmin({
+        requestId: 901,
+        actorUserId: "MDM-01",
+        actorUsername: "master.data.one",
+        remark: "approving somebody else's grabbed row",
+      }),
+      error => {
+        assert.equal(error.statusCode, 403);
+        assert.equal(error.code, "SINGLE_REQUEST_APPROVAL_FORBIDDEN");
+        return true;
+      }
+    );
+
+    assert.ok(queryLog.includes("ROLLBACK"));
+    assert.ok(!queryLog.includes("COMMIT"));
+  } finally {
+    db.connect = originalConnect;
+  }
+});
+
 test("approveSingleRequestByAdmin stores original request creator metadata in edit history", async () => {
   const originalConnect = db.connect;
   const originalGetSubGroupById = materialService.getSubGroupById;
