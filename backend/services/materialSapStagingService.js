@@ -93,16 +93,26 @@ const buildMaterialStagingPayload = ({
         return String(v).trim() === "" ? null : v;
     };
 
-    // 3 long-text columns of ≤70 chars = 210; PURCHASE_ORDER_TEXT is
-    // VARCHAR2(210) (widened from 132 alongside the 250-char combined
-    // description max: 40 MAKTX + 210 long text). The 2 join newlines can push
-    // the raw string to 212, so cap at 210 to always fit the column.
+    // PURCHASE_ORDER_TEXT continues MATERIAL_DESC: the four description columns
+    // are ONE positional partition of the approver's single box (40 MAKTX +
+    // 3×70 = 250), so the three long-text columns concatenate back
+    // separator-less AND untrimmed — the same contract as the UI's
+    // combineMaterialDescription. A separator injects a character SAP does not
+    // want and splits a word at a column boundary; a per-column trim eats the
+    // real space that lands on one.
+    // \s -> " " is a 1:1 length-preserving guard (mirrors the UI's toSingleLine)
+    // for rows written before this, so 3×70 = 210 stays exactly the
+    // VARCHAR2(210) width and the slice is a belt-and-braces cap.
+    const combinedLongText = [
+        snapshot.long_text_1,
+        snapshot.long_text_2,
+        snapshot.long_text_3,
+    ]
+        .map(v => String(v ?? ""))
+        .join("")
+        .replace(/\s/g, " ");
     const tdline =
-        [snapshot.long_text_1, snapshot.long_text_2, snapshot.long_text_3]
-            .map(v => (v == null ? "" : String(v).trim()))
-            .filter(Boolean)
-            .join("\n")
-            .slice(0, 210) || null;
+        combinedLongText.trim() === "" ? null : combinedLongText.slice(0, 210);
 
     const ticketType = normalizeTicketType(snapshot.ticket_type);
     const auditDate = formatSapDate(now);
