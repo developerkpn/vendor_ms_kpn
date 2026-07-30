@@ -376,6 +376,138 @@ const buildStepReworkPatch = ({ activeStep, actorUserId, reason } = {}) => {
     };
 };
 
+const buildReworkTargetError = (message, code, statusCode = 400) => {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    error.code = code;
+    error.errors = [{ fieldKey: "reworkToLevel", message }];
+    return error;
+};
+
+/**
+ * Normalize the optional `reworkToLevel` request-body field.
+ *
+ * @param {number|string|null} [value] step level chosen by the client
+ * @returns {number|null} the level, or null meaning "no target" — rework goes to
+ *                        the requester, exactly as before this field existed
+ * @throws 400 when present but not a positive integer. Junk is rejected rather
+ *         than coerced, so a bad value can never read as "no target".
+ */
+const normalizeReworkToLevel = value => {
+    if (value === undefined || value === null || value === "") {
+        return null;
+    }
+
+    const level =
+        typeof value === "number" || typeof value === "string"
+            ? Number(value)
+            : NaN;
+
+    if (!Number.isInteger(level) || level < 1) {
+        throw buildReworkTargetError(
+            "Rework target level must be a step level number",
+            "SINGLE_REQUEST_REWORK_TARGET_INVALID"
+        );
+    }
+
+    return level;
+};
+
+/**
+ * Rewind: send a request back to an earlier MANUAL step instead of back to the
+ * requester. Sibling of buildStepReworkPatch, not a flag on it — headers differ.
+ *
+ * The header goes to Submit / "Approval N", never Rework / "Requester": Rework
+ * means the requester must edit, Submit means somebody must approve, and a
+ * rewound request is not the requester's to edit. rework_* still records who
+ * sent it back, when, and why.
+ *
+ * Needs no step-engine change — the active step is the lowest level not
+ * APPROVED, so reopening the target row makes it active again while the levels
+ * above stay APPROVED, and approving it returns the request straight to Master
+ * Data instead of replaying the chain.
+ *
+ * @param {object} opts
+ * @param {Array}  opts.steps          locked step rows of THIS request; the
+ *                                     target is resolved inside them, so a
+ *                                     client-supplied level is never trusted
+ * @param {object} opts.activeStep     the request's active step, which must be
+ *                                     the Master Data (MDM) step
+ * @param {number} opts.reworkToLevel  level of the MANUAL step to reopen
+ * @param {string} [opts.actorUserId]  recorded as rework_by_user_id
+ * @param {string} opts.reason         required; recorded as rework_reason
+ * @returns {object} `{ step, targetStep, header, _meta }` — `step` patches the
+ *                   active Master Data row, `targetStep` the reopened row
+ *                   (`_meta.targetStep` carries its id for the caller), `header`
+ *                   the mat_single_request row
+ * @throws 403 when the active step is not Master Data; 400 when the level is not
+ *         a MANUAL step of this request
+ */
+const buildStepRewindPatch = ({
+    steps = [],
+    activeStep,
+    reworkToLevel,
+    actorUserId,
+    reason,
+} = {}) => {
+    const safeReason = assertRequiredActionReason(reason, "rework");
+    const targetLevel = normalizeReworkToLevel(reworkToLevel);
+
+    if (targetLevel === null) {
+        throw buildReworkTargetError(
+            "Rework target level is required",
+            "SINGLE_REQUEST_REWORK_TARGET_INVALID"
+        );
+    }
+
+    // Gated on the stage, not the actor. ADMIN passes canActorActOnStep
+    // unconditionally, so this is the only place that can hold the line.
+    if (stepKindOf(activeStep) !== STEP_KINDS.MDM) {
+        throw buildReworkTargetError(
+            "Only the Master Data stage can send a request back to an earlier approver",
+            "SINGLE_REQUEST_REWORK_TARGET_FORBIDDEN",
+            403
+        );
+    }
+
+    const targetStep =
+        sortSteps(steps).find(step => Number(step.level) === targetLevel) || null;
+
+    if (!targetStep || stepKindOf(targetStep) !== STEP_KINDS.MANUAL) {
+        throw buildReworkTargetError(
+            "Rework target must be an approval step of this request",
+            "SINGLE_REQUEST_REWORK_TARGET_INVALID"
+        );
+    }
+
+    // No status check needed: Master Data is always the highest level and the
+    // active step is the lowest non-APPROVED one, so with Master Data active
+    // every MANUAL step below it is already APPROVED.
+    const reopenStep = {
+        status: STEP_STATUS.WAITING,
+        acted_at: null,
+        remark: null,
+    };
+
+    return {
+        // Master Data reopens too, same shape the SAP resubmit flow uses. The
+        // grab survives by omission — approver_user_id is never named here, so
+        // the request comes back to the same Master Data user.
+        step: reopenStep,
+        targetStep: { ...reopenStep },
+        header: {
+            status: "Submit",
+            assigned_to: stepLabel(targetStep),
+            rework_stage: stepLabel(activeStep),
+            rework_by_user_id: actorUserId ?? null,
+            rework_at: SQL_NOW_EXPRESSION,
+            rework_reason: safeReason,
+        },
+        // Surfaced so the caller can apply `targetStep` to the second row.
+        _meta: { targetStep },
+    };
+};
+
 const buildStepRejectPatch = ({ activeStep, reason } = {}) => {
     const safeReason = assertRequiredActionReason(reason, "reject");
 
@@ -3717,11 +3849,14 @@ const MaterialRequests = {
         }
     },
 
+    // `reworkToLevel` is optional: absent/null keeps the original
+    // rework-to-requester behaviour, a level rewinds to that MANUAL step.
     requestSingleRequestRework: async ({
         requestId,
         actorUserId,
         actorUsername,
         reason,
+        reworkToLevel = null,
     }) => {
         try {
             return await DBClientWrapper(async client => {
@@ -3764,16 +3899,32 @@ const MaterialRequests = {
                         throw Object.assign(new Error("Forbidden: only the assigned approver or ADMIN can request rework"), { statusCode: 403, code: "SINGLE_REQUEST_REWORK_FORBIDDEN" });
                     }
 
-                    const reworkPatch = buildStepReworkPatch({
-                        activeStep,
-                        reason,
-                    });
+                    const targetLevel = normalizeReworkToLevel(reworkToLevel);
+                    const reworkPatch =
+                        targetLevel === null
+                            ? buildStepReworkPatch({
+                                  activeStep,
+                                  reason,
+                              })
+                            : buildStepRewindPatch({
+                                  steps,
+                                  activeStep,
+                                  reworkToLevel: targetLevel,
+                                  reason,
+                              });
 
                     await updateSingleRequestStepRow(client, activeStep.id, {
                         ...reworkPatch.step,
                         approver_user_id:
                             activeStep.approver_user_id ?? actorUserId ?? null,
                     });
+                    if (reworkPatch.targetStep) {
+                        await updateSingleRequestStepRow(
+                            client,
+                            reworkPatch._meta.targetStep.id,
+                            reworkPatch.targetStep
+                        );
+                    }
                     await updateSingleRequestColumns(client, requestId, {
                         ...reworkPatch.header,
                         rework_by_user_id: actorUserId ?? null,
@@ -3784,6 +3935,7 @@ const MaterialRequests = {
                         request_id: Number(requestId),
                         stage: stepLabel(activeStep),
                         status: reworkPatch.header.status,
+                        assigned_to: reworkPatch.header.assigned_to,
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -5243,6 +5395,8 @@ module.exports = {
     buildLoginUserGroupInfo,
     buildStepApprovePatch,
     buildStepReworkPatch,
+    normalizeReworkToLevel,
+    buildStepRewindPatch,
     buildStepRejectPatch,
     // mass approval
     syncMassRequestItemApprovalSnapshot,

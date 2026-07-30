@@ -2164,6 +2164,8 @@ const MaterialController = {
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
                 reason: req.body?.reason ?? null,
+                // Optional rewind target; the service validates the level.
+                reworkToLevel: req.body?.reworkToLevel ?? null,
             });
 
             return res.status(200).json({
@@ -2173,14 +2175,21 @@ const MaterialController = {
             });
         } catch (error) {
             const statusCode = error.statusCode || 500;
-            return res.status(statusCode).json({
+            const payload = {
                 success: false,
                 message:
                     statusCode === 500
                         ? "Failed to request single request rework"
                         : error.message,
                 error: statusCode === 500 ? error.message : undefined,
-            });
+                code: error.code,
+            };
+
+            if (Array.isArray(error.errors) && error.errors.length > 0) {
+                payload.errors = error.errors;
+            }
+
+            return res.status(statusCode).json(payload);
         }
     },
 
