@@ -3502,6 +3502,447 @@ test("saveSingleRequestRework controller forwards canonical JSON Change editedRe
   }
 });
 
+// --- Rework target: Master Data rewinds to an earlier MANUAL step -----------
+// Chain used throughout: Approval 1 + Approval 2 both APPROVED, Master Data
+// (level 3) active and grabbed by MDM-01.
+const rewindSteps = () => [
+  {
+    id: 7101,
+    request_id: 710,
+    level: 1,
+    kind: "MANUAL",
+    approver_user_id: "APP-01",
+    approver_name: "Approver One",
+    status: "APPROVED",
+    acted_at: new Date("2026-07-01T02:00:00.000Z"),
+    remark: "ok",
+  },
+  {
+    id: 7102,
+    request_id: 710,
+    level: 2,
+    kind: "MANUAL",
+    approver_user_id: "APP-02",
+    approver_name: "Approver Two",
+    status: "APPROVED",
+    acted_at: new Date("2026-07-02T02:00:00.000Z"),
+    remark: "ok too",
+  },
+  {
+    id: 7103,
+    request_id: 710,
+    level: 3,
+    kind: "MDM",
+    approver_user_id: "MDM-01",
+    approver_name: "Master Data One",
+    status: "WAITING",
+    acted_at: null,
+    remark: null,
+  },
+];
+
+test("normalizeReworkToLevel treats absent values as no target and rejects junk", () => {
+  for (const absent of [undefined, null, ""]) {
+    assert.equal(materialService.normalizeReworkToLevel(absent), null);
+  }
+
+  assert.equal(materialService.normalizeReworkToLevel(2), 2);
+  assert.equal(materialService.normalizeReworkToLevel("2"), 2);
+
+  for (const junk of ["abc", 1.5, 0, -1, true, [], {}]) {
+    assert.throws(
+      () => materialService.normalizeReworkToLevel(junk),
+      error => {
+        assert.equal(error.statusCode, 400);
+        assert.equal(error.code, "SINGLE_REQUEST_REWORK_TARGET_INVALID");
+        return true;
+      },
+      `expected ${JSON.stringify(junk)} to be rejected`
+    );
+  }
+});
+
+test("buildStepReworkPatch is unchanged when no rework target is given", () => {
+  const steps = rewindSteps();
+  const patch = materialService.buildStepReworkPatch({
+    activeStep: steps[2],
+    reason: "Data salah",
+  });
+
+  assert.deepEqual(patch, {
+    step: {
+      status: "REWORK",
+      acted_at: { __sql: "NOW()" },
+      remark: "Data salah",
+    },
+    header: {
+      status: "Rework",
+      assigned_to: "Requester",
+      rework_stage: "Master Data",
+      rework_by_user_id: null,
+      rework_at: { __sql: "NOW()" },
+      rework_reason: "Data salah",
+    },
+  });
+  assert.equal(patch.targetStep, undefined);
+});
+
+test("buildStepRewindPatch reopens the target step and Master Data without a Rework status", () => {
+  const steps = rewindSteps();
+  const patch = materialService.buildStepRewindPatch({
+    steps,
+    activeStep: steps[2],
+    reworkToLevel: 2,
+    actorUserId: "MDM-01",
+    reason: "Approval 2 salah pilih plant",
+  });
+
+  // Both rows reopen; the grab is preserved by omission.
+  assert.deepEqual(patch.targetStep, {
+    status: "WAITING",
+    acted_at: null,
+    remark: null,
+  });
+  assert.deepEqual(patch.step, {
+    status: "WAITING",
+    acted_at: null,
+    remark: null,
+  });
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(patch.step, "approver_user_id"),
+    false
+  );
+
+  assert.deepEqual(patch.header, {
+    status: "Submit",
+    assigned_to: "Approval 2",
+    rework_stage: "Master Data",
+    rework_by_user_id: "MDM-01",
+    rework_at: { __sql: "NOW()" },
+    rework_reason: "Approval 2 salah pilih plant",
+  });
+  assert.equal(patch._meta.targetStep.id, 7102);
+
+  // Approval 1 is left APPROVED, which is what sends it straight back to MDM.
+  assert.equal(steps[0].status, "APPROVED");
+});
+
+test("buildStepRewindPatch rejects the Master Data step as its own target", () => {
+  const steps = rewindSteps();
+
+  assert.throws(
+    () =>
+      materialService.buildStepRewindPatch({
+        steps,
+        activeStep: steps[2],
+        reworkToLevel: 3,
+        actorUserId: "MDM-01",
+        reason: "Balik ke diri sendiri",
+      }),
+    error => {
+      assert.equal(error.statusCode, 400);
+      assert.equal(error.code, "SINGLE_REQUEST_REWORK_TARGET_INVALID");
+      return true;
+    }
+  );
+});
+
+test("buildStepRewindPatch rejects a level that is not part of this request", () => {
+  const steps = rewindSteps();
+
+  assert.throws(
+    () =>
+      materialService.buildStepRewindPatch({
+        steps,
+        activeStep: steps[2],
+        reworkToLevel: 9,
+        actorUserId: "MDM-01",
+        reason: "Level ngawur",
+      }),
+    error => {
+      assert.equal(error.statusCode, 400);
+      assert.equal(error.code, "SINGLE_REQUEST_REWORK_TARGET_INVALID");
+      return true;
+    }
+  );
+});
+
+test("buildStepRewindPatch refuses a rewind raised from a MANUAL stage", () => {
+  const steps = rewindSteps();
+  const manualActive = { ...steps[1], status: "WAITING" };
+
+  assert.throws(
+    () =>
+      materialService.buildStepRewindPatch({
+        steps,
+        activeStep: manualActive,
+        reworkToLevel: 1,
+        actorUserId: "APP-02",
+        reason: "Approver biasa coba mundur",
+      }),
+    error => {
+      assert.equal(error.statusCode, 403);
+      assert.equal(error.code, "SINGLE_REQUEST_REWORK_TARGET_FORBIDDEN");
+      return true;
+    }
+  );
+});
+
+test("buildStepRewindPatch still requires a reason", () => {
+  const steps = rewindSteps();
+
+  assert.throws(
+    () =>
+      materialService.buildStepRewindPatch({
+        steps,
+        activeStep: steps[2],
+        reworkToLevel: 2,
+        actorUserId: "MDM-01",
+        reason: "   ",
+      }),
+    /rework reason is required/i
+  );
+});
+
+// Service seam: db.connect replaced by a fake client that matches on SQL.
+const connectRewindStub = (steps, { queryLog, stepUpdates, headerUpdates }) =>
+  async () => ({
+    query: async (queryText, params = []) => {
+      queryLog.push(queryText);
+
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(queryText)) {
+        return { rows: [], rowCount: null };
+      }
+
+      if (/FOR UPDATE OF r/.test(queryText)) {
+        return {
+          rows: [
+            {
+              request_id: 710,
+              request_no: "1000000710",
+              status: "Submit",
+              ticket_type: "CREATE",
+              created_by: "REQ-01",
+            },
+          ],
+        };
+      }
+
+      if (/FOR UPDATE OF s/.test(queryText)) {
+        return { rows: steps };
+      }
+
+      if (/mst_page_access/i.test(queryText)) {
+        return { rows: [{ exists: 1 }], rowCount: 1 };
+      }
+
+      if (/UPDATE mat_single_request_approval_step/.test(queryText)) {
+        stepUpdates.push({ queryText, params });
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (/UPDATE mat_single_request\b/.test(queryText)) {
+        headerUpdates.push({ queryText, params });
+        return { rows: [], rowCount: 1 };
+      }
+
+      throw new Error(`Unexpected query: ${queryText}`);
+    },
+    release: () => {},
+  });
+
+test("requestSingleRequestRework without a target keeps sending the request to the requester", async () => {
+  const originalConnect = db.connect;
+  const queryLog = [];
+  const stepUpdates = [];
+  const headerUpdates = [];
+
+  db.connect = connectRewindStub(rewindSteps(), {
+    queryLog,
+    stepUpdates,
+    headerUpdates,
+  });
+
+  try {
+    const result = await materialService.requestSingleRequestRework({
+      requestId: 710,
+      actorUserId: "MDM-01",
+      actorUsername: "master.data.one",
+      reason: "Requester salah isi",
+    });
+
+    assert.equal(result.status, "Rework");
+    assert.equal(result.assigned_to, "Requester");
+    assert.equal(result.stage, "Master Data");
+
+    // Exactly one step row is touched: the active Master Data step.
+    assert.equal(stepUpdates.length, 1);
+    assert.equal(stepUpdates[0].params[0], 7103);
+    assert.ok(stepUpdates[0].params.includes("REWORK"));
+
+    assert.equal(headerUpdates.length, 1);
+    assert.ok(headerUpdates[0].params.includes("Rework"));
+    assert.ok(headerUpdates[0].params.includes("Requester"));
+    assert.ok(queryLog.includes("COMMIT"));
+  } finally {
+    db.connect = originalConnect;
+  }
+});
+
+test("requestSingleRequestRework rewinds to the chosen MANUAL step instead of the requester", async () => {
+  const originalConnect = db.connect;
+  const queryLog = [];
+  const stepUpdates = [];
+  const headerUpdates = [];
+
+  db.connect = connectRewindStub(rewindSteps(), {
+    queryLog,
+    stepUpdates,
+    headerUpdates,
+  });
+
+  try {
+    const result = await materialService.requestSingleRequestRework({
+      requestId: 710,
+      actorUserId: "MDM-01",
+      actorUsername: "master.data.one",
+      reason: "Plant di Approval 2 keliru",
+      reworkToLevel: 2,
+    });
+
+    assert.equal(result.status, "Submit");
+    assert.equal(result.assigned_to, "Approval 2");
+
+    // Master Data + the Approval 2 target reopen; Approval 1 stays untouched.
+    assert.equal(stepUpdates.length, 2);
+    assert.deepEqual(
+      stepUpdates.map(update => update.params[0]),
+      [7103, 7102]
+    );
+    for (const update of stepUpdates) {
+      assert.ok(update.params.includes("WAITING"));
+      assert.equal(update.params.includes("REWORK"), false);
+    }
+    assert.equal(
+      stepUpdates.some(update => update.params[0] === 7101),
+      false
+    );
+
+    // Master Data keeps its grab; the target's approver is not touched at all.
+    assert.match(stepUpdates[0].queryText, /approver_user_id = \$/);
+    assert.ok(stepUpdates[0].params.includes("MDM-01"));
+    assert.doesNotMatch(stepUpdates[1].queryText, /approver_user_id/);
+
+    assert.equal(headerUpdates.length, 1);
+    assert.ok(headerUpdates[0].params.includes("Submit"));
+    assert.ok(headerUpdates[0].params.includes("Approval 2"));
+    assert.ok(headerUpdates[0].params.includes("Master Data"));
+    assert.ok(headerUpdates[0].params.includes("Plant di Approval 2 keliru"));
+    assert.equal(headerUpdates[0].params.includes("Rework"), false);
+    assert.equal(headerUpdates[0].params.includes("Requester"), false);
+    assert.ok(queryLog.includes("COMMIT"));
+  } finally {
+    db.connect = originalConnect;
+  }
+});
+
+test("requestSingleRequestRework rolls back an invalid rework target without writing", async () => {
+  const cases = [
+    { reworkToLevel: 3, code: "SINGLE_REQUEST_REWORK_TARGET_INVALID", statusCode: 400 },
+    { reworkToLevel: 9, code: "SINGLE_REQUEST_REWORK_TARGET_INVALID", statusCode: 400 },
+    { reworkToLevel: "abc", code: "SINGLE_REQUEST_REWORK_TARGET_INVALID", statusCode: 400 },
+  ];
+
+  for (const { reworkToLevel, code, statusCode } of cases) {
+    const originalConnect = db.connect;
+    const queryLog = [];
+    const stepUpdates = [];
+    const headerUpdates = [];
+
+    db.connect = connectRewindStub(rewindSteps(), {
+      queryLog,
+      stepUpdates,
+      headerUpdates,
+    });
+
+    try {
+      await assert.rejects(
+        materialService.requestSingleRequestRework({
+          requestId: 710,
+          actorUserId: "MDM-01",
+          actorUsername: "master.data.one",
+          reason: "Tujuan tidak valid",
+          reworkToLevel,
+        }),
+        error => {
+          assert.equal(error.statusCode, statusCode, `for ${reworkToLevel}`);
+          assert.equal(error.code, code, `for ${reworkToLevel}`);
+          return true;
+        }
+      );
+
+      assert.equal(stepUpdates.length, 0, `for ${reworkToLevel}`);
+      assert.equal(headerUpdates.length, 0, `for ${reworkToLevel}`);
+      assert.ok(queryLog.includes("ROLLBACK"), `for ${reworkToLevel}`);
+      assert.equal(queryLog.includes("COMMIT"), false, `for ${reworkToLevel}`);
+    } finally {
+      db.connect = originalConnect;
+    }
+  }
+});
+
+test("requestSingleRequestRework refuses a rework target when the active step is not Master Data", async () => {
+  const originalConnect = db.connect;
+  const queryLog = [];
+  const stepUpdates = [];
+  const headerUpdates = [];
+  // Approval 2 is the active step: Approval 1 approved, the rest still waiting.
+  const midChainSteps = rewindSteps().map(step =>
+    step.level === 2 ? { ...step, status: "WAITING", acted_at: null, remark: null } : step
+  );
+
+  db.connect = connectRewindStub(midChainSteps, {
+    queryLog,
+    stepUpdates,
+    headerUpdates,
+  });
+
+  try {
+    await assert.rejects(
+      materialService.requestSingleRequestRework({
+        requestId: 710,
+        actorUserId: "APP-02",
+        actorUsername: "approver.two",
+        reason: "Approver biasa coba pilih tujuan",
+        reworkToLevel: 1,
+      }),
+      error => {
+        assert.equal(error.statusCode, 403);
+        assert.equal(error.code, "SINGLE_REQUEST_REWORK_TARGET_FORBIDDEN");
+        return true;
+      }
+    );
+
+    assert.equal(stepUpdates.length, 0);
+    assert.equal(headerUpdates.length, 0);
+    assert.ok(queryLog.includes("ROLLBACK"));
+    assert.equal(queryLog.includes("COMMIT"), false);
+  } finally {
+    db.connect = originalConnect;
+  }
+});
+
+test("rework controller forwards the optional rework target and surfaces its error code", () => {
+  assert.match(
+    MaterialController.requestSingleRequestRework.toString(),
+    /req\.body\?\.reworkToLevel\s*\?\?\s*null/
+  );
+  assert.match(
+    MaterialController.requestSingleRequestRework.toString(),
+    /code: error\.code/
+  );
+});
+
 test("serveFile resolves files inside configured directories only", () => {
   const controllerSource = require("fs").readFileSync(
     require("path").join(__dirname, "../controllers/MaterialController.js"),
