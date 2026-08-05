@@ -3963,3 +3963,128 @@ test("serveFile resolves files inside configured directories only", () => {
   );
   assert.match(controllerSource, /candidatePath\.startsWith\(directoryPrefix\)/);
 });
+
+// Master Data may swap the sub material group on the same action that assigns
+// the running number, so the composed code must follow the edit: request 710
+// arrives on sub group 110 (code 031) and is approved on 555 (code 042).
+test("approveSingleRequestByAdmin composes the final code from the sub material group Master Data selected", async () => {
+  const originalConnect = db.connect;
+  const requestUpdates = [];
+
+  db.connect = async () => ({
+    query: async (queryText, params = []) => {
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(queryText)) {
+        return { rows: [], rowCount: null };
+      }
+
+      if (/FOR UPDATE OF r/.test(queryText)) {
+        return {
+          rows: [
+            {
+              request_id: 710,
+              request_no: "1000000710",
+              status: "Submit",
+              ticket_type: "Create",
+              created_by: "REQ-01",
+              created_at: new Date("2026-07-01T01:00:00.000Z"),
+              material_group_id: 12,
+              material_sub_group_id: 110,
+              material_group_code: "901",
+              material_sub_group_code: "031",
+              plant_code: "P1",
+              sloc_code: "S1",
+              material_description: "Original desc",
+              base_uom: "EA",
+              template_payload: { requestFields: {}, templateValues: {} },
+            },
+          ],
+          rowCount: 1,
+        };
+      }
+
+      if (/FOR UPDATE OF s/.test(queryText)) {
+        return { rows: rewindSteps(), rowCount: 3 };
+      }
+
+      if (/mst_page_access/i.test(queryText)) {
+        return { rows: [{ exists: 1 }], rowCount: 1 };
+      }
+
+      if (/FROM mat_item_sub_group mis/i.test(queryText)) {
+        return {
+          rows: [
+            {
+              id: 555,
+              subgroup_code: "042",
+              deleted_at: null,
+              item_group_id: 12,
+              group_code: "901",
+            },
+          ],
+          rowCount: 1,
+        };
+      }
+
+      if (/INSERT INTO mat_single_request_edit_history/i.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      // Codes re-read once the sub group edit has been written.
+      if (/mis\.code AS material_sub_group_code/i.test(queryText)) {
+        return {
+          rows: [
+            { material_group_code: "901", material_sub_group_code: "042" },
+          ],
+          rowCount: 1,
+        };
+      }
+
+      if (/FROM mat_sap_data WHERE code = \$1/i.test(queryText)) {
+        return { rows: [], rowCount: 0 };
+      }
+
+      if (/SELECT request_no FROM mat_single_request/i.test(queryText)) {
+        return { rows: [], rowCount: 0 };
+      }
+
+      if (/UPDATE mat_single_request_approval_step/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      // Terminal completion triggers the staging push; nothing pending for it.
+      if (/sap_push_status = 'PENDING'/.test(queryText)) {
+        return { rows: [], rowCount: 0 };
+      }
+
+      if (/UPDATE mat_single_request\b/.test(queryText)) {
+        requestUpdates.push({ queryText, params });
+        return { rows: [], rowCount: 1 };
+      }
+
+      throw new Error(`Unexpected query: ${queryText}`);
+    },
+    release: () => {},
+  });
+
+  try {
+    const result = await materialService.approveSingleRequestByAdmin({
+      requestId: 710,
+      actorUserId: "MDM-01",
+      actorUsername: "master.data.one",
+      remark: "approved",
+      editedRequest: { material_sub_group_id: 555 },
+      finalCodeSuffix: "123",
+    });
+
+    assert.equal(result.final_code, "901.042.123");
+
+    const finalCodeUpdate = requestUpdates.find(update =>
+      /final_code = \$\d+/i.test(update.queryText)
+    );
+    assert.ok(finalCodeUpdate);
+    assert.equal(finalCodeUpdate.params.includes("901.042.123"), true);
+    assert.equal(finalCodeUpdate.params.includes("901.031.123"), false);
+  } finally {
+    db.connect = originalConnect;
+  }
+});
