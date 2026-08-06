@@ -1066,6 +1066,24 @@ const getLockedSingleRequestApprovalSnapshot = async (client, requestId) => {
     return result.rows[0];
 };
 
+// Group and sub-group codes are joined from the master tables, never stored on
+// the request row, so a snapshot taken before an edit still carries the old
+// codes. Re-reads them for whatever ids the request currently holds.
+const loadSingleRequestGroupCodes = async (client, requestId) => {
+    const result = await client.query(
+        `SELECT
+            mig.code AS material_group_code,
+            mis.code AS material_sub_group_code
+        FROM mat_single_request r
+        LEFT JOIN mat_item_group mig ON mig.id = r.material_group_id
+        LEFT JOIN mat_item_sub_group mis ON mis.id = r.material_sub_group_id
+        WHERE r.id = $1`,
+        [requestId]
+    );
+
+    return result.rows[0] || {};
+};
+
 const updateSingleRequestColumns = async (client, requestId, patch = {}) => {
     const patchFields = Object.keys(patch);
 
@@ -3050,9 +3068,28 @@ const MaterialRequests = {
                         );
                     }
 
+                    // Master Data can change the sub material group in the same
+                    // action that assigns the running number, and the codes on
+                    // the snapshot were joined before that edit was written. Re-read
+                    // them so the final code is composed from the group the request
+                    // ends up with, not the one it arrived at this stage with.
+                    const editedGroupIds =
+                        Object.prototype.hasOwnProperty.call(
+                            editablePatch,
+                            "material_group_id"
+                        ) ||
+                        Object.prototype.hasOwnProperty.call(
+                            editablePatch,
+                            "material_sub_group_id"
+                        );
+                    const refreshedGroupCodes = editedGroupIds
+                        ? await loadSingleRequestGroupCodes(client, requestId)
+                        : null;
+
                     const nextSnapshot = {
                         ...snapshot,
                         ...editablePatch,
+                        ...(refreshedGroupCodes ?? {}),
                         change_extend_reason:
                             editablePatch.change_extend_reason ??
                             currentChangeExtendReason,
@@ -5425,6 +5462,7 @@ module.exports = {
     isRawSqlExpression,
     LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
     getLockedSingleRequestApprovalSnapshot,
+    loadSingleRequestGroupCodes,
     updateSingleRequestColumns,
     loadRequesterChain,
     insertSingleRequestApprovalSteps,
