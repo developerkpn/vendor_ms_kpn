@@ -299,6 +299,14 @@ test("approval action workflow accepts finalCodeSuffix and stores final_code at 
   assert.match(source, /final_code/);
 });
 
+test("final_code duplicate guard skips cancelled requests", () => {
+  const source = materialService.approveSingleRequestByAdmin.toString();
+  assert.match(
+    source,
+    /SELECT request_no FROM mat_single_request[\s\S]*WHERE final_code = \$1 AND id <> \$2[\s\S]*AND UPPER\(COALESCE\(status, ''\)\) <> 'CANCEL'/i
+  );
+});
+
 test("approveSingleRequestByAdmin stores composed final_code on Approval 3", async () => {
   const originalConnect = db.connect;
   let finalUpdateParams = null;

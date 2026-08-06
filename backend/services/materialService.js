@@ -3176,6 +3176,8 @@ const MaterialRequests = {
                     // an existing SAP material (mat_sap_data mirror) nor with a
                     // final_code already taken by another request still on its
                     // way to SAP (DONE but not yet synced into mat_sap_data).
+                    // A cancelled request releases its code: it is terminal, so
+                    // it can never reach SAP and claim the code back.
                     if (finalCode) {
                         const buildDuplicateFinalCodeError = message =>
                             Object.assign(new Error(message), {
@@ -3199,6 +3201,7 @@ const MaterialRequests = {
                         const requestDuplicate = await client.query(
                             `SELECT request_no FROM mat_single_request
                              WHERE final_code = $1 AND id <> $2
+                               AND UPPER(COALESCE(status, '')) <> 'CANCEL'
                              LIMIT 1`,
                             [finalCode, requestId]
                         );
