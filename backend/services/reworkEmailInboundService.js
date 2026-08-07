@@ -178,8 +178,8 @@ const resolveCursorStart = ({ cursor = null, uidNext, uidValidity } = {}) => {
  *
  * @returns {object} an unconnected ImapFlow instance
  */
-const createInboundImapClient = () =>
-    new ImapFlow({
+const createInboundImapClient = () => {
+    const client = new ImapFlow({
         host: process.env.IMAP_HOST || process.env.SMTP_HOST,
         port: Number(process.env.IMAP_PORT) || 993,
         secure: true,
@@ -191,6 +191,22 @@ const createInboundImapClient = () =>
         // The library's own logging is per-command and very loud on a 60s cron.
         logger: false,
     });
+
+    // ImapFlow is an EventEmitter, and a socket that dies between commands —
+    // a dropped VPN, an idle timeout — emits 'error' out of band rather than
+    // rejecting whatever the poller happens to be awaiting. An EventEmitter
+    // with no 'error' listener rethrows, which no try/catch around the poll can
+    // catch, so the whole API process would go down with the mailbox. The next
+    // tick reconnects from the stored cursor, so logging is the whole handler.
+    client.on("error", error => {
+        console.error(
+            "[rework-email-inbound] IMAP connection error:",
+            error && error.message ? error.message : error
+        );
+    });
+
+    return client;
+};
 
 const readPollCursor = async (client, mailbox) => {
     const result = await client.query(
