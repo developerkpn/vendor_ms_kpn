@@ -62,6 +62,65 @@ const SINGLE_REQUEST_MATERIAL_CODE_SQL = `NULLIF(COALESCE(
             ''
         ), '')`;
 
+// SQL fragments: resolve a MASS item's material group / sub group CODES.
+// mat_mass_request_item stores the two fields as free text (varchar(100)) —
+// the grid UI writes whatever the dropdown bound to, which is the display name
+// on some builds and the code on others — while the final-code composer and
+// the SAP staging push both need the bare 3-digit CODE. One LATERAL per field
+// resolves it from the master tables, accepting all three shapes the UI can
+// have written ("901", "BEARING", "901 - BEARING") case/whitespace-insensitively
+// and preferring an exact code hit when a name happens to collide with a code.
+// LIMIT 1 keeps the join from multiplying the item row; the sub group is scoped
+// to the resolved group because sub-group codes are only unique within a group.
+// Both fragments assume the item table is aliased `i`; the group fragment must
+// come first (the sub-group one reads mig.id).
+const MASS_ITEM_GROUP_CODE_LATERAL_SQL = `LEFT JOIN LATERAL (
+                SELECT g.id, g.code
+                FROM mat_item_group g
+                WHERE g.deleted_at IS NULL
+                  AND BTRIM(COALESCE(i.material_group, '')) <> ''
+                  AND (
+                      UPPER(BTRIM(g.code)) IN (
+                          UPPER(BTRIM(i.material_group)),
+                          UPPER(BTRIM(SPLIT_PART(i.material_group, ' - ', 1)))
+                      )
+                      OR UPPER(BTRIM(g.name)) IN (
+                          UPPER(BTRIM(i.material_group)),
+                          UPPER(BTRIM(SPLIT_PART(i.material_group, ' - ', 1)))
+                      )
+                      OR UPPER(BTRIM(g.code) || ' - ' || BTRIM(g.name)) =
+                         UPPER(BTRIM(i.material_group))
+                  )
+                ORDER BY
+                    (UPPER(BTRIM(g.code)) = UPPER(BTRIM(i.material_group))) DESC,
+                    g.id ASC
+                LIMIT 1
+            ) mig ON TRUE`;
+
+const MASS_ITEM_SUB_GROUP_CODE_LATERAL_SQL = `LEFT JOIN LATERAL (
+                SELECT s.id, s.code
+                FROM mat_item_sub_group s
+                WHERE s.deleted_at IS NULL
+                  AND s.item_group_id = mig.id
+                  AND BTRIM(COALESCE(i.material_sub_group, '')) <> ''
+                  AND (
+                      UPPER(BTRIM(s.code)) IN (
+                          UPPER(BTRIM(i.material_sub_group)),
+                          UPPER(BTRIM(SPLIT_PART(i.material_sub_group, ' - ', 1)))
+                      )
+                      OR UPPER(BTRIM(s.name)) IN (
+                          UPPER(BTRIM(i.material_sub_group)),
+                          UPPER(BTRIM(SPLIT_PART(i.material_sub_group, ' - ', 1)))
+                      )
+                      OR UPPER(BTRIM(s.code) || ' - ' || BTRIM(s.name)) =
+                         UPPER(BTRIM(i.material_sub_group))
+                  )
+                ORDER BY
+                    (UPPER(BTRIM(s.code)) = UPPER(BTRIM(i.material_sub_group))) DESC,
+                    s.id ASC
+                LIMIT 1
+            ) mis ON TRUE`;
+
 module.exports = {
     STEP_KINDS,
     STEP_STATUS,
@@ -76,4 +135,6 @@ module.exports = {
     SECTION_ORDER,
     MATERIAL_SAP_STAGING_TABLE,
     SINGLE_REQUEST_MATERIAL_CODE_SQL,
+    MASS_ITEM_GROUP_CODE_LATERAL_SQL,
+    MASS_ITEM_SUB_GROUP_CODE_LATERAL_SQL,
 };

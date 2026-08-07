@@ -259,10 +259,38 @@ router.post(
     AuthToken.authSession,
     MaterialController.requestSapErrorRework
 );
+router.post(
+    "/requests/mass/:id/sap-resubmit",
+    AuthToken.authSession,
+    MaterialController.requestMassSapErrorRework
+);
 router.put(
     "/requests/mass/:id/rework",
     AuthToken.authSession,
     MaterialController.saveMassRequestRework
+);
+
+// Rework e-mail: the draft the Master Data dialog prefills before sending,
+// and the sent-mails + replies thread the request detail renders read-only.
+router.get(
+    "/requests/single/:id/rework-email-template",
+    AuthToken.authSession,
+    MaterialController.getSingleRequestReworkEmailTemplate
+);
+router.get(
+    "/requests/mass/:id/rework-email-template",
+    AuthToken.authSession,
+    MaterialController.getMassRequestReworkEmailTemplate
+);
+router.get(
+    "/requests/single/:id/rework-email-thread",
+    AuthToken.authSession,
+    MaterialController.getSingleRequestReworkEmailThread
+);
+router.get(
+    "/requests/mass/:id/rework-email-thread",
+    AuthToken.authSession,
+    MaterialController.getMassRequestReworkEmailThread
 );
 
 

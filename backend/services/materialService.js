@@ -24,8 +24,21 @@ const {
     SECTION_TITLES,
     SECTION_ORDER,
     SINGLE_REQUEST_MATERIAL_CODE_SQL,
+    MASS_ITEM_GROUP_CODE_LATERAL_SQL,
+    MASS_ITEM_SUB_GROUP_CODE_LATERAL_SQL,
 } = require("../constants/material");
 const { normalizeWhitespace } = require("../utils/material");
+const {
+    notifyReworkApproversViaEmailPlaceholder,
+} = require("../helper/reworkEmailPlaceholder");
+const {
+    buildSingleReworkEmailTemplate,
+    buildMassReworkEmailTemplate,
+} = require("../helper/reworkEmailTemplate");
+// Required as a module object, not destructured: the rework flows call through
+// the object so a test can swap sendReworkApproverEmail for a fake and no test
+// process ever opens an SMTP socket (same seam as db.connect).
+const reworkEmailSender = require("../helper/reworkEmailSender");
 const materialSapStagingService = require("./materialSapStagingService");
 
 // ===========================================================================
@@ -46,6 +59,7 @@ function normalizeTicketType(ticketType) {
 
 // Build the ordered step plan from a frozen manual chain + ticket type.
 // CREATE = all N manual + MDM; CHANGE = first manual + MDM; EXTEND = MDM only.
+// Requester with an empty manual chain falls through to MDM-only.
 function buildApprovalStepPlan({ ticketType, chain = [] } = {}) {
     const tt = normalizeTicketType(ticketType);
     const manual = (Array.isArray(chain) ? chain : [])
@@ -55,25 +69,13 @@ function buildApprovalStepPlan({ ticketType, chain = [] } = {}) {
         }))
         .filter(entry => entry.approverUserId);
 
-    const requireManual = () => {
-        if (manual.length < 1) {
-            const error = new Error(
-                "Requester has no approver chain configured."
-            );
-            error.statusCode = 409;
-            error.code = "NO_APPROVER_CHAIN";
-            throw error;
-        }
-    };
-
-    if (tt === "EXTEND") {
+    if (tt === "EXTEND" || manual.length < 1) {
         return [
             { level: 1, kind: STEP_KINDS.MDM, approverUserId: null, status: STEP_INITIAL_STATUS },
         ];
     }
 
     if (tt === "CHANGE") {
-        requireManual();
         return [
             { level: 1, kind: STEP_KINDS.MANUAL, approverUserId: manual[0].approverUserId, status: STEP_INITIAL_STATUS },
             { level: 2, kind: STEP_KINDS.MDM, approverUserId: null, status: STEP_INITIAL_STATUS },
@@ -81,7 +83,6 @@ function buildApprovalStepPlan({ ticketType, chain = [] } = {}) {
     }
 
     // CREATE (default): full manual chain + MDM.
-    requireManual();
     const plan = manual.map((entry, index) => ({
         level: index + 1,
         kind: STEP_KINDS.MANUAL,
@@ -184,6 +185,7 @@ function buildStepsPayload(steps) {
             label: stepLabel(step),
             approverUserId: stepApproverUserId(step),
             approverName: step.approver_name ?? step.approverName ?? null,
+            approverEmail: step.approver_email ?? step.approverEmail ?? null,
             status: normalizeStepStatus(step.status),
             claimedAt: step.claimed_at ?? step.claimedAt ?? null,
             actedAt: step.acted_at ?? step.actedAt ?? null,
@@ -306,6 +308,199 @@ const buildSingleRequestFinalCode = ({
     }
 
     return `${groupCode}.${subGroupCode}.${suffix}`;
+};
+
+// ===========================================================================
+// Mass-request final codes (v1) — one running number entered at the Master Data
+// step, incremented across the batch's items.
+//
+// A mass batch stages ONE VMS_MATERIALDATA row per item, each keyed by that
+// item's own request_no and carrying its own material code, so the MDM approver
+// has to hand out N codes in one action. v1 keeps the UI to a single input: the
+// approver types the running number for item 1 and items 2..N take it +1, +2,
+// … The composition itself still goes through buildSingleRequestFinalCode, so a
+// mass code and a single code are the same artifact (GGG.SSS.NNN) built by the
+// same rules.
+// ===========================================================================
+
+// Mass batches are Create-only by product decision: the grid never offers
+// Change/Extend (both need an existing SAP material code, which the batch grid
+// has no column for) and everything below — per-item final code generation, the
+// staging push keyed on that code — assumes a freshly generated code. This is
+// the server-side backstop for the UI-only restriction.
+const assertMassRequestRowsAreCreateOnly = (rows = []) => {
+    const offending = [];
+
+    (Array.isArray(rows) ? rows : []).forEach((row, index) => {
+        // A blank/absent field reads as Create — the grid simply omits it.
+        const raw = String(row?.ticketType ?? row?.ticket_type ?? "").trim();
+
+        if (raw === "" || raw.toUpperCase() === "CREATE") {
+            return;
+        }
+
+        offending.push({
+            rowIndex: index,
+            fieldKey: "ticketType",
+            message: `Row ${index + 1}: mass material requests only support ticket type Create (got "${raw}").`,
+        });
+    });
+
+    if (offending.length > 0) {
+        throw Object.assign(
+            new Error(
+                "Mass material requests only support ticket type Create"
+            ),
+            {
+                statusCode: 400,
+                code: "MASS_REQUEST_CREATE_ONLY",
+                errors: offending,
+            }
+        );
+    }
+
+    return true;
+};
+
+// v1 restriction: the entered running number must be strictly NUMERIC, so the
+// per-item step is arithmetic (+1) instead of an alphanumeric "next code"
+// guess. Width stays 3 because buildSingleRequestFinalCode's suffix segment is
+// exactly 3 chars — the composed codes go through that builder unchanged.
+const MASS_FINAL_CODE_SUFFIX_PATTERN = /^\d{3}$/;
+
+const buildMassFinalCodeError = (message, code, statusCode = 409) =>
+    Object.assign(new Error(message), {
+        statusCode,
+        code,
+        errors: [{ fieldKey: "finalCodeSuffix", message }],
+    });
+
+// Item k (1-based, ordered by item_no) takes the entered suffix + (k - 1),
+// zero-padded back to the entered suffix's width. Running past that width is a
+// 409 overflow rather than a silently widened code: the segment is fixed width
+// in SAP, so "999" + 1 must fail loudly instead of staging "1000".
+const buildMassItemFinalCodeSuffixes = ({
+    finalCodeSuffix,
+    itemCount,
+} = {}) => {
+    const suffix = normalizeCodeSegment(finalCodeSuffix);
+
+    if (!MASS_FINAL_CODE_SUFFIX_PATTERN.test(suffix)) {
+        throw buildMassFinalCodeError(
+            "Final code running number is required and must be exactly 3 digits for a mass request",
+            "MASS_REQUEST_FINAL_CODE_SUFFIX_INVALID",
+            400
+        );
+    }
+
+    const width = suffix.length;
+    const ceiling = 10 ** width;
+    const base = Number.parseInt(suffix, 10);
+    const count = Number(itemCount) || 0;
+    const suffixes = [];
+
+    for (let index = 0; index < count; index += 1) {
+        const value = base + index;
+
+        if (value >= ceiling) {
+            throw buildMassFinalCodeError(
+                `Running number ${suffix} cannot cover ${count} items: item ${index + 1} would need ${value}, which is past the ${width}-digit range. Use a lower running number.`,
+                "MASS_REQUEST_FINAL_CODE_SUFFIX_OVERFLOW"
+            );
+        }
+
+        suffixes.push(String(value).padStart(width, "0"));
+    }
+
+    return suffixes;
+};
+
+// Belt-and-braces. Two siblings cannot collide by construction (every item gets
+// a distinct suffix), but the composed codes are what actually gets written, so
+// assert the invariant instead of trusting it — a later change to the increment
+// rule (per-group running numbers, say) would otherwise silently stage two
+// items onto one SAP material code.
+const assertMassFinalCodesAreDistinct = (plan = []) => {
+    const itemNoByCode = new Map();
+
+    for (const entry of Array.isArray(plan) ? plan : []) {
+        const code = normalizeCodeSegment(entry?.final_code);
+
+        if (!code) {
+            continue;
+        }
+
+        if (itemNoByCode.has(code)) {
+            throw buildMassFinalCodeError(
+                `Item ${entry?.item_no}: material code ${code} is already taken by item ${itemNoByCode.get(code)} in this same batch. Use a different running number.`,
+                "MASS_REQUEST_FINAL_CODE_ALREADY_EXISTS"
+            );
+        }
+
+        itemNoByCode.set(code, entry?.item_no);
+    }
+
+    return true;
+};
+
+/**
+ * Compose one final code per batch item from the single entered running number.
+ *
+ * @param {object} opts
+ * @param {string} opts.finalCodeSuffix  running number entered at the MDM step
+ * @param {Array}  opts.items            batch items, each carrying item_id /
+ *                                       item_no / request_no plus the RESOLVED
+ *                                       material group + sub group CODES (the
+ *                                       item table stores free text — see
+ *                                       MASS_ITEM_*_CODE_LATERAL_SQL). Sorted
+ *                                       by item_no here so the caller's row
+ *                                       order cannot shuffle the increment.
+ * @returns {Array<{item_id, item_no, request_no, final_code}>}
+ */
+const buildMassRequestFinalCodePlan = ({
+    finalCodeSuffix,
+    items = [],
+} = {}) => {
+    const orderedItems = [...(Array.isArray(items) ? items : [])].sort(
+        (a, b) => Number(a?.item_no) - Number(b?.item_no)
+    );
+    const suffixes = buildMassItemFinalCodeSuffixes({
+        finalCodeSuffix,
+        itemCount: orderedItems.length,
+    });
+
+    const plan = orderedItems.map((item, index) => {
+        const itemNo = item?.item_no ?? index + 1;
+        const groupCode = normalizeCodeSegment(item?.material_group_code);
+        const subGroupCode = normalizeCodeSegment(
+            item?.material_sub_group_code
+        );
+
+        // The item's group/sub group are free text; when neither the code nor
+        // the display name matches a master row there is nothing to compose a
+        // code from, and guessing would mint a wrong SAP material number.
+        if (!groupCode || !subGroupCode) {
+            throw buildMassFinalCodeError(
+                `Item ${itemNo}: material group / sub material group could not be resolved to a master code, so no final code can be composed. Fix that item's group values and approve again.`,
+                "MASS_REQUEST_FINAL_CODE_GROUP_UNRESOLVED"
+            );
+        }
+
+        return {
+            item_id: item?.item_id ?? item?.id ?? null,
+            item_no: itemNo,
+            request_no: item?.request_no ?? null,
+            final_code: buildSingleRequestFinalCode({
+                materialGroupCode: groupCode,
+                materialSubGroupCode: subGroupCode,
+                finalCodeSuffix: suffixes[index],
+            }),
+        };
+    });
+
+    assertMassFinalCodesAreDistinct(plan);
+
+    return plan;
 };
 
 const canActorReviseSingleRequest = ({
@@ -507,6 +702,402 @@ const buildStepRewindPatch = ({
         _meta: { targetStep },
     };
 };
+
+// --- Chain replacement (Master Data rewrites the manual approver chain) -----
+// Third rework mode, alongside "back to the requester" (buildStepReworkPatch)
+// and "back to one earlier approver" (buildStepRewindPatch). Here Master Data
+// throws the whole frozen MANUAL chain away and installs a new one, because the
+// request was routed to the wrong approvers in the first place — rewinding to a
+// wrong approver would just repeat the mistake.
+
+const REWORK_NOTIFY_CHANNELS = Object.freeze({ APP: "APP", EMAIL: "EMAIL" });
+
+const buildChainReplaceError = (
+    message,
+    code,
+    { statusCode = 400, fieldKey = "newApprovers", errors = null } = {}
+) => {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    error.code = code;
+    error.errors = errors ?? [{ fieldKey, message }];
+    return error;
+};
+
+/**
+ * Normalize the optional `notifyVia` request-body field.
+ *
+ * @param {string|null} [value] channel chosen by the client, case-insensitive
+ * @param {string} [codePrefix] SINGLE_REQUEST | MASS_REQUEST — error-code scope
+ * @returns {'APP'|'EMAIL'} APP when absent/blank, so an old client that never
+ *                          sends the field keeps the in-app-only behaviour
+ * @throws 400 `<PREFIX>_REWORK_NOTIFY_INVALID` on anything else. Junk is
+ *         rejected rather than coerced to APP: silently downgrading a requested
+ *         EMAIL to APP would look like a delivery that simply never arrived.
+ */
+const normalizeReworkNotifyVia = (value, codePrefix = "SINGLE_REQUEST") => {
+    if (value === undefined || value === null) {
+        return REWORK_NOTIFY_CHANNELS.APP;
+    }
+
+    const channel =
+        typeof value === "string" ? value.trim().toUpperCase() : null;
+
+    if (channel === "") {
+        return REWORK_NOTIFY_CHANNELS.APP;
+    }
+
+    if (
+        channel !== REWORK_NOTIFY_CHANNELS.APP &&
+        channel !== REWORK_NOTIFY_CHANNELS.EMAIL
+    ) {
+        throw buildChainReplaceError(
+            "Rework notification channel must be APP or EMAIL",
+            `${codePrefix}_REWORK_NOTIFY_INVALID`,
+            { fieldKey: "notifyVia" }
+        );
+    }
+
+    return channel;
+};
+
+/**
+ * Normalize + require the mail content that goes with `notifyVia: 'EMAIL'`.
+ *
+ * Both fields are optional on the wire (an APP rework carries neither) but
+ * mandatory once EMAIL is chosen: Master Data edits a generated draft in the
+ * dialog, so a blank subject or body means the draft never loaded or the editor
+ * was cleared. Sending an empty mail to an approver is worse than refusing —
+ * he would get a blank message and no way to know what to review.
+ *
+ * @param {'APP'|'EMAIL'} notifyVia normalized channel
+ * @param {object} [body] the request body's `emailSubject` / `emailBody`
+ * @param {string} [codePrefix] SINGLE_REQUEST | MASS_REQUEST — error-code scope
+ * @returns {{emailSubject: string, emailBody: string}|null} null on the APP
+ *          channel, where there is nothing to send
+ * @throws 400 `<PREFIX>_REWORK_EMAIL_CONTENT_REQUIRED` when either is blank
+ */
+const assertReworkEmailContent = (
+    notifyVia,
+    { emailSubject = null, emailBody = null } = {},
+    codePrefix = "SINGLE_REQUEST"
+) => {
+    if (notifyVia !== REWORK_NOTIFY_CHANNELS.EMAIL) {
+        return null;
+    }
+
+    const subject = typeof emailSubject === "string" ? emailSubject.trim() : "";
+    const body = typeof emailBody === "string" ? emailBody.trim() : "";
+    const errors = [];
+
+    if (subject === "") {
+        errors.push({
+            fieldKey: "emailSubject",
+            message: "Email subject is required to notify by email",
+        });
+    }
+
+    if (body === "") {
+        errors.push({
+            fieldKey: "emailBody",
+            message: "Email body is required to notify by email",
+        });
+    }
+
+    if (errors.length > 0) {
+        throw buildChainReplaceError(
+            "Email subject and body are required to notify by email",
+            `${codePrefix}_REWORK_EMAIL_CONTENT_REQUIRED`,
+            { errors }
+        );
+    }
+
+    // The body keeps the editor's own leading/trailing layout; only the subject
+    // is trimmed, because a subject is a single line by definition.
+    return { emailSubject: subject, emailBody: String(emailBody) };
+};
+
+/**
+ * Does this body ask for chain replacement at all?
+ *
+ * Absent, null and `[]` all read as "no" so the plain rework-to-requester and
+ * rewind paths stay byte-for-byte what they were; anything else (including a
+ * non-array) reads as "yes" and is then rejected loudly by the plan builder,
+ * never silently ignored.
+ *
+ * @param {*} newApprovers raw request-body value
+ * @returns {boolean}
+ */
+const isChainReplaceRequested = newApprovers =>
+    newApprovers !== undefined &&
+    newApprovers !== null &&
+    !(Array.isArray(newApprovers) && newApprovers.length === 0);
+
+const normalizeNewApproverIds = (newApprovers, codePrefix) => {
+    if (!Array.isArray(newApprovers) || newApprovers.length === 0) {
+        throw buildChainReplaceError(
+            "New approvers must be a non-empty ordered list of user ids",
+            `${codePrefix}_REWORK_APPROVER_INVALID`
+        );
+    }
+
+    const ids = newApprovers.map(value =>
+        value === undefined || value === null ? "" : String(value).trim()
+    );
+
+    if (ids.some(id => id === "")) {
+        throw buildChainReplaceError(
+            "New approvers must all be user ids",
+            `${codePrefix}_REWORK_APPROVER_INVALID`
+        );
+    }
+
+    return ids;
+};
+
+/**
+ * Chain replacement: Master Data replaces this request's whole MANUAL chain
+ * with `newApprovers` (ordered, index 0 = Approval 1) and re-queues itself
+ * behind them. Sibling of buildStepRewindPatch — pure logic only, so the SQL
+ * stays in the service methods and this stays unit-testable.
+ *
+ * Why Master Data only: it is the one stage that sees every request and can
+ * tell that the routing itself was wrong. A MANUAL approver rewriting the chain
+ * could approve-by-substitution — swap the approvers above him for nobody, or
+ * for himself. Gated on the stage, not the actor, because ADMIN passes
+ * canActorActOnStep unconditionally and this is the only place that can hold
+ * the line.
+ *
+ * Why the MDM row is patched, not recreated: its approver_user_id/claimed_at
+ * carry the grab. Deleting and re-inserting it would silently return the
+ * request to the open MDM pool, so the row is moved to level N+1 and reopened
+ * while both grab columns go unnamed (untouched by omission).
+ *
+ * Levels are contiguous 1..N+1 and (request_id, level) is UNIQUE, so the caller
+ * must apply the plan in this order: DELETE the MANUAL rows, THEN move the MDM
+ * row to `mdmStep.level`, THEN insert `manualSteps`. Any other order can collide
+ * with the MDM row's old level (e.g. 2 approvers replacing 2 approvers).
+ *
+ * @param {object} opts
+ * @param {Array}  [opts.steps]        locked step rows of THIS request (unused
+ *                                     for routing — the plan is derived from the
+ *                                     new list — kept for signature symmetry
+ *                                     with the sibling builders)
+ * @param {object} opts.activeStep     the request's active step, which must be
+ *                                     the Master Data (MDM) step; it is also the
+ *                                     row that gets moved to level N+1
+ * @param {Array}  opts.newApprovers   ordered mst_user user_ids, index 0 = Approval 1
+ * @param {number|string|null} [opts.reworkToLevel] rewind target, if the body
+ *                                     also carried one — mutually exclusive
+ * @param {string} [opts.requesterUserId] request owner; may not approve his own request
+ * @param {string} [opts.actorUserId]  recorded as rework_by_user_id
+ * @param {string} opts.reason         required; recorded as rework_reason
+ * @param {string} [opts.codePrefix]   SINGLE_REQUEST | MASS_REQUEST
+ * @returns {object} `{ approverIds, manualSteps, mdmStep, header, _meta }` —
+ *                   `manualSteps` are INSERT specs (insertSingleRequestApprovalSteps /
+ *                   insertMassItemApprovalSteps shape), `mdmStep` is the SET
+ *                   patch for the existing MDM row, `header` the request/item
+ *                   header patch, `_meta.mdmStep` the MDM row itself
+ * @throws 400 `<PREFIX>_REWORK_TARGET_CONFLICT` when a rewind target came too;
+ *         403 `<PREFIX>_REWORK_TARGET_FORBIDDEN` when the active step is not
+ *         Master Data; 400 `<PREFIX>_REWORK_APPROVER_INVALID` when the list is
+ *         empty, blank, duplicated, contains the requester, or contains the
+ *         Master Data claimer. Existence/active-ness of the ids needs the DB and
+ *         is asserted by the caller (assertActiveApproverUsersExist).
+ */
+const buildStepChainReplacePlan = ({
+    steps = [],
+    activeStep,
+    newApprovers,
+    reworkToLevel = null,
+    requesterUserId = null,
+    actorUserId = null,
+    reason,
+    codePrefix = "SINGLE_REQUEST",
+} = {}) => {
+    void steps;
+    const safeReason = assertRequiredActionReason(reason, "rework");
+
+    // Mode conflict first: a body carrying both targets is ambiguous about what
+    // the approver meant, and guessing either way rewrites the chain wrongly.
+    const hasRewindTarget =
+        reworkToLevel !== undefined &&
+        reworkToLevel !== null &&
+        reworkToLevel !== "";
+
+    if (
+        Array.isArray(newApprovers) &&
+        newApprovers.length > 0 &&
+        hasRewindTarget
+    ) {
+        throw buildChainReplaceError(
+            "Choose either a rework target level or a new approver chain, not both",
+            `${codePrefix}_REWORK_TARGET_CONFLICT`,
+            { fieldKey: "reworkToLevel" }
+        );
+    }
+
+    // Stage gate before field validation: a non-Master-Data approver must get
+    // the same 403 whether or not his payload happens to be well formed.
+    if (stepKindOf(activeStep) !== STEP_KINDS.MDM) {
+        throw buildChainReplaceError(
+            "Only the Master Data stage can replace the approver chain",
+            `${codePrefix}_REWORK_TARGET_FORBIDDEN`,
+            { statusCode: 403 }
+        );
+    }
+
+    const ids = normalizeNewApproverIds(newApprovers, codePrefix);
+
+    // A repeated id would make the same person approve twice, which the step
+    // engine reads as two independent stages nobody can distinguish.
+    if (new Set(ids).size !== ids.length) {
+        throw buildChainReplaceError(
+            "New approvers must be distinct",
+            `${codePrefix}_REWORK_APPROVER_INVALID`
+        );
+    }
+
+    if (
+        requesterUserId != null &&
+        ids.some(id => String(id) === String(requesterUserId))
+    ) {
+        throw buildChainReplaceError(
+            "The requester cannot approve their own request",
+            `${codePrefix}_REWORK_APPROVER_INVALID`
+        );
+    }
+
+    // Separation of duties on the grab: whoever holds Master Data must not also
+    // sit in the manual chain he just wrote — he would approve into himself.
+    const mdmApproverUserId = stepApproverUserId(activeStep);
+
+    if (
+        mdmApproverUserId != null &&
+        ids.some(id => String(id) === String(mdmApproverUserId))
+    ) {
+        throw buildChainReplaceError(
+            "The Master Data approver cannot be part of the new approver chain",
+            `${codePrefix}_REWORK_APPROVER_INVALID`
+        );
+    }
+
+    const mdmLevel = ids.length + 1;
+
+    return {
+        approverIds: ids,
+        // INSERT specs, not patches: these rows do not exist yet.
+        manualSteps: ids.map((approverUserId, index) => ({
+            level: index + 1,
+            kind: STEP_KINDS.MANUAL,
+            approverUserId,
+            status: STEP_INITIAL_STATUS,
+        })),
+        // SET patch for the surviving MDM row. approver_user_id and claimed_at
+        // are absent on purpose — the grab survives by omission.
+        mdmStep: {
+            level: mdmLevel,
+            status: STEP_STATUS.WAITING,
+            acted_at: null,
+            remark: null,
+        },
+        header: {
+            // Submit, never Rework: the request is not the requester's to edit,
+            // it is waiting on the brand-new Approval 1.
+            status: "Submit",
+            assigned_to: stepLabelByKindLevel(STEP_KINDS.MANUAL, 1),
+            rework_stage: stepLabel(activeStep),
+            rework_by_user_id: actorUserId ?? null,
+            rework_at: SQL_NOW_EXPRESSION,
+            rework_reason: safeReason,
+        },
+        _meta: { mdmStep: activeStep, mdmLevel, reason: safeReason },
+    };
+};
+
+/**
+ * Build the `notify` block a rework response carries.
+ *
+ * MUST be called after the transaction commits: the EMAIL branch is a real (if
+ * currently inert) side effect, and a side effect fired inside the transaction
+ * would survive a rollback that undid the chain it announced.
+ *
+ * `sent` is always false today — the EMAIL template is not written yet — and
+ * `placeholder` tells the client which of the two false-s it is looking at:
+ * true "we owe you a mail", false "APP needs no mail at all".
+ *
+ * @param {'APP'|'EMAIL'} notifyVia normalized channel
+ * @param {object} [ctx] context handed to the placeholder sender
+ * @returns {{via: string, sent: boolean, placeholder: boolean}}
+ */
+const buildReworkNotifyResult = (notifyVia, ctx = {}) => {
+    if (notifyVia !== REWORK_NOTIFY_CHANNELS.EMAIL) {
+        return {
+            via: REWORK_NOTIFY_CHANNELS.APP,
+            sent: false,
+            placeholder: false,
+        };
+    }
+
+    return {
+        via: REWORK_NOTIFY_CHANNELS.EMAIL,
+        ...notifyReworkApproversViaEmailPlaceholder(ctx),
+    };
+};
+
+/**
+ * The `notify` block the EMAIL rework channel carries — the live send.
+ *
+ * Same post-commit rule as buildReworkNotifyResult, and the same reason: this
+ * one really does put a mail on the wire, so it must not be able to run inside
+ * a transaction that can still roll back.
+ *
+ * Only reached when the dialog picked somebody, because the mail is addressed to
+ * that person (index 0 of the list). A rework with no picked recipient has
+ * nobody to write to and keeps the inert buildReworkNotifyResult.
+ *
+ * Since the 2026-08-07 product decision this is the WHOLE of the EMAIL path:
+ * the pick is a recipient, not an approver, so the request is not reassigned and
+ * `approverUserId` names the addressee only (see requestSingleRequestRework).
+ *
+ * Never rejects: sendReworkApproverEmail turns every failure into
+ * `{sent:false, error}` so a dead SMTP server cannot make a committed rework
+ * look like it failed.
+ *
+ * @param {object} client pg client, used after COMMIT
+ * @param {object} opts
+ * @param {{emailSubject: string, emailBody: string}} opts.mailContent validated content
+ * @param {'SINGLE'|'MASS'} opts.requestKind mat_rework_email.request_kind
+ * @param {number} opts.requestId    mat_single_request.id / mat_mass_request.id
+ * @param {string} opts.requestNo    request_no the [VMS#...] thread token names
+ * @param {string} opts.approverUserId the picked new Approval 1
+ * @param {string|null} opts.approverEmail his mst_user.email, already resolved
+ *                                         by assertActiveApproverUsersExist
+ * @param {string} [opts.actorUserId] the Master Data actor
+ * @returns {Promise<{via:'EMAIL', sent:boolean, error?:string}>}
+ */
+const sendReworkChainReplaceEmail = async (
+    client,
+    {
+        mailContent,
+        requestKind,
+        requestId,
+        requestNo,
+        approverUserId,
+        approverEmail,
+        actorUserId = null,
+    } = {}
+) =>
+    await reworkEmailSender.sendReworkApproverEmail(client, {
+        requestKind,
+        requestId,
+        requestNo,
+        subject: mailContent.emailSubject,
+        body: mailContent.emailBody,
+        toEmail: approverEmail,
+        toUserId: approverUserId,
+        sentByUserId: actorUserId,
+    });
 
 const buildStepRejectPatch = ({ activeStep, reason } = {}) => {
     const safeReason = assertRequiredActionReason(reason, "reject");
@@ -1177,7 +1768,8 @@ const loadSingleRequestSteps = async (
             s.status,
             s.acted_at,
             s.remark,
-            COALESCE(au.fullname, au.username, s.approver_user_id) AS approver_name
+            COALESCE(au.fullname, au.username, s.approver_user_id) AS approver_name,
+            au.email AS approver_email
          FROM mat_single_request_approval_step s
          LEFT JOIN mst_user au ON au.user_id = s.approver_user_id
          WHERE s.request_id = $1
@@ -1279,7 +1871,8 @@ const loadMassItemSteps = async (
             s.status,
             s.acted_at,
             s.remark,
-            COALESCE(au.fullname, au.username, s.approver_user_id) AS approver_name
+            COALESCE(au.fullname, au.username, s.approver_user_id) AS approver_name,
+            au.email AS approver_email
          FROM mat_mass_request_item_approval_step s
          JOIN mat_mass_request_item i ON i.id = s.item_id
          LEFT JOIN mst_user au ON au.user_id = s.approver_user_id
@@ -1356,6 +1949,121 @@ const claimMdmMassItemStep = async (client, massRequestId, level, actorUserId) =
     );
 
     return result.rowCount > 0;
+};
+
+// --- Mass-item final code helpers (DB side) --------------------------------
+
+// Resolve every item's material group / sub group CODE in ONE query. The item
+// table stores those two as free text (the grid writes a display name on some
+// builds, a code on others), while the final-code composer needs the bare
+// 3-digit codes — the two LATERAL fragments accept every shape the UI can have
+// written. A NULL code means "unresolvable"; the composer turns that into a 409
+// naming the item.
+const loadMassItemGroupCodes = async (client, massRequestId) => {
+    const result = await client.query(
+        `SELECT
+            i.id AS item_id,
+            i.item_no,
+            i.request_no,
+            mig.code AS material_group_code,
+            mis.code AS material_sub_group_code
+         FROM mat_mass_request_item i
+         ${MASS_ITEM_GROUP_CODE_LATERAL_SQL}
+         ${MASS_ITEM_SUB_GROUP_CODE_LATERAL_SQL}
+         WHERE i.mass_request_id = $1
+         ORDER BY i.item_no ASC`,
+        [massRequestId]
+    );
+
+    return result.rows;
+};
+
+// Uniqueness guard for a composed batch, mirroring the single-request one
+// (approveSingleRequestByAdmin): a code must not collide with an existing SAP
+// material, nor with a final_code already taken by another request still on its
+// way to SAP. A CANCELled request/item releases its code — it is terminal, so
+// it can never reach SAP and claim the code back. Batched with = ANY(...) so a
+// 10-item batch costs 3 round-trips instead of 30; the offending item_no is
+// recovered from the plan for the message.
+const assertMassFinalCodePlanIsAvailable = async (
+    client,
+    { massRequestId, plan = [] } = {}
+) => {
+    const codes = plan.map(entry => entry.final_code).filter(Boolean);
+
+    if (codes.length === 0) {
+        return;
+    }
+
+    const itemNoByCode = new Map(
+        plan.map(entry => [entry.final_code, entry.item_no])
+    );
+    const conflict = (code, detail) => {
+        throw buildMassFinalCodeError(
+            `Item ${itemNoByCode.get(code)}: ${detail}`,
+            "MASS_REQUEST_FINAL_CODE_ALREADY_EXISTS"
+        );
+    };
+
+    const sapDuplicate = await client.query(
+        `SELECT code FROM mat_sap_data WHERE code = ANY($1::text[]) LIMIT 1`,
+        [codes]
+    );
+    if (sapDuplicate.rowCount > 0) {
+        const code = sapDuplicate.rows[0].code;
+        conflict(
+            code,
+            `material code ${code} already exists in SAP master data. Use a different running number.`
+        );
+    }
+
+    const singleDuplicate = await client.query(
+        `SELECT request_no, final_code
+         FROM mat_single_request
+         WHERE final_code = ANY($1::text[])
+           AND UPPER(COALESCE(status, '')) <> 'CANCEL'
+         LIMIT 1`,
+        [codes]
+    );
+    if (singleDuplicate.rowCount > 0) {
+        const row = singleDuplicate.rows[0];
+        conflict(
+            row.final_code,
+            `material code ${row.final_code} is already used by request ${row.request_no}. Use a different running number.`
+        );
+    }
+
+    // Scoped to OTHER batches: this batch's own items are the rows being
+    // rewritten right now (a SAP-error resubmit re-approval still carries the
+    // previous codes), so they must not collide with themselves.
+    const massDuplicate = await client.query(
+        `SELECT request_no, item_no, final_code
+         FROM mat_mass_request_item
+         WHERE final_code = ANY($1::text[])
+           AND mass_request_id <> $2
+           AND UPPER(COALESCE(status, '')) <> 'CANCEL'
+         LIMIT 1`,
+        [codes, massRequestId]
+    );
+    if (massDuplicate.rowCount > 0) {
+        const row = massDuplicate.rows[0];
+        conflict(
+            row.final_code,
+            `material code ${row.final_code} is already used by mass request item ${row.request_no}. Use a different running number.`
+        );
+    }
+};
+
+const applyMassItemFinalCodes = async (client, { massRequestId, plan = [] }) => {
+    for (const entry of plan) {
+        await client.query(
+            `UPDATE mat_mass_request_item
+             SET final_code = $3,
+                 updated_at = NOW()
+             WHERE id = $1 AND mass_request_id = $2`,
+            [entry.item_id, massRequestId, entry.final_code]
+        );
+    }
 };
 
 const getSingleRequestAttachments = async (client, requestId) => {
@@ -1906,6 +2614,99 @@ const isActorMdmMaterialUser = async (client, actorUserId) => {
     return result.rowCount > 0;
 };
 
+/**
+ * The one DB-backed half of chain-replacement validation: every replacement
+ * approver must be a real, ACTIVE mst_user.
+ *
+ * saveRequesterApproverChain (the administrator's whole-list save) checks shape
+ * only and never touches mst_user, so an unchecked id there merely produces a
+ * dead matrix row. Here the ids go straight onto a live request's step rows, so
+ * a typo or a disabled account would strand the request on an approver who can
+ * never log in — hence this extra round trip.
+ *
+ * One query for the whole list (ANY($1)), so cost does not grow with N.
+ *
+ * It also hands back each approver's e-mail. The EMAIL notification channel
+ * needs exactly that address and this query has already paid for the mst_user
+ * round trip inside the same locked transaction — resolving it again afterwards
+ * would both cost a second query and read a row that could have changed.
+ *
+ * @returns {Promise<Map<string, string|null>>} user_id -> email (null when the
+ *          account has no address on file)
+ * @throws 400 `<PREFIX>_REWORK_APPROVER_INVALID` naming every offending id
+ */
+const assertActiveApproverUsersExist = async (
+    client,
+    approverIds = [],
+    codePrefix = "SINGLE_REQUEST"
+) => {
+    const ids = [...new Set(approverIds.map(id => String(id)))];
+
+    if (ids.length === 0) {
+        return new Map();
+    }
+
+    const result = await client.query(
+        `SELECT mu.user_id, mu.email
+           FROM mst_user mu
+          WHERE mu.user_id = ANY($1)
+            AND mu.is_active = true`,
+        [ids]
+    );
+    const activeEmails = new Map(
+        result.rows.map(row => [String(row.user_id), row.email ?? null])
+    );
+    const invalidIds = ids.filter(id => !activeEmails.has(id));
+
+    if (invalidIds.length > 0) {
+        throw buildChainReplaceError(
+            `Approver not found or inactive: ${invalidIds.join(", ")}`,
+            `${codePrefix}_REWORK_APPROVER_INVALID`,
+            {
+                errors: invalidIds.map(id => ({
+                    fieldKey: "newApprovers",
+                    message: `Approver not found or inactive: ${id}`,
+                })),
+            }
+        );
+    }
+
+    return activeEmails;
+};
+
+/**
+ * The picked approver's display name for the rework mail greeting.
+ *
+ * Read-only and deliberately forgiving: the draft is a convenience, so an id
+ * that names nobody (or an account with no fullname on file) simply leaves the
+ * composer on its generic "Kepada Yth. Approver,". The real gate on the id is
+ * assertActiveApproverUsersExist, which runs when the rework is submitted.
+ *
+ * ACTIVE-only for the same reason that check is: a disabled account is not an
+ * approver, and putting its name on the mail would say otherwise.
+ *
+ * @param {object} client pg client
+ * @param {string|number} [approverUserId] mst_user.user_id the dialog picked
+ * @returns {Promise<string>} the fullname, or "" when there is none to use
+ */
+const loadReworkApproverFullname = async (client, approverUserId) => {
+    const userId = String(approverUserId ?? "").trim();
+
+    if (userId === "") {
+        return "";
+    }
+
+    const result = await client.query(
+        `SELECT mu.fullname
+           FROM mst_user mu
+          WHERE mu.user_id = $1
+            AND mu.is_active = true`,
+        [userId]
+    );
+
+    return String(result.rows[0]?.fullname ?? "").trim();
+};
+
 // =====================================================================
 // Dynamic-approver step engine — shared SQL fragments.
 // Each request/item exposes its step rows as a `approval_steps` jsonb
@@ -1925,6 +2726,7 @@ const buildSingleRequestStepLateral = (alias = "r") => `LEFT JOIN LATERAL (
                                         'kind', s.kind,
                                         'approver_user_id', s.approver_user_id,
                                         'approver_name', COALESCE(sau.fullname, sau.username, s.approver_user_id),
+                                        'approver_email', sau.email,
                                         'status', s.status,
                                         'claimed_at', s.claimed_at,
                                         'acted_at', s.acted_at,
@@ -1969,8 +2771,41 @@ const SINGLE_REQUEST_LEGACY_REWORK_SELECT_FIELDS = `NULL::varchar AS rework_stag
                         NULL::varchar AS rework_by_username,
                         NULL::text AS rework_reason`;
 
+// =====================================================================
+// Rework e-mail replies — list/inbox reply indicator.
+// A rework sent "via email" (chain replacement, notifyVia='EMAIL') stores
+// the mail in mat_rework_email and every polled answer in
+// mat_rework_email_reply. The list and inbox rows carry the reply COUNT so
+// the Status cell can say a reply is waiting without opening the detail.
+// =====================================================================
+
+// Scalar subquery, never a join: the count hangs off the row it belongs to
+// and can therefore not multiply it (the single-request list is GROUP BY'd
+// over attachments, and a joined reply row would fan both out). Counted
+// through mat_rework_email, so a request that never had a mail sent — and a
+// deployment whose mat_rework_email_reply is still empty — reads 0, not NULL.
+//
+// `kind`   the mat_rework_email.request_kind literal ('SINGLE' | 'MASS')
+// `idExpr` the outer row's request id (r.id / m.id). For MASS that is
+//          mat_mass_request.id, which is what reworkEmailSender stores, so the
+//          count spans the whole batch's thread rather than one item.
+const buildEmailReplyCountSql = (kind, idExpr) => `(
+                            SELECT COUNT(rp.id)
+                            FROM mat_rework_email e
+                            JOIN mat_rework_email_reply rp ON rp.rework_email_id = e.id
+                            WHERE e.request_kind = '${kind}'
+                              AND e.request_id = ${idExpr}
+                        )::int AS email_reply_count`;
+
+// 20260807_rework_email_thread.sql is applied by hand. Until it lands the two
+// tables do not exist, and Postgres rejects the whole statement at parse time —
+// so the fallback drops the subquery for a constant instead, exactly as the
+// pre-rework-column fallbacks below do. The payload field never disappears.
+const EMAIL_REPLY_COUNT_ABSENT_SQL = `0::int AS email_reply_count`;
+
 const buildSingleRequestSelectFields = ({
     includeReworkFields = true,
+    includeEmailReplyCount = true,
 } = {}) => `r.id,
                           r.request_no AS ticket_number,
                           r.ticket_type,
@@ -2003,6 +2838,12 @@ const buildSingleRequestSelectFields = ({
                                   : SINGLE_REQUEST_LEGACY_REWORK_SELECT_FIELDS
                           },
                           COALESCE(u.username, r.created_by) AS created_by,
+                          u.email AS requester_email,
+                          ${
+                              includeEmailReplyCount
+                                  ? buildEmailReplyCountSql("SINGLE", "r.id")
+                                  : EMAIL_REPLY_COUNT_ABSENT_SQL
+                          },
                           TO_CHAR(r.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
                           r.assigned_to,
                         COALESCE(
@@ -2024,14 +2865,15 @@ const SINGLE_REQUEST_GROUP_BY = `r.id,
                           mis.code,
                           mis.name,
                           u.username,
+                          u.email,
                           step_rows.approval_steps,
                           step_rows.active_step`;
 
 const buildSingleRequestListQuery = (
     whereClause,
-    { includeReworkFields = true } = {}
+    { includeReworkFields = true, includeEmailReplyCount = true } = {}
 ) => `SELECT
-                        ${buildSingleRequestSelectFields({ includeReworkFields })}
+                        ${buildSingleRequestSelectFields({ includeReworkFields, includeEmailReplyCount })}
                       FROM mat_single_request r
                       LEFT JOIN mst_user u ON u.user_id = r.created_by
                       ${buildSingleRequestStepLateral("r")}
@@ -2052,6 +2894,7 @@ const buildSingleRequestListQuery = (
 const buildSingleRequestApprovalInboxQuery = ({
     includeEditHistory = true,
     includeReworkFields = true,
+    includeEmailReplyCount = true,
 } = {}) => `SELECT
                         r.id,
                         r.request_no AS ticket_number,
@@ -2079,6 +2922,12 @@ const buildSingleRequestApprovalInboxQuery = ({
                         TO_CHAR(r.sap_pushed_at, 'YYYY-MM-DD HH24:MI') AS sap_pushed_at,
                         r.created_by AS requester_user_id,
                         COALESCE(u.username, r.created_by) AS created_by,
+                        u.email AS requester_email,
+                        ${
+                            includeEmailReplyCount
+                                ? buildEmailReplyCountSql("SINGLE", "r.id")
+                                : EMAIL_REPLY_COUNT_ABSENT_SQL
+                        },
                         TO_CHAR(r.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
                         r.assigned_to,
                         ${SINGLE_REQUEST_STEP_SELECT_FIELDS},
@@ -2190,6 +3039,7 @@ const MASS_REQUEST_FIRST_ITEM_STEP_LATERAL = `LEFT JOIN LATERAL (
                         'kind', s.kind,
                         'approver_user_id', s.approver_user_id,
                         'approver_name', COALESCE(sau.fullname, sau.username, s.approver_user_id),
+                        'approver_email', sau.email,
                         'status', s.status,
                         'claimed_at', s.claimed_at,
                         'acted_at', s.acted_at,
@@ -2220,44 +3070,87 @@ const MASS_REQUEST_FIRST_ITEM_STEP_LATERAL = `LEFT JOIN LATERAL (
     LIMIT 1
 ) first_item ON TRUE`;
 
-const GET_MASS_REQUESTS_BY_USER_QUERY = `SELECT
+// Scalar block (mass request): roll the per-ITEM sap_push_status up to one
+// batch-level value, so the list/inbox rows can offer the SAP-error resubmit
+// action the same way the single-request rows do off r.sap_push_status.
+// Precedence is worst-first — one errored item makes the batch ERROR, and only
+// an all-SYNCED batch reads SYNCED. `m` is the alias for mat_mass_request.
+const MASS_REQUEST_SAP_PUSH_STATUS_SQL = `(
+    SELECT CASE
+        WHEN COUNT(*) FILTER (WHERE UPPER(COALESCE(si.sap_push_status, '')) = 'ERROR') > 0 THEN 'ERROR'
+        WHEN COUNT(*) FILTER (WHERE UPPER(COALESCE(si.sap_push_status, '')) = 'PENDING') > 0 THEN 'PENDING'
+        WHEN COUNT(*) FILTER (WHERE UPPER(COALESCE(si.sap_push_status, '')) = 'PUSHED') > 0 THEN 'PUSHED'
+        WHEN COUNT(*) > 0
+             AND COUNT(*) FILTER (WHERE UPPER(COALESCE(si.sap_push_status, '')) = 'SYNCED') = COUNT(*)
+             THEN 'SYNCED'
+        ELSE NULL
+    END
+    FROM mat_mass_request_item si
+    WHERE si.mass_request_id = m.id
+) AS sap_push_status`;
+
+// Mass counterpart of the single-request reply scalar, keyed on the batch id
+// (mat_mass_request.id) the rework mail was filed under.
+const buildMassEmailReplyCountSql = includeEmailReplyCount =>
+    includeEmailReplyCount
+        ? buildEmailReplyCountSql("MASS", "m.id")
+        : EMAIL_REPLY_COUNT_ABSENT_SQL;
+
+const buildMassRequestsByUserQuery = ({
+    includeEmailReplyCount = true,
+} = {}) => `SELECT
     m.id,
     m.mass_request_no,
     m.item_count,
     m.mass_request_reason,
     m.created_by,
     m.created_by_username,
+    u.email AS requester_email,
+    ${buildMassEmailReplyCountSql(includeEmailReplyCount)},
     TO_CHAR(m.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
     first_item.first_item_material_description,
     first_item.first_item_uom AS first_item_uom,
     first_item.first_item_status,
     first_item.first_item_assigned_to,
     COALESCE(first_item.approval_steps, '[]'::jsonb) AS approval_steps,
-    first_item.active_step
+    first_item.active_step,
+    ${MASS_REQUEST_SAP_PUSH_STATUS_SQL}
 FROM mat_mass_request m
+LEFT JOIN mst_user u ON u.user_id = m.created_by
 ${MASS_REQUEST_FIRST_ITEM_STEP_LATERAL}
 WHERE m.created_by = $1
 ORDER BY m.created_at DESC, m.id DESC`;
 
-const GET_MASS_REQUEST_APPROVAL_INBOX_QUERY = `SELECT
+const buildMassRequestApprovalInboxQuery = ({
+    includeEmailReplyCount = true,
+} = {}) => `SELECT
     m.id,
     m.mass_request_no,
     m.item_count,
     m.mass_request_reason,
     m.created_by,
     m.created_by_username,
+    u.email AS requester_email,
+    ${buildMassEmailReplyCountSql(includeEmailReplyCount)},
     TO_CHAR(m.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
     first_item.first_item_status,
     first_item.first_item_assigned_to,
     COALESCE(first_item.approval_steps, '[]'::jsonb) AS approval_steps,
-    first_item.active_step
+    first_item.active_step,
+    ${MASS_REQUEST_SAP_PUSH_STATUS_SQL}
 FROM mat_mass_request m
+LEFT JOIN mst_user u ON u.user_id = m.created_by
 ${MASS_REQUEST_FIRST_ITEM_STEP_LATERAL}
 WHERE (
     first_item.active_step IS NOT NULL
     OR UPPER(COALESCE(first_item.first_item_status, '')) IN ('DONE', 'REWORK', 'REJECT', 'REJECTED', 'CANCEL')
 )
 ORDER BY m.created_at DESC, m.id DESC`;
+
+const GET_MASS_REQUESTS_BY_USER_QUERY = buildMassRequestsByUserQuery();
+
+const GET_MASS_REQUEST_APPROVAL_INBOX_QUERY =
+    buildMassRequestApprovalInboxQuery();
 
 const isMissingSingleRequestEditHistoryTableError = error =>
     error?.code === "42P01" &&
@@ -2267,14 +3160,22 @@ const isMissingSingleRequestReworkColumnsError = error =>
     error?.code === "42703" &&
     /rework_(stage|by_user_id|at|reason)/i.test(String(error?.message || ""));
 
+// 20260807_rework_email_thread.sql is applied by hand. Until it lands, the
+// thread read degrades to "no thread" instead of 500-ing the request detail.
+const isMissingReworkEmailTableError = error =>
+    error?.code === "42P01" &&
+    /mat_rework_email/i.test(String(error?.message || ""));
+
 const runSingleRequestListQuery = async (client, whereClause, params = []) => {
     let includeReworkFields = true;
+    let includeEmailReplyCount = true;
 
     while (true) {
         try {
             return await client.query(
                 buildSingleRequestListQuery(whereClause, {
                     includeReworkFields,
+                    includeEmailReplyCount,
                 }),
                 params
             );
@@ -2287,6 +3188,11 @@ const runSingleRequestListQuery = async (client, whereClause, params = []) => {
                 continue;
             }
 
+            if (includeEmailReplyCount && isMissingReworkEmailTableError(error)) {
+                includeEmailReplyCount = false;
+                continue;
+            }
+
             throw error;
         }
     }
@@ -2295,6 +3201,7 @@ const runSingleRequestListQuery = async (client, whereClause, params = []) => {
 const runSingleRequestApprovalInboxQuery = async client => {
     let includeEditHistory = true;
     let includeReworkFields = true;
+    let includeEmailReplyCount = true;
 
     while (true) {
         try {
@@ -2302,6 +3209,7 @@ const runSingleRequestApprovalInboxQuery = async client => {
                 buildSingleRequestApprovalInboxQuery({
                     includeEditHistory,
                     includeReworkFields,
+                    includeEmailReplyCount,
                 })
             );
         } catch (error) {
@@ -2321,10 +3229,44 @@ const runSingleRequestApprovalInboxQuery = async client => {
                 continue;
             }
 
+            if (includeEmailReplyCount && isMissingReworkEmailTableError(error)) {
+                includeEmailReplyCount = false;
+                continue;
+            }
+
             throw error;
         }
     }
 };
+
+// Mass counterparts of the two runners above. Their only degradation is the
+// reply scalar — everything else the mass queries read has been there since
+// the batch tables themselves.
+const runMassRequestQuery = async (client, buildQuery, params = []) => {
+    let includeEmailReplyCount = true;
+
+    while (true) {
+        try {
+            return await client.query(
+                buildQuery({ includeEmailReplyCount }),
+                params
+            );
+        } catch (error) {
+            if (includeEmailReplyCount && isMissingReworkEmailTableError(error)) {
+                includeEmailReplyCount = false;
+                continue;
+            }
+
+            throw error;
+        }
+    }
+};
+
+const runMassRequestsByUserQuery = async (client, createdBy) =>
+    await runMassRequestQuery(client, buildMassRequestsByUserQuery, [createdBy]);
+
+const runMassRequestApprovalInboxQuery = async client =>
+    await runMassRequestQuery(client, buildMassRequestApprovalInboxQuery);
 
 // =====================================================================
 // Dynamic-approver step engine — request-object payload + visibility (JS).
@@ -3557,6 +4499,12 @@ const MaterialRequests = {
         const savedFiles = [];
 
         try {
+            // Pure body-shape check: settle it before a transaction is opened.
+            // The grid only ever offers Create; this is the server-side backstop
+            // (see assertMassRequestRowsAreCreateOnly for why the rest of the
+            // mass pipeline depends on it).
+            assertMassRequestRowsAreCreateOnly(rows);
+
             return await DBClientWrapper(async client => {
                 await client.query("BEGIN");
 
@@ -3776,9 +4724,9 @@ const MaterialRequests = {
     getMassRequestsByUser: async createdBy => {
         try {
             return await DBClientWrapper(async client => {
-                const result = await client.query(
-                    GET_MASS_REQUESTS_BY_USER_QUERY,
-                    [createdBy]
+                const result = await runMassRequestsByUserQuery(
+                    client,
+                    createdBy
                 );
 
                 return result.rows.map(attachStepPayloadToRow);
@@ -3889,16 +4837,39 @@ const MaterialRequests = {
         }
     },
 
-    // `reworkToLevel` is optional: absent/null keeps the original
-    // rework-to-requester behaviour, a level rewinds to that MANUAL step.
+    // Three mutually exclusive rework modes, all reached through this one entry
+    // point so the status/actor gates below cannot be bypassed by picking one:
+    //   neither field  -> back to the requester (original behaviour)
+    //   reworkToLevel  -> rewind to that MANUAL step
+    //   newApprovers   -> Master Data replaces the whole MANUAL chain
+    // `notifyVia` is orthogonal and defaults to APP; on EMAIL it also requires
+    // the (editable) `emailSubject` / `emailBody` the dialog prefilled from
+    // getSingleRequestReworkEmailTemplate.
     requestSingleRequestRework: async ({
         requestId,
         actorUserId,
         actorUsername,
         reason,
         reworkToLevel = null,
+        newApprovers = null,
+        notifyVia = null,
+        emailSubject = null,
+        emailBody = null,
     }) => {
         try {
+            // Pure body-shape checks: settle them before a transaction is
+            // opened rather than BEGIN/ROLLBACK for a malformed request.
+            const notifyChannel = normalizeReworkNotifyVia(
+                notifyVia,
+                "SINGLE_REQUEST"
+            );
+            const mailContent = assertReworkEmailContent(
+                notifyChannel,
+                { emailSubject, emailBody },
+                "SINGLE_REQUEST"
+            );
+            const replaceChain = isChainReplaceRequested(newApprovers);
+
             return await DBClientWrapper(async client => {
                 await client.query("BEGIN");
 
@@ -3939,6 +4910,122 @@ const MaterialRequests = {
                         throw Object.assign(new Error("Forbidden: only the assigned approver or ADMIN can request rework"), { statusCode: 403, code: "SINGLE_REQUEST_REWORK_FORBIDDEN" });
                     }
 
+                    if (replaceChain) {
+                        const plan = buildStepChainReplacePlan({
+                            steps,
+                            activeStep,
+                            newApprovers,
+                            reworkToLevel,
+                            requesterUserId:
+                                snapshot.requester_user_id ??
+                                snapshot.created_by,
+                            actorUserId,
+                            reason,
+                            codePrefix: "SINGLE_REQUEST",
+                        });
+
+                        const approverEmails =
+                            await assertActiveApproverUsersExist(
+                                client,
+                                plan.approverIds,
+                                "SINGLE_REQUEST"
+                            );
+
+                        // "Via email" is CORRESPONDENCE ONLY (product decision
+                        // 2026-08-07). The picked person is the RECIPIENT of a
+                        // mail, not a new approver: the request is not
+                        // reassigned, so nothing here writes a step row or the
+                        // header. It stays claimed at Master Data, MDM reads the
+                        // replies, edits by hand and carries on in-app. `plan`
+                        // is still built above because its validation is the
+                        // contract on the recipient list (distinct, not the
+                        // requester, not the MDM claimer) — only its patches go
+                        // unused. `reason` is likewise validated (the plan
+                        // builder requires it) and then deliberately dropped:
+                        // there is no rework to record it against.
+                        if (mailContent) {
+                            // Read-only transaction: COMMIT just drops the FOR
+                            // UPDATE locks. The send still happens after it, for
+                            // the same reason as the reassigning path below.
+                            await client.query("COMMIT");
+
+                            const notify = await sendReworkChainReplaceEmail(
+                                client,
+                                {
+                                    mailContent,
+                                    requestKind: "SINGLE",
+                                    requestId: Number(requestId),
+                                    requestNo: snapshot.request_no ?? null,
+                                    approverUserId: plan.approverIds[0],
+                                    approverEmail:
+                                        approverEmails.get(
+                                            String(plan.approverIds[0])
+                                        ) ?? null,
+                                    actorUserId,
+                                }
+                            );
+
+                            return {
+                                request_id: Number(requestId),
+                                stage: stepLabel(activeStep),
+                                // The request's CURRENT values, unchanged — the
+                                // client must not repaint the row as moved.
+                                status: snapshot.status,
+                                assigned_to:
+                                    snapshot.assigned_to ??
+                                    stepLabel(activeStep),
+                                notify,
+                                emailOnly: true,
+                            };
+                        }
+
+                        // Order is forced by UNIQUE (request_id, level): the old
+                        // MANUAL rows go first, then the surviving MDM row moves
+                        // up to N+1, and only then can 1..N be inserted.
+                        await client.query(
+                            `DELETE FROM mat_single_request_approval_step
+                              WHERE request_id = $1
+                                AND kind = $2`,
+                            [requestId, STEP_KINDS.MANUAL]
+                        );
+                        // approver_user_id / claimed_at are not in the patch, so
+                        // the Master Data grab survives the rewrite.
+                        await updateSingleRequestStepRow(
+                            client,
+                            plan._meta.mdmStep.id,
+                            plan.mdmStep
+                        );
+                        await insertSingleRequestApprovalSteps(
+                            client,
+                            requestId,
+                            plan.manualSteps
+                        );
+                        await updateSingleRequestColumns(client, requestId, {
+                            ...plan.header,
+                            rework_by_user_id: actorUserId ?? null,
+                        });
+                        await client.query("COMMIT");
+
+                        // Post-commit on purpose (see buildReworkNotifyResult).
+                        // Always the APP block: the EMAIL channel returned above
+                        // without reassigning anything, so a reassignment can
+                        // only have been asked for in-app.
+                        const notify = buildReworkNotifyResult(notifyChannel, {
+                            requestId: Number(requestId),
+                            requestNo: snapshot.request_no ?? null,
+                            approverUserIds: plan.approverIds,
+                            reason: plan._meta.reason,
+                        });
+
+                        return {
+                            request_id: Number(requestId),
+                            stage: stepLabel(activeStep),
+                            status: plan.header.status,
+                            assigned_to: plan.header.assigned_to,
+                            notify,
+                        };
+                    }
+
                     const targetLevel = normalizeReworkToLevel(reworkToLevel);
                     const reworkPatch =
                         targetLevel === null
@@ -3976,6 +5063,16 @@ const MaterialRequests = {
                         stage: stepLabel(activeStep),
                         status: reworkPatch.header.status,
                         assigned_to: reworkPatch.header.assigned_to,
+                        // Post-commit on purpose (see buildReworkNotifyResult).
+                        // No mail even on the EMAIL channel: rework-to-requester
+                        // and rewind pick nobody, so there is no address the
+                        // notification could be sent to.
+                        notify: buildReworkNotifyResult(notifyChannel, {
+                            requestId: Number(requestId),
+                            requestNo: snapshot.request_no ?? null,
+                            approverUserIds: [],
+                            reason,
+                        }),
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -4624,9 +5721,7 @@ const MaterialRequests = {
     getMassRequestApprovalInbox: async (actorUserId, actorUsername, scope) => {
         try {
             return await DBClientWrapper(async client => {
-                const result = await client.query(
-                    GET_MASS_REQUEST_APPROVAL_INBOX_QUERY
-                );
+                const result = await runMassRequestApprovalInboxQuery(client);
                 const actorIsMdmMaterial = await isActorMdmMaterialUser(
                     client,
                     actorUserId
@@ -4654,9 +5749,10 @@ const MaterialRequests = {
         actorUsername,
         remark,
         items,
+        finalCodeSuffix,
     }) => {
         try {
-            return await DBClientWrapper(async client => {
+            const result = await DBClientWrapper(async client => {
                 await client.query("BEGIN");
 
                 try {
@@ -4784,6 +5880,35 @@ const MaterialRequests = {
                         }
                     }
 
+                    // Per-item final codes: only when the active step is the
+                    // Master Data one (always the last step of the plan, so a
+                    // mass batch is Create-only and every item needs a code).
+                    // Composed AFTER the item edits above — the MDM approver can
+                    // fix an item's group/sub group in the same action that
+                    // assigns the running number, and the code must follow the
+                    // group the item ends up with.
+                    const isMdmStep = activeStep.kind === STEP_KINDS.MDM;
+                    const finalCodePlan = isMdmStep
+                        ? buildMassRequestFinalCodePlan({
+                              finalCodeSuffix,
+                              items: await loadMassItemGroupCodes(
+                                  client,
+                                  massRequestId
+                              ),
+                          })
+                        : [];
+
+                    if (finalCodePlan.length > 0) {
+                        await assertMassFinalCodePlanIsAvailable(client, {
+                            massRequestId,
+                            plan: finalCodePlan,
+                        });
+                        await applyMassItemFinalCodes(client, {
+                            massRequestId,
+                            plan: finalCodePlan,
+                        });
+                    }
+
                     // Mark this stage APPROVED on the matching step row of EVERY
                     // item. For MDM, record the approver (claimer or this actor).
                     const approvePatch = buildMassStepApprovePatch({ remark });
@@ -4818,10 +5943,18 @@ const MaterialRequests = {
                         ? stepLabel(nextActive)
                         : "Completed";
 
+                    // Terminal completion: flag EVERY item for the Oracle
+                    // SAP-staging push (one VMS_MATERIALDATA row per item). The
+                    // inline push below picks them up right after COMMIT, same
+                    // as the single flow.
                     const updateResult = await client.query(
                         `UPDATE mat_mass_request_item
                          SET status = $2,
-                             assigned_to = $3,
+                             assigned_to = $3,${
+                                 nextActive
+                                     ? ""
+                                     : "\n                             sap_push_status = 'PENDING',"
+                             }
                              updated_at = NOW()
                          WHERE mass_request_id = $1
                          RETURNING id`,
@@ -4836,31 +5969,85 @@ const MaterialRequests = {
                         status: headerStatus,
                         assigned_to: headerAssignedTo,
                         updated_count: updateResult.rowCount,
+                        final_codes: finalCodePlan.map(entry => ({
+                            item_no: entry.item_no,
+                            request_no: entry.request_no,
+                            final_code: entry.final_code,
+                        })),
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
                     throw error;
                 }
             });
+
+            // Immediate SAP staging push on terminal completion, mirroring the
+            // single flow: best-effort + out-of-transaction. The items are
+            // already committed DONE with sap_push_status='PENDING', so a push
+            // failure here leaves them PENDING (recoverable by the next cron
+            // tick) and must NOT fail the approval response.
+            if (result && result.status === "DONE") {
+                try {
+                    await materialSapStagingService.pushPendingMaterialsToSapStaging(
+                        {
+                            massRequestId,
+                            limit: Math.max(result.updated_count || 0, 1),
+                        }
+                    );
+                } catch (pushError) {
+                    console.error(
+                        `Immediate SAP staging push failed for mass request ${massRequestId}:`,
+                        pushError
+                    );
+                }
+            }
+
+            return result;
         } catch (error) {
             console.error("Error approving mass request:", error);
             throw error;
         }
     },
 
+    // Two rework modes (no `reworkToLevel` here — mass rework never gained the
+    // rewind): no `newApprovers` = back to the requester, `newApprovers` =
+    // Master Data replaces the MANUAL chain of EVERY item in the batch.
+    // `notifyVia` defaults to APP; on EMAIL it also requires the (editable)
+    // `emailSubject` / `emailBody` the dialog prefilled from
+    // getMassRequestReworkEmailTemplate.
     requestMassRequestRework: async ({
         massRequestId,
         actorUserId,
         actorUsername,
         reason,
+        newApprovers = null,
+        notifyVia = null,
+        emailSubject = null,
+        emailBody = null,
     }) => {
         try {
+            // Pure body-shape checks: settle them before a transaction is
+            // opened rather than BEGIN/ROLLBACK for a malformed request.
+            const notifyChannel = normalizeReworkNotifyVia(
+                notifyVia,
+                "MASS_REQUEST"
+            );
+            const mailContent = assertReworkEmailContent(
+                notifyChannel,
+                { emailSubject, emailBody },
+                "MASS_REQUEST"
+            );
+            const replaceChain = isChainReplaceRequested(newApprovers);
+
             return await DBClientWrapper(async client => {
                 await client.query("BEGIN");
 
                 try {
+                    // request_no rides along on the lock: this row IS the
+                    // batch's thread identity (see the [VMS#...] token note in
+                    // migration/20260807_rework_email_thread.sql).
                     const lockResult = await client.query(
-                        `SELECT i.id, i.status
+                        `SELECT i.id, i.status, i.created_by, i.request_no, i.assigned_to
                          FROM mat_mass_request_item i
                          WHERE i.mass_request_id = $1
                          ORDER BY i.item_no ASC
@@ -4936,6 +6123,157 @@ const MaterialRequests = {
                         );
                     }
 
+                    if (replaceChain) {
+                        const plan = buildStepChainReplacePlan({
+                            steps: firstItemSteps,
+                            activeStep,
+                            newApprovers,
+                            requesterUserId: firstItem.created_by,
+                            actorUserId,
+                            reason,
+                            codePrefix: "MASS_REQUEST",
+                        });
+
+                        const approverEmails =
+                            await assertActiveApproverUsersExist(
+                                client,
+                                plan.approverIds,
+                                "MASS_REQUEST"
+                            );
+
+                        // "Via email" is CORRESPONDENCE ONLY (product decision
+                        // 2026-08-07) — see the twin branch in
+                        // requestSingleRequestRework. The batch is not
+                        // reassigned: no step row, no item header, nothing. The
+                        // picked person is the mail's recipient, the batch stays
+                        // claimed at Master Data, and `reason` is validated by
+                        // the plan builder and then dropped.
+                        if (mailContent) {
+                            // Read-only transaction: COMMIT just drops the FOR
+                            // UPDATE locks. The send still happens after it.
+                            await client.query("COMMIT");
+
+                            const notify = await sendReworkChainReplaceEmail(
+                                client,
+                                {
+                                    mailContent,
+                                    requestKind: "MASS",
+                                    requestId: Number(massRequestId),
+                                    requestNo: firstItem.request_no ?? null,
+                                    approverUserId: plan.approverIds[0],
+                                    approverEmail:
+                                        approverEmails.get(
+                                            String(plan.approverIds[0])
+                                        ) ?? null,
+                                    actorUserId,
+                                }
+                            );
+
+                            return {
+                                mass_request_id: Number(massRequestId),
+                                stage: stepLabel(activeStep),
+                                // The batch's CURRENT values, unchanged.
+                                status: firstItem.status,
+                                assigned_to:
+                                    firstItem.assigned_to ??
+                                    stepLabel(activeStep),
+                                // Nothing was written, so nothing was updated.
+                                updated_count: 0,
+                                notify,
+                                emailOnly: true,
+                            };
+                        }
+
+                        // Steps are mirrored per item, so every write below fans
+                        // out over the batch exactly like approveMassRequest
+                        // does — join back to mat_mass_request_item on
+                        // mass_request_id, never touch one item's rows alone.
+                        const itemsResult = await client.query(
+                            `SELECT i.id
+                             FROM mat_mass_request_item i
+                             WHERE i.mass_request_id = $1
+                             ORDER BY i.item_no ASC`,
+                            [massRequestId]
+                        );
+
+                        // Order is forced by UNIQUE (item_id, level): drop the
+                        // old MANUAL rows, move the surviving MDM rows up to
+                        // N+1, then insert 1..N per item.
+                        await client.query(
+                            `DELETE FROM mat_mass_request_item_approval_step s
+                             USING mat_mass_request_item i
+                             WHERE s.item_id = i.id
+                               AND i.mass_request_id = $1
+                               AND s.kind = $2`,
+                            [massRequestId, STEP_KINDS.MANUAL]
+                        );
+                        // Matched by the MDM step's CURRENT level (still the old
+                        // one at this point). approver_user_id / claimed_at are
+                        // not in the patch, so the grab survives the rewrite.
+                        await updateMassItemStepRowsByLevel(
+                            client,
+                            massRequestId,
+                            activeStep.level,
+                            plan.mdmStep
+                        );
+                        for (const item of itemsResult.rows) {
+                            await insertMassItemApprovalSteps(
+                                client,
+                                item.id,
+                                plan.manualSteps
+                            );
+                        }
+
+                        // mat_mass_request_item carries no rework_* columns, so
+                        // the header write stays status/assigned_to like every
+                        // other mass action.
+                        const chainUpdateResult = await client.query(
+                            `UPDATE mat_mass_request_item
+                             SET status = $2,
+                                 assigned_to = $3,
+                                 updated_at = NOW()
+                             WHERE mass_request_id = $1
+                             RETURNING id`,
+                            [
+                                massRequestId,
+                                plan.header.status,
+                                plan.header.assigned_to,
+                            ]
+                        );
+
+                        if (chainUpdateResult.rowCount === 0) {
+                            throw Object.assign(
+                                new Error(
+                                    "Mass request is already processed or not waiting for rework"
+                                ),
+                                {
+                                    statusCode: 409,
+                                    code: "MASS_REQUEST_REWORK_CONFLICT",
+                                }
+                            );
+                        }
+
+                        await client.query("COMMIT");
+
+                        // Post-commit on purpose (see buildReworkNotifyResult).
+                        // Always the APP block: the EMAIL channel returned above
+                        // without reassigning anything.
+                        const notify = buildReworkNotifyResult(notifyChannel, {
+                            massRequestId: Number(massRequestId),
+                            approverUserIds: plan.approverIds,
+                            reason: plan._meta.reason,
+                        });
+
+                        return {
+                            mass_request_id: Number(massRequestId),
+                            stage: stepLabel(activeStep),
+                            status: plan.header.status,
+                            assigned_to: plan.header.assigned_to,
+                            updated_count: chainUpdateResult.rowCount,
+                            notify,
+                        };
+                    }
+
                     const reworkPatch = buildMassStepReworkPatch({
                         activeStep,
                         actorUserId,
@@ -4984,6 +6322,14 @@ const MaterialRequests = {
                         status: reworkPatch.header.status,
                         assigned_to: reworkPatch.header.assigned_to,
                         updated_count: updateResult.rowCount,
+                        // Post-commit on purpose (see buildReworkNotifyResult).
+                        // No mail even on the EMAIL channel: rework-to-requester
+                        // picks nobody, so there is no address to send to.
+                        notify: buildReworkNotifyResult(notifyChannel, {
+                            massRequestId: Number(massRequestId),
+                            approverUserIds: [],
+                            reason,
+                        }),
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -5143,6 +6489,153 @@ const MaterialRequests = {
         }
     },
 
+    // SAP rejected one or more items of the batch (item sap_push_status =
+    // 'ERROR'). Mirror of the single-request requestSapErrorRework, lifted to
+    // the batch: a mass action is always request-level, so ANY errored item
+    // reopens the Master Data step for the WHOLE batch (the MDM approver edits
+    // the offending rows in the approval dialog and re-approves; re-approval
+    // recomposes the final codes, sets every item back to PENDING and the
+    // inline push re-stages them — idempotent DELETE+INSERT, fresh FLAG='I').
+    // Only an active MDM_MATERIAL user (or ADMIN) may do this, and the manual
+    // approvers are NOT re-run.
+    requestMassSapErrorRework: async ({
+        massRequestId,
+        actorUserId,
+        actorUsername,
+    }) => {
+        try {
+            return await DBClientWrapper(async client => {
+                await client.query("BEGIN");
+
+                try {
+                    // Lock the batch on its first item — the same anchor row
+                    // approveMassRequest takes — so a concurrent approve or a
+                    // second resubmit cannot interleave between this check and
+                    // the reopen below. This is also the existence probe: the
+                    // error-count aggregate that follows can NOT serve as one,
+                    // because an ungrouped COUNT always returns exactly one row
+                    // (a missing batch would read as "0 errors" -> 409 instead
+                    // of 404).
+                    const lockResult = await client.query(
+                        `SELECT i.id
+                         FROM mat_mass_request_item i
+                         WHERE i.mass_request_id = $1
+                         ORDER BY i.item_no ASC
+                         LIMIT 1
+                         FOR UPDATE OF i`,
+                        [massRequestId]
+                    );
+
+                    if (lockResult.rows.length === 0) {
+                        throw Object.assign(
+                            new Error("Mass request not found"),
+                            { statusCode: 404, code: "MASS_REQUEST_NOT_FOUND" }
+                        );
+                    }
+
+                    const errorCountResult = await client.query(
+                        `SELECT COUNT(*) AS error_count
+                         FROM mat_mass_request_item i
+                         WHERE i.mass_request_id = $1
+                           AND UPPER(COALESCE(i.sap_push_status, '')) = 'ERROR'`,
+                        [massRequestId]
+                    );
+
+                    if (
+                        Number(errorCountResult.rows[0].error_count || 0) === 0
+                    ) {
+                        throw Object.assign(
+                            new Error(
+                                "Only a mass request with items rejected by SAP can be resubmitted"
+                            ),
+                            {
+                                statusCode: 409,
+                                code: "MASS_REQUEST_SAP_RETRY_CONFLICT",
+                            }
+                        );
+                    }
+
+                    const actorIsMdmMaterial = await isActorMdmMaterialUser(
+                        client,
+                        actorUserId
+                    );
+                    if (
+                        !actorIsMdmMaterial &&
+                        !isAdminMaterialApprover(actorUsername)
+                    ) {
+                        throw Object.assign(
+                            new Error(
+                                "Forbidden: only an active MDM_MATERIAL user or ADMIN can resubmit this mass request"
+                            ),
+                            {
+                                statusCode: 403,
+                                code: "MASS_REQUEST_SAP_RETRY_FORBIDDEN",
+                            }
+                        );
+                    }
+
+                    const steps = await loadMassItemSteps(
+                        client,
+                        massRequestId,
+                        { forUpdate: true }
+                    );
+                    const mdmStep = steps.find(
+                        step => stepKindOf(step) === STEP_KINDS.MDM
+                    );
+                    if (!mdmStep) {
+                        throw Object.assign(
+                            new Error(
+                                "Master Data (MDM) stage not found for this mass request"
+                            ),
+                            {
+                                statusCode: 409,
+                                code: "MASS_REQUEST_SAP_RETRY_NO_MDM",
+                            }
+                        );
+                    }
+
+                    // Reopen the Master Data step in place on every item:
+                    // WAITING with the last grabber's approver_user_id
+                    // untouched, items back to Submit. final_code is left as-is
+                    // — the re-approval overwrites it with the newly entered
+                    // running number.
+                    await updateMassItemStepRowsByLevel(
+                        client,
+                        massRequestId,
+                        mdmStep.level,
+                        { status: "WAITING", acted_at: null, remark: null }
+                    );
+                    const updateResult = await client.query(
+                        `UPDATE mat_mass_request_item
+                         SET status = 'Submit',
+                             assigned_to = $2,
+                             sap_push_status = NULL,
+                             sap_error_msg = NULL,
+                             updated_at = NOW()
+                         WHERE mass_request_id = $1
+                         RETURNING id`,
+                        [massRequestId, stepLabel(mdmStep)]
+                    );
+
+                    await client.query("COMMIT");
+
+                    return {
+                        mass_request_id: Number(massRequestId),
+                        stage: stepLabel(mdmStep),
+                        status: "Submit",
+                        updated_count: updateResult.rowCount,
+                    };
+                } catch (error) {
+                    await client.query("ROLLBACK");
+                    throw error;
+                }
+            });
+        } catch (error) {
+            console.error("Error starting mass SAP-error rework:", error);
+            throw error;
+        }
+    },
+
     getMassRequestItems: async massRequestId => {
         try {
             return await DBClientWrapper(async client => {
@@ -5162,6 +6655,10 @@ const MaterialRequests = {
                         i.spesifikasi_tambahan,
                         i.status,
                         i.assigned_to,
+                        i.final_code,
+                        i.sap_push_status,
+                        i.sap_pushed_at,
+                        i.sap_error_msg,
                         COALESCE(item_steps.approval_steps, '[]'::jsonb) AS approval_steps,
                         item_steps.active_step
                     FROM mat_mass_request_item i
@@ -5174,6 +6671,7 @@ const MaterialRequests = {
                                         'kind', s.kind,
                                         'approver_user_id', s.approver_user_id,
                                         'approver_name', COALESCE(sau.fullname, sau.username, s.approver_user_id),
+                                        'approver_email', sau.email,
                                         'status', s.status,
                                         'claimed_at', s.claimed_at,
                                         'acted_at', s.acted_at,
@@ -5206,6 +6704,186 @@ const MaterialRequests = {
             });
         } catch (error) {
             console.error("Error fetching mass request items:", error);
+            throw error;
+        }
+    },
+
+    // =====================================================================
+    // Rework e-mail thread (chain replacement, notifyVia = EMAIL).
+    // Two reads per request kind: the DRAFT the Master Data dialog prefills,
+    // and the THREAD (mails sent + replies polled back off IMAP) the request
+    // detail renders read-only.
+    // =====================================================================
+
+    /**
+     * The rework mail draft for a SINGLE request.
+     *
+     * Composed from the request's own row through the existing list loader —
+     * the Master Data dialog then edits it, so nothing here is final.
+     *
+     * @param {object} opts
+     * @param {number|string} opts.requestId mat_single_request.id
+     * @param {string} [opts.approverUserId] the approver the dialog picked, so
+     *        the greeting can address him by name; optional, and an id that
+     *        names no active user simply keeps the generic greeting
+     * @returns {Promise<{subject: string, body: string}>}
+     * @throws 404 SINGLE_REQUEST_NOT_FOUND
+     */
+    getSingleRequestReworkEmailTemplate: async ({
+        requestId,
+        approverUserId,
+    }) => {
+        try {
+            return await DBClientWrapper(async client => {
+                const result = await runSingleRequestListQuery(
+                    client,
+                    "r.id = $1",
+                    [requestId]
+                );
+                const row = result.rows[0];
+
+                if (!row) {
+                    throw Object.assign(new Error("Single request not found"), {
+                        statusCode: 404,
+                        code: "SINGLE_REQUEST_NOT_FOUND",
+                    });
+                }
+
+                const approverName = await loadReworkApproverFullname(
+                    client,
+                    approverUserId
+                );
+                const { subject, body } = buildSingleReworkEmailTemplate(row, {
+                    approverName,
+                });
+
+                return { subject, body };
+            });
+        } catch (error) {
+            console.error(
+                "Error building single request rework email template:",
+                error
+            );
+            throw error;
+        }
+    },
+
+    /**
+     * The rework mail draft for a MASS request (the whole batch).
+     *
+     * Reuses getMassRequestItems: mass rework acts on every item at once, so
+     * the draft has to list every item anyway and there is no lighter read.
+     *
+     * @param {object} opts
+     * @param {number|string} opts.massRequestId mat_mass_request.id
+     * @param {string} [opts.approverUserId] the approver the dialog picked, so
+     *        the greeting can address him by name; optional, and an id that
+     *        names no active user simply keeps the generic greeting
+     * @returns {Promise<{subject: string, body: string}>}
+     * @throws 404 MASS_REQUEST_NOT_FOUND
+     */
+    getMassRequestReworkEmailTemplate: async ({
+        massRequestId,
+        approverUserId,
+    }) => {
+        try {
+            const items =
+                await MaterialRequests.getMassRequestItems(massRequestId);
+
+            if (!Array.isArray(items) || items.length === 0) {
+                throw Object.assign(new Error("Mass request not found"), {
+                    statusCode: 404,
+                    code: "MASS_REQUEST_NOT_FOUND",
+                });
+            }
+
+            // Its own client, unlike the single path: the item read above owns
+            // (and has already released) the only one this method holds, and a
+            // request with no picked approver never asks for one at all.
+            const approverName =
+                String(approverUserId ?? "").trim() === ""
+                    ? ""
+                    : await DBClientWrapper(client =>
+                          loadReworkApproverFullname(client, approverUserId)
+                      );
+            const { subject, body } = buildMassReworkEmailTemplate(items, {
+                approverName,
+            });
+
+            return { subject, body };
+        } catch (error) {
+            console.error(
+                "Error building mass request rework email template:",
+                error
+            );
+            throw error;
+        }
+    },
+
+    /**
+     * Every rework mail sent for one request, newest first, each with its
+     * replies.
+     *
+     * Returns [] rather than throwing when the tables are not there yet, so a
+     * deployment that has not run 20260807_rework_email_thread.sql simply shows
+     * no thread section (same tolerance runSingleRequestListQuery already has
+     * for the rework columns).
+     *
+     * @param {object} opts
+     * @param {'SINGLE'|'MASS'} opts.requestKind which request table
+     * @param {number|string} opts.requestId the request's id
+     * @returns {Promise<Array<{id:number, subject:string, body:string, toEmail:string, sendStatus:string, sentAt:Date, replies:Array}>>}
+     */
+    getReworkEmailThread: async ({ requestKind, requestId }) => {
+        try {
+            return await DBClientWrapper(async client => {
+                const result = await client.query(
+                    `SELECT
+                         e.id,
+                         e.subject,
+                         e.body,
+                         e.to_email,
+                         e.send_status,
+                         e.send_error,
+                         e.sent_at,
+                         COALESCE(reply_rows.replies, '[]'::jsonb) AS replies
+                     FROM mat_rework_email e
+                     LEFT JOIN LATERAL (
+                         SELECT jsonb_agg(
+                                    jsonb_build_object(
+                                        'fromEmail', rp.from_email,
+                                        'senderMatches', rp.sender_matches,
+                                        'receivedAt', COALESCE(rp.received_at, rp.created_at),
+                                        'bodyText', rp.body_text
+                                    )
+                                    ORDER BY COALESCE(rp.received_at, rp.created_at), rp.id
+                                ) AS replies
+                         FROM mat_rework_email_reply rp
+                         WHERE rp.rework_email_id = e.id
+                     ) reply_rows ON TRUE
+                     WHERE e.request_kind = $1
+                       AND e.request_id = $2
+                     ORDER BY e.sent_at DESC, e.id DESC`,
+                    [requestKind, requestId]
+                );
+
+                return result.rows.map(row => ({
+                    id: Number(row.id),
+                    subject: row.subject,
+                    body: row.body,
+                    toEmail: row.to_email,
+                    sendStatus: row.send_status,
+                    sendError: row.send_error ?? null,
+                    sentAt: row.sent_at,
+                    replies: Array.isArray(row.replies) ? row.replies : [],
+                }));
+            });
+        } catch (error) {
+            if (isMissingReworkEmailTableError(error)) {
+                return [];
+            }
+
+            console.error("Error fetching rework email thread:", error);
             throw error;
         }
     },
@@ -5397,8 +7075,13 @@ const __private = {
     LOCKED_SINGLE_REQUEST_APPROVAL_SNAPSHOT_QUERY,
     isMissingSingleRequestEditHistoryTableError,
     isMissingSingleRequestReworkColumnsError,
+    isMissingReworkEmailTableError,
     GET_MASS_REQUESTS_BY_USER_QUERY,
     GET_MASS_REQUEST_APPROVAL_INBOX_QUERY,
+    buildMassRequestsByUserQuery,
+    buildMassRequestApprovalInboxQuery,
+    EMAIL_REPLY_COUNT_ABSENT_SQL,
+    MASS_REQUEST_SAP_PUSH_STATUS_SQL,
     SINGLE_REQUEST_ATTACHMENT_ROOT,
     MASS_REQUEST_ATTACHMENT_ROOT,
 };
@@ -5431,12 +7114,29 @@ module.exports = {
     isAdminMaterialApprover,
     assertRequiredActionReason,
     buildSingleRequestFinalCode,
+    // mass final codes (v1: one numeric running number, incremented per item)
+    assertMassRequestRowsAreCreateOnly,
+    buildMassItemFinalCodeSuffixes,
+    assertMassFinalCodesAreDistinct,
+    buildMassRequestFinalCodePlan,
+    loadMassItemGroupCodes,
+    assertMassFinalCodePlanIsAvailable,
+    applyMassItemFinalCodes,
     canActorReviseSingleRequest,
     buildLoginUserGroupInfo,
     buildStepApprovePatch,
     buildStepReworkPatch,
     normalizeReworkToLevel,
     buildStepRewindPatch,
+    // chain replacement (shared single + mass)
+    REWORK_NOTIFY_CHANNELS,
+    normalizeReworkNotifyVia,
+    isChainReplaceRequested,
+    buildStepChainReplacePlan,
+    buildReworkNotifyResult,
+    assertReworkEmailContent,
+    sendReworkChainReplaceEmail,
+    assertActiveApproverUsersExist,
     buildStepRejectPatch,
     // mass approval
     syncMassRequestItemApprovalSnapshot,
@@ -5491,10 +7191,18 @@ module.exports = {
     GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY,
     GET_MASS_REQUESTS_BY_USER_QUERY,
     GET_MASS_REQUEST_APPROVAL_INBOX_QUERY,
+    buildMassRequestsByUserQuery,
+    buildMassRequestApprovalInboxQuery,
+    buildEmailReplyCountSql,
+    EMAIL_REPLY_COUNT_ABSENT_SQL,
     isMissingSingleRequestEditHistoryTableError,
     isMissingSingleRequestReworkColumnsError,
+    isMissingReworkEmailTableError,
     runSingleRequestListQuery,
     runSingleRequestApprovalInboxQuery,
+    runMassRequestQuery,
+    runMassRequestsByUserQuery,
+    runMassRequestApprovalInboxQuery,
     normalizeRowApprovalSteps,
     attachStepPayloadToRow,
     actorMatchesStep,

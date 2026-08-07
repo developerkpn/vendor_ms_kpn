@@ -22,6 +22,7 @@ const VerifyLogin = require("./backend/middleware/VerifyLogin");
 const { SchedulerSyncStaged } = require("./backend/helper/Scheduler");
 const Material = require("./backend/models/MaterialModel");
 const materialSapStagingService = require("./backend/services/materialSapStagingService");
+const reworkEmailInboundService = require("./backend/services/reworkEmailInboundService");
 const cron = require("node-cron");
 const moment = require("moment-timezone");
 
@@ -165,6 +166,31 @@ cron.schedule(
         }
     },
     // Don't let a slow tick overlap the next one.
+    { noOverlap: true }
+);
+
+// Pull rework-approver replies out of the VMS mailbox — every 60s.
+// OFF unless REWORK_EMAIL_INBOUND_ENABLED === 'true': the box is shared with
+// humans and holds 14k+ unrelated mails, so nothing connects to it until an
+// operator opts in per environment. The first enabled tick only seeds its
+// cursor at uidNext-1 and reads nothing (see reworkEmailInboundService).
+cron.schedule(
+    "* * * * *",
+    async () => {
+        if (process.env.REWORK_EMAIL_INBOUND_ENABLED !== "true") {
+            return;
+        }
+
+        try {
+            const result = await reworkEmailInboundService.pollReworkEmailReplies();
+            if (result.scanned || result.inserted || result.reason !== "RESUME") {
+                console.log("[CRON] Rework email inbound:", result);
+            }
+        } catch (error) {
+            console.error("[CRON] Rework email inbound poll failed:", error);
+        }
+    },
+    // A slow IMAP round trip must not stack ticks on the same mailbox.
     { noOverlap: true }
 );
 

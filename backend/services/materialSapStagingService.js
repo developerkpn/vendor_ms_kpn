@@ -14,6 +14,8 @@ const { getConnection } = require("../config/oracleconnection");
 const {
     MATERIAL_SAP_STAGING_TABLE,
     SINGLE_REQUEST_MATERIAL_CODE_SQL,
+    MASS_ITEM_GROUP_CODE_LATERAL_SQL,
+    MAX_MATERIAL_DESCRIPTION_LENGTH,
 } = require("../constants/material");
 
 // "C - CHEMICAL INDUSTRY" -> "C";  "1 - FULL TAX" -> "1";  "PC" -> "PC".
@@ -166,24 +168,106 @@ const buildMaterialStagingPayload = ({
     };
 };
 
+/**
+ * Adapt ONE mat_mass_request_item row to the snapshot shape
+ * buildMaterialStagingPayload consumes, so a batch item and a single request
+ * produce byte-identical staging rows from one builder.
+ *
+ * The only real difference is where the description text comes from.
+ *
+ *   single: ONE 250-char approver box, positionally partitioned across four
+ *           columns — material_description holds chars 0..40 (MAKTX) and
+ *           long_text_1..3 hold 40..250 (3×70), so MATERIAL_DESC +
+ *           PURCHASE_ORDER_TEXT concatenate back to the original string.
+ *   mass:   the grid has TWO independent columns, "Material Description" and
+ *           "PO Text" — they were never one string, so concatenating them would
+ *           glue two unrelated sentences together and split a word at the seam.
+ *
+ * So the partition is replicated by INTENT, not by literal re-slicing: what the
+ * single flow actually guarantees SAP is the two column widths (MAKTX 40, the
+ * TDLINE region 3×70 = 210) and a whitespace collapse that is 1:1 in length.
+ * Here material_description feeds MATERIAL_DESC capped at 40 and po_text feeds
+ * PURCHASE_ORDER_TEXT capped at 210 — the cap is applied by the shared builder
+ * itself, by handing po_text in through long_text_1 (long_text_2/3 stay null),
+ * which runs it through the same `\s -> " "` collapse + .slice(0, 210) the
+ * single rows get. Both caps are belt-and-braces: the mass create endpoint
+ * already rejects a description over 40 chars.
+ *
+ * @param {object} row  mat_mass_request_item row joined with
+ *                      material_group_code + derived_sales_org
+ * @returns {object} snapshot for buildMaterialStagingPayload
+ */
+const buildMassItemStagingSnapshot = (row = {}) => {
+    const description = String(row.material_description ?? "").replace(
+        /\s/g,
+        " "
+    );
+
+    return {
+        request_no: row.request_no,
+        // Mass batches are Create-only (enforced at createMassRequest), so
+        // MATERIAL_NUMBER always resolves to the composed final_code.
+        ticket_type: row.ticket_type ?? "Create",
+        final_code: row.final_code ?? null,
+        material_code: null,
+        plant_code: row.plant_code ?? null,
+        sloc_code: row.sloc_code ?? null,
+        material_description:
+            description.trim() === ""
+                ? null
+                : description.slice(0, MAX_MATERIAL_DESCRIPTION_LENGTH),
+        base_uom: row.base_uom ?? null,
+        material_group_code: row.material_group_code ?? null,
+        derived_sales_org: row.derived_sales_org ?? null,
+        // PO text enters through the long-text partition — see above.
+        long_text_1: row.po_text ?? null,
+        long_text_2: null,
+        long_text_3: null,
+        // Items carry no template payload, so MOVING_AVG_PRICE and the
+        // user-supplied sales_organization fallback both come out NULL.
+        template_payload: null,
+    };
+};
+
 // ===========================================================================
 // Push + write-back sync (decoupled from the approval request; run by the cron
-// scheduler). A completed single request is flagged sap_push_status='PENDING'.
+// scheduler). A completed single request is flagged sap_push_status='PENDING';
+// a completed MASS request flags every one of its ITEMS the same way, because a
+// batch stages one VMS_MATERIALDATA row per item (keyed by the item's own
+// request_no), not one row per batch. Both kinds flow through the same loop —
+// only the Postgres table the status is written back to differs.
 // ===========================================================================
 
-// Inserts PENDING single requests into the Oracle staging table. Each row gets
-// its own Oracle commit so one failure does not block the rest; the request's
-// sap_push_status advances to PUSHED (or ERROR) on the Postgres side.
+// Which Postgres table a pending target lives in. Keeps the push/sync loops
+// free of if/else chains: `kind` selects the table and its id column.
+const PUSH_TARGET_TABLES = Object.freeze({
+    single: { table: "mat_single_request", label: "material request" },
+    mass: { table: "mat_mass_request_item", label: "mass request item" },
+});
+
+// Inserts PENDING single requests + PENDING mass items into the Oracle staging
+// table. Each row gets its own Oracle commit so one failure does not block the
+// rest; the request's/item's sap_push_status advances to PUSHED (or ERROR) on
+// the Postgres side.
+//
+// `requestId` (single) and `massRequestId` (mass) are mutually exclusive
+// targeting filters used by the inline post-approval push: passing either one
+// restricts the sweep to that kind, so an inline single push never drags in
+// unrelated pending mass items and vice versa. Passing neither (the cron)
+// sweeps both.
 const pushPendingMaterialsToSapStaging = async function ({
     limit = 50,
     requestId = null,
+    massRequestId = null,
 } = {}) {
     const psql = await db.connect();
     let oraclient;
     const pushed = [];
     const errors = [];
     try {
-        const { rows } = await psql.query(
+        const { rows: singleRows } = massRequestId != null
+            ? { rows: [] }
+            : await psql.query(
             `SELECT
                 r.id AS request_id,
                 r.request_no,
@@ -218,7 +302,65 @@ const pushPendingMaterialsToSapStaging = async function ({
             requestId != null ? [limit, requestId] : [limit]
         );
 
-        if (rows.length === 0) {
+        // Mass items: one pending row per ITEM (status DONE + PENDING), keyed
+        // by the item's own request_no. The group-code LATERAL is needed here
+        // because the item stores its material group as free text, not an FK.
+        const { rows: massRows } = requestId != null
+            ? { rows: [] }
+            : await psql.query(
+            `SELECT
+                i.id AS item_id,
+                i.mass_request_id,
+                i.item_no,
+                i.request_no,
+                i.ticket_type,
+                i.final_code,
+                mig.code AS material_group_code,
+                i.plant_code,
+                i.sloc_code,
+                i.material_description,
+                i.base_uom,
+                i.po_text,
+                -- Sales org derived from the plant's company (one per company):
+                so.sales_org_code AS derived_sales_org,
+                -- MDM approver email (one MDM step per item) -> APPROVED_BY:
+                (SELECT mu.email
+                   FROM mat_mass_request_item_approval_step s
+                   JOIN mst_user mu ON mu.user_id = s.approver_user_id
+                  WHERE s.item_id = i.id AND s.kind = 'MDM'
+                  LIMIT 1) AS approved_by_email
+             FROM mat_mass_request_item i
+             ${MASS_ITEM_GROUP_CODE_LATERAL_SQL}
+             LEFT JOIN mst_plant mp ON mp.plant_code = i.plant_code
+             LEFT JOIN mst_sales_org so ON so.company_code = mp.company_code
+             WHERE i.status = 'DONE' AND i.sap_push_status = 'PENDING'
+               ${massRequestId != null ? "AND i.mass_request_id = $2" : ""}
+             ORDER BY i.updated_at ASC, i.item_no ASC
+             LIMIT $1`,
+            massRequestId != null ? [limit, massRequestId] : [limit]
+        );
+
+        // One uniform work list: `kind` picks the Postgres table to mark, `id`
+        // is that table's primary key, and `snapshot` is already in the shape
+        // buildMaterialStagingPayload wants (single rows are natively in it).
+        const targets = [
+            ...singleRows.map(row => ({
+                kind: "single",
+                id: row.request_id,
+                requestNo: row.request_no,
+                snapshot: row,
+                approvedBy: row.approved_by_email || null,
+            })),
+            ...massRows.map(row => ({
+                kind: "mass",
+                id: row.item_id,
+                requestNo: row.request_no,
+                snapshot: buildMassItemStagingSnapshot(row),
+                approvedBy: row.approved_by_email || null,
+            })),
+        ];
+
+        if (targets.length === 0) {
             return { pushed, errors };
         }
 
@@ -227,30 +369,31 @@ const pushPendingMaterialsToSapStaging = async function ({
         // A Postgres failure when marking one row must not abort the whole
         // batch — the Oracle row may already be committed, so swallow+log and
         // let the next cron tick reconcile.
-        const markPushed = async requestId => {
+        const markPushed = async target => {
+            const { table, label } = PUSH_TARGET_TABLES[target.kind];
             try {
                 await psql.query(
-                    `UPDATE mat_single_request
+                    `UPDATE ${table}
                      SET sap_push_status = 'PUSHED',
                          sap_pushed_at = NOW(),
                          sap_error_msg = NULL,
                          updated_at = NOW()
                      WHERE id = $1`,
-                    [requestId]
+                    [target.id]
                 );
             } catch (markError) {
                 console.error(
-                    `Failed to mark material request ${requestId} PUSHED:`,
+                    `Failed to mark ${label} ${target.id} PUSHED:`,
                     markError
                 );
             }
         };
 
-        for (const row of rows) {
+        for (const target of targets) {
             try {
                 const payload = buildMaterialStagingPayload({
-                    snapshot: row,
-                    approvedBy: row.approved_by_email || null,
+                    snapshot: target.snapshot,
+                    approvedBy: target.approvedBy,
                 });
                 // Idempotent (re)stage: drop any prior row for this request first
                 // so an MDM re-approval after a SAP error replaces the stale
@@ -260,7 +403,7 @@ const pushPendingMaterialsToSapStaging = async function ({
                 // PENDING row safe — whichever commits last leaves the same row.
                 await oraclient.execute(
                     `DELETE FROM ${MATERIAL_SAP_STAGING_TABLE} WHERE APP_REQUEST_NO = :1`,
-                    [row.request_no]
+                    [target.requestNo]
                 );
                 const [insertSql, values] = Crud.insertItemOra(
                     MATERIAL_SAP_STAGING_TABLE,
@@ -269,8 +412,8 @@ const pushPendingMaterialsToSapStaging = async function ({
                 await oraclient.execute(insertSql, values);
                 await oraclient.commit();
 
-                await markPushed(row.request_id);
-                pushed.push(row.request_no);
+                await markPushed(target);
+                pushed.push(target.requestNo);
             } catch (rowError) {
                 try {
                     await oraclient.rollback();
@@ -283,30 +426,31 @@ const pushPendingMaterialsToSapStaging = async function ({
                 // or pg blip). SAP already has it, so reconcile to PUSHED rather
                 // than stranding the request as a false ERROR.
                 if (rowError && rowError.errorNum === 1) {
-                    await markPushed(row.request_id);
-                    pushed.push(row.request_no);
+                    await markPushed(target);
+                    pushed.push(target.requestNo);
                     continue;
                 }
 
                 const message = String(
                     rowError?.message || rowError || ""
                 ).slice(0, 500);
+                const { table, label } = PUSH_TARGET_TABLES[target.kind];
                 try {
                     await psql.query(
-                        `UPDATE mat_single_request
+                        `UPDATE ${table}
                          SET sap_push_status = 'ERROR',
                              sap_error_msg = $2,
                              updated_at = NOW()
                          WHERE id = $1`,
-                        [row.request_id, message]
+                        [target.id, message]
                     );
                 } catch (markError) {
                     console.error(
-                        `Failed to mark material request ${row.request_id} ERROR:`,
+                        `Failed to mark ${label} ${target.id} ERROR:`,
                         markError
                     );
                 }
-                errors.push({ request_no: row.request_no, error: message });
+                errors.push({ request_no: target.requestNo, error: message });
             }
         }
 
@@ -332,28 +476,48 @@ const pushPendingMaterialsToSapStaging = async function ({
 // PUSHED ("waiting for SAP"). MATERIAL_NUMBER is the code we pushed (not a
 // SAP-returned value), so it is not read back. Confirm the exact SAP write-back
 // contract with the SAP team.
+//
+// Mass items participate exactly like single requests, one Oracle row per item:
+// the write-back is looked up by APP_REQUEST_NO, and a mass item's request_no
+// lives in its own number range (3xxxxxxxxx) disjoint from the single one
+// (1xxxxxxxxx), so both kinds can share one lookup map — `kind` says which
+// Postgres table the resulting status lands in.
 const syncMaterialStagingFromSap = async function () {
     const psql = await db.connect();
     let oraclient;
     const synced = [];
     const failed = [];
     try {
-        const { rows: pending } = await psql.query(
+        const { rows: pendingSingles } = await psql.query(
             `SELECT id, request_no
              FROM mat_single_request
              WHERE sap_push_status = 'PUSHED'
              ORDER BY sap_pushed_at ASC
              LIMIT 500`
         );
+        const { rows: pendingMassItems } = await psql.query(
+            `SELECT id, request_no
+             FROM mat_mass_request_item
+             WHERE sap_push_status = 'PUSHED'
+             ORDER BY sap_pushed_at ASC
+             LIMIT 500`
+        );
 
-        if (pending.length === 0) {
+        if (pendingSingles.length === 0 && pendingMassItems.length === 0) {
             return { synced, failed };
         }
 
-        const idByRequestNo = new Map(
-            pending.map(r => [String(r.request_no), r.id])
-        );
-        const requestNos = [...idByRequestNo.keys()];
+        const targetByRequestNo = new Map([
+            ...pendingSingles.map(r => [
+                String(r.request_no),
+                { kind: "single", id: r.id },
+            ]),
+            ...pendingMassItems.map(r => [
+                String(r.request_no),
+                { kind: "mass", id: r.id },
+            ]),
+        ]);
+        const requestNos = [...targetByRequestNo.keys()];
 
         oraclient = await getConnection();
 
@@ -375,20 +539,22 @@ const syncMaterialStagingFromSap = async function () {
                 const appRequestNo = oraRow[0];
                 const errorPost = oraRow[1];
                 const flag = oraRow[2];
-                const id = idByRequestNo.get(String(appRequestNo));
-                if (!id) {
+                const target = targetByRequestNo.get(String(appRequestNo));
+                if (!target) {
                     continue;
                 }
 
+                const { table } = PUSH_TARGET_TABLES[target.kind];
+
                 if (flag === "E" || errorPost) {
                     await psql.query(
-                        `UPDATE mat_single_request
+                        `UPDATE ${table}
                          SET sap_push_status = 'ERROR',
                              sap_error_msg = $2,
                              updated_at = NOW()
                          WHERE id = $1`,
                         [
-                            id,
+                            target.id,
                             String(
                                 errorPost ?? "SAP error (no message returned)"
                             ).slice(0, 500),
@@ -400,12 +566,12 @@ const syncMaterialStagingFromSap = async function () {
                     });
                 } else {
                     await psql.query(
-                        `UPDATE mat_single_request
+                        `UPDATE ${table}
                          SET sap_push_status = 'SYNCED',
                              sap_error_msg = NULL,
                              updated_at = NOW()
                          WHERE id = $1`,
-                        [id]
+                        [target.id]
                     );
                     synced.push(appRequestNo);
                 }
@@ -435,6 +601,8 @@ module.exports = {
     resolveMaterialNumber,
     formatSapDate,
     buildMaterialStagingPayload,
+    buildMassItemStagingSnapshot,
+    PUSH_TARGET_TABLES,
     pushPendingMaterialsToSapStaging,
     syncMaterialStagingFromSap,
 };

@@ -2039,6 +2039,10 @@ const MaterialController = {
                 actorUsername: req.cookies.username,
                 remark: req.body?.remark ?? null,
                 items: req.body?.items ?? null,
+                // Running number for item 1; items 2..N take it +1, +2, …
+                // Required at the Master Data step (same field name and
+                // validation semantics as the single-request approve).
+                finalCodeSuffix: req.body?.finalCodeSuffix ?? null,
             });
 
             return res.status(200).json({
@@ -2048,10 +2052,20 @@ const MaterialController = {
             });
         } catch (error) {
             if (Number.isInteger(error?.statusCode)) {
-                return res.status(error.statusCode).json({
+                const payload = {
                     success: false,
                     message: error.message,
-                });
+                };
+
+                if (error.code) {
+                    payload.code = error.code;
+                }
+
+                if (Array.isArray(error.errors) && error.errors.length > 0) {
+                    payload.errors = error.errors;
+                }
+
+                return res.status(error.statusCode).json(payload);
             }
 
             return res.status(500).json({
@@ -2069,6 +2083,17 @@ const MaterialController = {
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
                 reason: req.body?.reason ?? null,
+                // Optional replacement approver chain (ordered user_ids) and
+                // notification channel; the service validates both. Accepts
+                // `newApprovers` (preferred) or the `newApproverIds` alias.
+                // No `reworkToLevel` here — mass rework has no rewind mode.
+                newApprovers:
+                    req.body?.newApprovers ?? req.body?.newApproverIds ?? null,
+                notifyVia: req.body?.notifyVia ?? null,
+                // Mail content, editable by Master Data; required (and
+                // validated) by the service only on the EMAIL channel.
+                emailSubject: req.body?.emailSubject ?? null,
+                emailBody: req.body?.emailBody ?? null,
             });
 
             return res.status(200).json({
@@ -2078,14 +2103,21 @@ const MaterialController = {
             });
         } catch (error) {
             const statusCode = error.statusCode || 500;
-            return res.status(statusCode).json({
+            const payload = {
                 success: false,
                 message:
                     statusCode === 500
                         ? "Failed to request mass request rework"
                         : error.message,
                 error: statusCode === 500 ? error.message : undefined,
-            });
+                code: error.code,
+            };
+
+            if (Array.isArray(error.errors) && error.errors.length > 0) {
+                payload.errors = error.errors;
+            }
+
+            return res.status(statusCode).json(payload);
         }
     },
 
@@ -2132,6 +2164,107 @@ const MaterialController = {
             });
         }
     },
+
+    // --- Rework e-mail thread (chain replacement, notifyVia = EMAIL) --------
+    // Draft reads for the Master Data dialog, thread reads for the request
+    // detail. All four are plain reads behind AuthToken.authSession, like the
+    // other material request detail routes.
+
+    getSingleRequestReworkEmailTemplate: async (req, res) => {
+        try {
+            const template =
+                await materialService.getSingleRequestReworkEmailTemplate({
+                    requestId: req.params.id,
+                    // Optional: the approver the dialog has already picked, so
+                    // the greeting can name him instead of saying "Approver".
+                    approverUserId: req.query.approverUserId,
+                });
+
+            return res.status(200).json({
+                success: true,
+                data: template,
+            });
+        } catch (error) {
+            const statusCode = error.statusCode || 500;
+            return res.status(statusCode).json({
+                success: false,
+                message:
+                    statusCode === 500
+                        ? "Failed to build single request rework email template"
+                        : error.message,
+                code: error.code,
+                error: statusCode === 500 ? error.message : undefined,
+            });
+        }
+    },
+
+    getMassRequestReworkEmailTemplate: async (req, res) => {
+        try {
+            const template =
+                await materialService.getMassRequestReworkEmailTemplate({
+                    massRequestId: req.params.id,
+                    // Optional: the approver the dialog has already picked, so
+                    // the greeting can name him instead of saying "Approver".
+                    approverUserId: req.query.approverUserId,
+                });
+
+            return res.status(200).json({
+                success: true,
+                data: template,
+            });
+        } catch (error) {
+            const statusCode = error.statusCode || 500;
+            return res.status(statusCode).json({
+                success: false,
+                message:
+                    statusCode === 500
+                        ? "Failed to build mass request rework email template"
+                        : error.message,
+                code: error.code,
+                error: statusCode === 500 ? error.message : undefined,
+            });
+        }
+    },
+
+    getSingleRequestReworkEmailThread: async (req, res) => {
+        try {
+            const rows = await materialService.getReworkEmailThread({
+                requestKind: "SINGLE",
+                requestId: req.params.id,
+            });
+
+            return res.status(200).json({
+                success: true,
+                data: rows,
+            });
+        } catch (error) {
+            return res.status(500).json({
+                success: false,
+                message: "Failed to fetch single request rework email thread",
+                error: error.message,
+            });
+        }
+    },
+
+    getMassRequestReworkEmailThread: async (req, res) => {
+        try {
+            const rows = await materialService.getReworkEmailThread({
+                requestKind: "MASS",
+                requestId: req.params.id,
+            });
+
+            return res.status(200).json({
+                success: true,
+                data: rows,
+            });
+        } catch (error) {
+            return res.status(500).json({
+                success: false,
+                message: "Failed to fetch mass request rework email thread",
+                error: error.message,
+            });
+        }
+    },
     getSingleRequestApprovalInbox: async (req, res) => {
         try {
             const actorUsername = req.cookies?.username;
@@ -2166,6 +2299,16 @@ const MaterialController = {
                 reason: req.body?.reason ?? null,
                 // Optional rewind target; the service validates the level.
                 reworkToLevel: req.body?.reworkToLevel ?? null,
+                // Optional replacement approver chain (ordered user_ids) and
+                // notification channel; the service validates both. Accepts
+                // `newApprovers` (preferred) or the `newApproverIds` alias.
+                newApprovers:
+                    req.body?.newApprovers ?? req.body?.newApproverIds ?? null,
+                notifyVia: req.body?.notifyVia ?? null,
+                // Mail content, editable by Master Data; required (and
+                // validated) by the service only on the EMAIL channel.
+                emailSubject: req.body?.emailSubject ?? null,
+                emailBody: req.body?.emailBody ?? null,
             });
 
             return res.status(200).json({
@@ -2217,6 +2360,37 @@ const MaterialController = {
                 message:
                     statusCode === 500
                         ? "Failed to resubmit single request to SAP"
+                        : error.message,
+                code: error.code,
+                error: statusCode === 500 ? error.message : undefined,
+            });
+        }
+    },
+
+    // Start a SAP-error resubmit for a MASS batch: request-level like every
+    // other mass approval action, so one errored item reopens the Master Data
+    // step for the whole batch. Same actor rule as the single one.
+    requestMassSapErrorRework: async (req, res) => {
+        try {
+            const result = await materialService.requestMassSapErrorRework({
+                massRequestId: req.params.id,
+                actorUserId: req.cookies.user_id,
+                actorUsername: req.cookies.username,
+            });
+
+            return res.status(200).json({
+                success: true,
+                message:
+                    "Mass request sent back to Master Data for resubmission",
+                data: result,
+            });
+        } catch (error) {
+            const statusCode = error.statusCode || 500;
+            return res.status(statusCode).json({
+                success: false,
+                message:
+                    statusCode === 500
+                        ? "Failed to resubmit mass request to SAP"
                         : error.message,
                 code: error.code,
                 error: statusCode === 500 ? error.message : undefined,
