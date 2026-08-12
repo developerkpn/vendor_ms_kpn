@@ -311,16 +311,14 @@ const buildSingleRequestFinalCode = ({
 };
 
 // ===========================================================================
-// Mass-request final codes (v1) — one running number entered at the Master Data
-// step, incremented across the batch's items.
+// Mass-request final codes — one running number entered per item at the
+// Master Data step, typed in one by one (no batch-wide auto-increment).
 //
 // A mass batch stages ONE VMS_MATERIALDATA row per item, each keyed by that
-// item's own request_no and carrying its own material code, so the MDM approver
-// has to hand out N codes in one action. v1 keeps the UI to a single input: the
-// approver types the running number for item 1 and items 2..N take it +1, +2,
-// … The composition itself still goes through buildSingleRequestFinalCode, so a
-// mass code and a single code are the same artifact (GGG.SSS.NNN) built by the
-// same rules.
+// item's own request_no and carrying its own material code, so the MDM
+// approver hands out N codes in one action, one per item. The composition
+// itself still goes through buildSingleRequestFinalCode, so a mass code and a
+// single code are the same artifact (GGG.SSS.NNN) built by the same rules.
 // ===========================================================================
 
 // Mass batches are Create-only by product decision: the grid never offers
@@ -362,10 +360,8 @@ const assertMassRequestRowsAreCreateOnly = (rows = []) => {
     return true;
 };
 
-// v1 restriction: the entered running number must be strictly NUMERIC, so the
-// per-item step is arithmetic (+1) instead of an alphanumeric "next code"
-// guess. Width stays 3 because buildSingleRequestFinalCode's suffix segment is
-// exactly 3 chars — the composed codes go through that builder unchanged.
+// Each item's running number must be strictly NUMERIC, matching the fixed
+// 3-char suffix segment buildSingleRequestFinalCode composes into GGG.SSS.NNN.
 const MASS_FINAL_CODE_SUFFIX_PATTERN = /^\d{3}$/;
 
 const buildMassFinalCodeError = (message, code, statusCode = 409) =>
@@ -375,44 +371,35 @@ const buildMassFinalCodeError = (message, code, statusCode = 409) =>
         errors: [{ fieldKey: "finalCodeSuffix", message }],
     });
 
-// Item k (1-based, ordered by item_no) takes the entered suffix + (k - 1),
-// zero-padded back to the entered suffix's width. Running past that width is a
-// 409 overflow rather than a silently widened code: the segment is fixed width
-// in SAP, so "999" + 1 must fail loudly instead of staging "1000".
-const buildMassItemFinalCodeSuffixes = ({
-    finalCodeSuffix,
-    itemCount,
+// Resolve every item's own entered running number. `finalCodeSuffixes` is a
+// map keyed by item_id (string) -> suffix, one entry per item, typed in by
+// Master Data one at a time — no arithmetic, no batch-wide increment. Missing
+// or malformed entries fail loudly and name the offending item.
+const resolveMassItemFinalCodeSuffixes = ({
+    finalCodeSuffixes,
+    items = [],
 } = {}) => {
-    const suffix = normalizeCodeSegment(finalCodeSuffix);
+    const suffixByItemId =
+        finalCodeSuffixes && typeof finalCodeSuffixes === "object"
+            ? finalCodeSuffixes
+            : {};
 
-    if (!MASS_FINAL_CODE_SUFFIX_PATTERN.test(suffix)) {
-        throw buildMassFinalCodeError(
-            "Final code running number is required and must be exactly 3 digits for a mass request",
-            "MASS_REQUEST_FINAL_CODE_SUFFIX_INVALID",
-            400
+    return items.map((item, index) => {
+        const itemNo = item?.item_no ?? index + 1;
+        const suffix = normalizeCodeSegment(
+            suffixByItemId[String(item?.item_id ?? item?.id ?? "")]
         );
-    }
 
-    const width = suffix.length;
-    const ceiling = 10 ** width;
-    const base = Number.parseInt(suffix, 10);
-    const count = Number(itemCount) || 0;
-    const suffixes = [];
-
-    for (let index = 0; index < count; index += 1) {
-        const value = base + index;
-
-        if (value >= ceiling) {
+        if (!MASS_FINAL_CODE_SUFFIX_PATTERN.test(suffix)) {
             throw buildMassFinalCodeError(
-                `Running number ${suffix} cannot cover ${count} items: item ${index + 1} would need ${value}, which is past the ${width}-digit range. Use a lower running number.`,
-                "MASS_REQUEST_FINAL_CODE_SUFFIX_OVERFLOW"
+                `Item ${itemNo}: running number is required and must be exactly 3 digits.`,
+                "MASS_REQUEST_FINAL_CODE_SUFFIX_INVALID",
+                400
             );
         }
 
-        suffixes.push(String(value).padStart(width, "0"));
-    }
-
-    return suffixes;
+        return suffix;
+    });
 };
 
 // Belt-and-braces. Two siblings cannot collide by construction (every item gets
@@ -444,29 +431,31 @@ const assertMassFinalCodesAreDistinct = (plan = []) => {
 };
 
 /**
- * Compose one final code per batch item from the single entered running number.
+ * Compose one final code per batch item from that item's own entered running
+ * number.
  *
  * @param {object} opts
- * @param {string} opts.finalCodeSuffix  running number entered at the MDM step
+ * @param {Record<string, string>} opts.finalCodeSuffixes  running number per
+ *                                       item, keyed by item_id, entered one by
+ *                                       one at the MDM step
  * @param {Array}  opts.items            batch items, each carrying item_id /
  *                                       item_no / request_no plus the RESOLVED
  *                                       material group + sub group CODES (the
  *                                       item table stores free text — see
  *                                       MASS_ITEM_*_CODE_LATERAL_SQL). Sorted
- *                                       by item_no here so the caller's row
- *                                       order cannot shuffle the increment.
+ *                                       by item_no here for a stable order.
  * @returns {Array<{item_id, item_no, request_no, final_code}>}
  */
 const buildMassRequestFinalCodePlan = ({
-    finalCodeSuffix,
+    finalCodeSuffixes,
     items = [],
 } = {}) => {
     const orderedItems = [...(Array.isArray(items) ? items : [])].sort(
         (a, b) => Number(a?.item_no) - Number(b?.item_no)
     );
-    const suffixes = buildMassItemFinalCodeSuffixes({
-        finalCodeSuffix,
-        itemCount: orderedItems.length,
+    const suffixes = resolveMassItemFinalCodeSuffixes({
+        finalCodeSuffixes,
+        items: orderedItems,
     });
 
     const plan = orderedItems.map((item, index) => {
@@ -5749,7 +5738,7 @@ const MaterialRequests = {
         actorUsername,
         remark,
         items,
-        finalCodeSuffix,
+        finalCodeSuffixes,
     }) => {
         try {
             const result = await DBClientWrapper(async client => {
@@ -5890,7 +5879,7 @@ const MaterialRequests = {
                     const isMdmStep = activeStep.kind === STEP_KINDS.MDM;
                     const finalCodePlan = isMdmStep
                         ? buildMassRequestFinalCodePlan({
-                              finalCodeSuffix,
+                              finalCodeSuffixes,
                               items: await loadMassItemGroupCodes(
                                   client,
                                   massRequestId
@@ -7114,9 +7103,9 @@ module.exports = {
     isAdminMaterialApprover,
     assertRequiredActionReason,
     buildSingleRequestFinalCode,
-    // mass final codes (v1: one numeric running number, incremented per item)
+    // mass final codes (one numeric running number per item, entered one by one)
     assertMassRequestRowsAreCreateOnly,
-    buildMassItemFinalCodeSuffixes,
+    resolveMassItemFinalCodeSuffixes,
     assertMassFinalCodesAreDistinct,
     buildMassRequestFinalCodePlan,
     loadMassItemGroupCodes,

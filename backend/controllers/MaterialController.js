@@ -2039,10 +2039,9 @@ const MaterialController = {
                 actorUsername: req.cookies.username,
                 remark: req.body?.remark ?? null,
                 items: req.body?.items ?? null,
-                // Running number for item 1; items 2..N take it +1, +2, …
-                // Required at the Master Data step (same field name and
-                // validation semantics as the single-request approve).
-                finalCodeSuffix: req.body?.finalCodeSuffix ?? null,
+                // One running number per item, keyed by item_id, entered one
+                // by one. Required at the Master Data step.
+                finalCodeSuffixes: req.body?.finalCodeSuffixes ?? null,
             });
 
             return res.status(200).json({

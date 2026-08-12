@@ -13,7 +13,7 @@ const MaterialController = require("../controllers/MaterialController");
 
 const {
     assertMassRequestRowsAreCreateOnly,
-    buildMassItemFinalCodeSuffixes,
+    resolveMassItemFinalCodeSuffixes,
     assertMassFinalCodesAreDistinct,
     buildMassRequestFinalCodePlan,
 } = materialService;
@@ -84,69 +84,54 @@ test("createMassRequest runs the create-only backstop before opening a transacti
 });
 
 // ---------------------------------------------------------------------------
-// Suffix validation / increment / padding / overflow
+// Suffix validation — one running number per item, keyed by item_id
 // ---------------------------------------------------------------------------
 
-test("buildMassItemFinalCodeSuffixes increments the entered running number per item", () => {
+const itemStubs = [
+    { item_id: 11, item_no: 1 },
+    { item_id: 12, item_no: 2 },
+    { item_id: 13, item_no: 3 },
+];
+
+test("resolveMassItemFinalCodeSuffixes reads each item's own entered running number", () => {
     assert.deepEqual(
-        buildMassItemFinalCodeSuffixes({
-            finalCodeSuffix: "007",
-            itemCount: 4,
+        resolveMassItemFinalCodeSuffixes({
+            finalCodeSuffixes: { 11: "005", 12: "006", 13: "021" },
+            items: itemStubs,
         }),
-        ["007", "008", "009", "010"]
+        ["005", "006", "021"]
     );
 });
 
-test("buildMassItemFinalCodeSuffixes zero-pads back to the entered width", () => {
-    // 001 + 8 crosses two padding boundaries (009 -> 010 -> ... -> 099 -> 100).
-    assert.deepEqual(
-        buildMassItemFinalCodeSuffixes({
-            finalCodeSuffix: "098",
-            itemCount: 3,
-        }),
-        ["098", "099", "100"]
+test("resolveMassItemFinalCodeSuffixes rejects a missing entry, naming the item", () => {
+    const error = captureThrow(() =>
+        resolveMassItemFinalCodeSuffixes({
+            finalCodeSuffixes: { 11: "005", 13: "021" },
+            items: itemStubs,
+        })
     );
+
+    assert.equal(error.statusCode, 400);
+    assert.equal(error.code, "MASS_REQUEST_FINAL_CODE_SUFFIX_INVALID");
+    assert.equal(error.errors[0].fieldKey, "finalCodeSuffix");
+    assert.match(error.message, /Item 2/);
 });
 
-test("buildMassItemFinalCodeSuffixes rejects a non-numeric suffix with 400", () => {
+test("resolveMassItemFinalCodeSuffixes rejects a non-numeric entry, naming the item", () => {
     for (const suffix of ["A01", "1", "12", "1234", "", null, undefined, "  "]) {
         const error = captureThrow(
             () =>
-                buildMassItemFinalCodeSuffixes({
-                    finalCodeSuffix: suffix,
-                    itemCount: 2,
+                resolveMassItemFinalCodeSuffixes({
+                    finalCodeSuffixes: { 11: "005", 12: suffix, 13: "021" },
+                    items: itemStubs,
                 }),
             `suffix ${JSON.stringify(suffix)} must be rejected`
         );
 
         assert.equal(error.statusCode, 400);
         assert.equal(error.code, "MASS_REQUEST_FINAL_CODE_SUFFIX_INVALID");
-        assert.equal(error.errors[0].fieldKey, "finalCodeSuffix");
+        assert.match(error.message, /Item 2/);
     }
-});
-
-test("buildMassItemFinalCodeSuffixes rejects an overflow past the entered width with 409", () => {
-    const error = captureThrow(() =>
-        buildMassItemFinalCodeSuffixes({
-            finalCodeSuffix: "998",
-            itemCount: 3,
-        })
-    );
-
-    assert.equal(error.statusCode, 409);
-    assert.equal(error.code, "MASS_REQUEST_FINAL_CODE_SUFFIX_OVERFLOW");
-    assert.match(error.message, /item 3/i);
-    assert.match(error.message, /1000/);
-});
-
-test("buildMassItemFinalCodeSuffixes allows a batch that lands exactly on the last code", () => {
-    assert.deepEqual(
-        buildMassItemFinalCodeSuffixes({
-            finalCodeSuffix: "998",
-            itemCount: 2,
-        }),
-        ["998", "999"]
-    );
 });
 
 // ---------------------------------------------------------------------------
@@ -177,10 +162,12 @@ const massItems = [
     },
 ];
 
-test("buildMassRequestFinalCodePlan composes one incremented code per item", () => {
+const massFinalCodeSuffixes = { 11: "005", 12: "006", 13: "007" };
+
+test("buildMassRequestFinalCodePlan composes each item's own entered code", () => {
     assert.deepEqual(
         buildMassRequestFinalCodePlan({
-            finalCodeSuffix: "005",
+            finalCodeSuffixes: massFinalCodeSuffixes,
             items: massItems,
         }),
         [
@@ -208,7 +195,7 @@ test("buildMassRequestFinalCodePlan composes one incremented code per item", () 
 
 test("buildMassRequestFinalCodePlan orders by item_no regardless of the row order it is handed", () => {
     const plan = buildMassRequestFinalCodePlan({
-        finalCodeSuffix: "005",
+        finalCodeSuffixes: massFinalCodeSuffixes,
         items: [massItems[2], massItems[0], massItems[1]],
     });
 
@@ -221,7 +208,7 @@ test("buildMassRequestFinalCodePlan orders by item_no regardless of the row orde
 test("buildMassRequestFinalCodePlan 409s naming the item whose group code is unresolvable", () => {
     const error = captureThrow(() =>
         buildMassRequestFinalCodePlan({
-            finalCodeSuffix: "005",
+            finalCodeSuffixes: massFinalCodeSuffixes,
             items: [
                 massItems[0],
                 { ...massItems[1], material_sub_group_code: null },
@@ -279,7 +266,7 @@ const groupCodeRows = () =>
 // the three uniqueness lookups; `queries` collects everything that was issued.
 const runMassApprove = async ({
     duplicates = {},
-    finalCodeSuffix = "005",
+    finalCodeSuffixes = massFinalCodeSuffixes,
 } = {}) => {
     const originalConnect = db.connect;
     const originalPush =
@@ -355,7 +342,7 @@ const runMassApprove = async ({
             actorUsername: "master.data.one",
             remark: "approved",
             items: null,
-            finalCodeSuffix,
+            finalCodeSuffixes,
         });
         return { result, queries, pushCalls };
     } finally {
@@ -365,7 +352,7 @@ const runMassApprove = async ({
     }
 };
 
-test("approveMassRequest writes an incremented final code per item and flags them PENDING", async () => {
+test("approveMassRequest writes each item's own entered final code and flags them PENDING", async () => {
     const { result, queries, pushCalls } = await runMassApprove();
 
     assert.deepEqual(
@@ -398,9 +385,11 @@ test("approveMassRequest writes an incremented final code per item and flags the
     assert.equal(pushCalls[0].massRequestId, 5);
 });
 
-test("approveMassRequest requires a numeric running number at the Master Data step", async () => {
+test("approveMassRequest requires a numeric running number for every item at the Master Data step", async () => {
     const error = await captureReject(() =>
-        runMassApprove({ finalCodeSuffix: "A01" })
+        runMassApprove({
+            finalCodeSuffixes: { ...massFinalCodeSuffixes, 12: "A01" },
+        })
     );
 
     assert.equal(error.statusCode, 400);
@@ -630,7 +619,7 @@ test("requestMassSapErrorRework locks + probes existence on a row, not on the co
 test("mass approve + resubmit are wired through the controller and routes", () => {
     assert.match(
         MaterialController.approveMassRequest.toString(),
-        /finalCodeSuffix: req\.body\?\.finalCodeSuffix \?\? null/
+        /finalCodeSuffixes: req\.body\?\.finalCodeSuffixes \?\? null/
     );
     assert.match(
         MaterialController.requestMassSapErrorRework.toString(),
