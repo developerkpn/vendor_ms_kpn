@@ -414,6 +414,12 @@ const connectChainStub = (
             return { rows: [], rowCount: 1 };
         }
 
+        // Every request action also appends to the request comment history; the
+        // stub answers that write the way the database would.
+        if (/mat_request_comment/.test(queryText)) {
+            return { rows: [], rowCount: 1 };
+        }
+
         throw new Error(`Unexpected query: ${queryText}`);
     },
     release: () => {},
@@ -857,6 +863,12 @@ const connectMassChainStub = ({
             if (/UPDATE mat_mass_request_item\b/.test(queryText)) {
                 headerUpdates.push({ queryText, params });
                 return { rows: [{ id: 9001 }, { id: 9002 }], rowCount: 2 };
+            }
+
+            // Every request action also appends to the request comment history; the
+            // stub answers that write the way the database would.
+            if (/mat_request_comment/.test(queryText)) {
+                return { rows: [], rowCount: 1 };
             }
 
             throw new Error(`Unexpected query: ${queryText}`);

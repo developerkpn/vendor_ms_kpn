@@ -222,6 +222,12 @@ const templateConnectStub = ({ fullname } = {}) => {
                     : { rows: [{ fullname }], rowCount: 1 };
             }
 
+            // Every request action also appends to the request comment history; the
+            // stub answers that write the way the database would.
+            if (/mat_request_comment/.test(queryText)) {
+                return { rows: [], rowCount: 1 };
+            }
+
             throw new Error(`Unexpected query: ${queryText}`);
         },
         release: () => {},
@@ -512,6 +518,12 @@ const fakePgClient = () => {
                 inserts.push(params);
                 return { rows: [{ id: 501 }], rowCount: 1 };
             }
+            // Every request action also appends to the request comment history; the
+            // stub answers that write the way the database would.
+            if (/mat_request_comment/.test(queryText)) {
+                return { rows: [], rowCount: 1 };
+            }
+
             throw new Error(`Unexpected query: ${queryText}`);
         },
     };
@@ -748,6 +760,12 @@ const connectSingleChainStub = queryLog => async () => ({
         }
 
         if (/UPDATE mat_single_request\b/.test(queryText)) {
+            return { rows: [], rowCount: 1 };
+        }
+
+        // Every request action also appends to the request comment history; the
+        // stub answers that write the way the database would.
+        if (/mat_request_comment/.test(queryText)) {
             return { rows: [], rowCount: 1 };
         }
 
@@ -1043,6 +1061,12 @@ const inboundLookupClient = rows => {
                 };
             }
 
+            // Every request action also appends to the request comment history; the
+            // stub answers that write the way the database would.
+            if (/mat_request_comment/.test(queryText)) {
+                return { rows: [], rowCount: 1 };
+            }
+
             throw new Error(`Unexpected query: ${queryText}`);
         },
     };
@@ -1230,6 +1254,12 @@ const pollerPgStub = ({ cursor = null, matchId = null }) => {
                 state.replyInserts.push(params);
                 return { rows: [{ id: 900 }], rowCount: 1 };
             }
+            // Every request action also appends to the request comment history; the
+            // stub answers that write the way the database would.
+            if (/mat_request_comment/.test(queryText)) {
+                return { rows: [], rowCount: 1 };
+            }
+
             throw new Error(`Unexpected query: ${queryText}`);
         },
         release: () => {},

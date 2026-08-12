@@ -365,6 +365,12 @@ test("approveSingleRequestByAdmin stores composed final_code on Approval 3", asy
         return { rows: [], rowCount: 1 };
       }
 
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
       throw new Error(`Unexpected query: ${queryText}`);
     },
     release: () => {},
@@ -1958,6 +1964,12 @@ test("approveSingleRequestByAdmin still forbids a Master Data step grabbed by an
         return { rows: [{ exists: 1 }], rowCount: 1 };
       }
 
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
       throw new Error(`Unexpected query: ${queryText}`);
     },
     release: () => {},
@@ -2078,6 +2090,12 @@ test("approveSingleRequestByAdmin stores original request creator metadata in ed
       }
 
       if (/SET assigned_to = \$2,/i.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
         return { rows: [], rowCount: 1 };
       }
 
@@ -2261,6 +2279,12 @@ test("approveSingleRequestByAdmin auto-assigns Approval 3 for Change when MDM us
         return { rows: [], rowCount: 1 };
       }
 
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
       throw new Error(`Unexpected query: ${queryText}`);
     },
     release: () => {},
@@ -2399,6 +2423,12 @@ test("approveSingleRequestByAdmin skips history insert when edit-history table i
         return { rows: [], rowCount: 1 };
       }
 
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
       throw new Error(`Unexpected query: ${queryText}`);
     },
     release: () => {},
@@ -2529,6 +2559,12 @@ test("createSingleRequest stores aligned insert values for Extend and auto-assig
           ],
           rowCount: 1,
         };
+      }
+
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
       }
 
       throw new Error(`Unexpected query: ${queryText}`);
@@ -2679,6 +2715,12 @@ test("createMassRequest stores attachments under item request number path", asyn
           ],
           rowCount: 1,
         };
+      }
+
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
       }
 
       throw new Error(`Unexpected query: ${queryText}`);
@@ -3028,6 +3070,12 @@ test("saveSingleRequestRework keeps requested attachments and appends new upload
         return { rows: [{ id: 12 }], rowCount: 1 };
       }
 
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
       throw new Error(`Unexpected query: ${queryText}`);
     },
     release: () => {},
@@ -3154,6 +3202,12 @@ test("saveSingleRequestRework rejects attachment mutation for Change tickets", a
         };
       }
 
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
       throw new Error(`Unexpected query: ${queryText}`);
     },
     release: () => {},
@@ -3252,6 +3306,12 @@ test("saveSingleRequestRework persists selected material group for rework edits"
         /UPDATE mat_single_request[\s\S]*material_sub_group_id = \$\d/i.test(queryText) &&
         /updated_at = NOW\(\)/i.test(queryText)
       ) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
         return { rows: [], rowCount: 1 };
       }
 
@@ -3754,6 +3814,12 @@ const connectRewindStub = (steps, { queryLog, stepUpdates, headerUpdates }) =>
         return { rows: [], rowCount: 1 };
       }
 
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
       throw new Error(`Unexpected query: ${queryText}`);
     },
     release: () => {},
@@ -4058,6 +4124,12 @@ test("approveSingleRequestByAdmin composes the final code from the sub material 
 
       if (/UPDATE mat_single_request\b/.test(queryText)) {
         requestUpdates.push({ queryText, params });
+        return { rows: [], rowCount: 1 };
+      }
+
+      // Every request action also appends to the request comment history; the
+      // stub answers that write the way the database would.
+      if (/mat_request_comment/.test(queryText)) {
         return { rows: [], rowCount: 1 };
       }
 

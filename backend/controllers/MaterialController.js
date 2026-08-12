@@ -2264,6 +2264,46 @@ const MaterialController = {
             });
         }
     },
+
+    getSingleRequestComments: async (req, res) => {
+        try {
+            const rows = await materialService.getRequestComments({
+                requestKind: "SINGLE",
+                requestId: req.params.id,
+            });
+
+            return res.status(200).json({
+                success: true,
+                data: rows,
+            });
+        } catch (error) {
+            return res.status(500).json({
+                success: false,
+                message: "Failed to fetch single request comments",
+                error: error.message,
+            });
+        }
+    },
+
+    getMassRequestComments: async (req, res) => {
+        try {
+            const rows = await materialService.getRequestComments({
+                requestKind: "MASS",
+                requestId: req.params.id,
+            });
+
+            return res.status(200).json({
+                success: true,
+                data: rows,
+            });
+        } catch (error) {
+            return res.status(500).json({
+                success: false,
+                message: "Failed to fetch mass request comments",
+                error: error.message,
+            });
+        }
+    },
     getSingleRequestApprovalInbox: async (req, res) => {
         try {
             const actorUsername = req.cookies?.username;

@@ -293,6 +293,18 @@ router.get(
     MaterialController.getMassRequestReworkEmailThread
 );
 
+// Comment history: everything said about a request, in the order it was said.
+router.get(
+    "/requests/single/:id/comments",
+    AuthToken.authSession,
+    MaterialController.getSingleRequestComments
+);
+router.get(
+    "/requests/mass/:id/comments",
+    AuthToken.authSession,
+    MaterialController.getMassRequestComments
+);
+
 
 // Material template endpoints
 router.get("/templates", MaterialController.getMaterialTemplates);

@@ -330,6 +330,12 @@ const runMassApprove = async ({
                 return { rows: [{ id: 11 }, { id: 12 }, { id: 13 }], rowCount: 3 };
             }
 
+            // Every request action also appends to the request comment history; the
+            // stub answers that write the way the database would.
+            if (/mat_request_comment/.test(queryText)) {
+                return { rows: [], rowCount: 1 };
+            }
+
             throw new Error(`Unexpected query: ${queryText}`);
         },
         release: () => {},
