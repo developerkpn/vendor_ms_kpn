@@ -651,6 +651,27 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
                     throw new Error("User not found");
                 }
                 const user = userData.rows[0];
+                // Master Data membership is a group-name fact, not a role one:
+                // every material user carries role "MATERIAL", so only the
+                // MDM_MATERIAL group name separates Master Data from the
+                // approvers and requesters around them. Login already resolves
+                // it this way; the session refresh has to agree, because the
+                // MDM-only UI is gated on the flag it returns. A user with no
+                // page-access rows yields no group names, hence false.
+                const userGroupInfoResult = await client.query(
+                    `SELECT DISTINCT
+                        user_group_id,
+                        user_group_name
+                    FROM mst_page_access
+                    WHERE user_group_id = $1
+                        AND user_group_name IS NOT NULL
+                    ORDER BY user_group_name`,
+                    [user.user_group]
+                );
+                const userGroupInfo = buildLoginUserGroupInfo(
+                    userGroupInfoResult.rows,
+                    user.user_group
+                );
                 const getAuthorization = await client.query(
                     `
                     SELECT 
@@ -720,6 +741,7 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
                     bu_id: user.bu_id,
                     permission: authPerm,
                     groupid: user.user_group,
+                    is_mdm_material: userGroupInfo.user_group.is_mdm_material,
                     is_reset_pwd: is_reset_pwd,
                     menu: menu,
                 };
