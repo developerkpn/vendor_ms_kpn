@@ -1207,6 +1207,101 @@ const buildMassStepRejectPatch = ({ reason } = {}) => {
 };
 
 // ===========================================================================
+// Request comment history (mat_request_comment).
+// ===========================================================================
+// Append-only record of everything said about a request: the requester's submit
+// reason, every approve remark, every rework reason, the reject reason. Written
+// ALONGSIDE the step/header transitions above, never instead of them — nothing
+// reads this table to decide what happens next, so a request's routing behaves
+// identically whether the table is there or not.
+//
+// It exists because the routing columns cannot hold a history: a stage reworked
+// twice overwrites its own remark and its own rework_reason, and the reason that
+// gets overwritten is one somebody typed.
+
+const REQUEST_COMMENT_KINDS = Object.freeze({
+    SINGLE: "SINGLE",
+    MASS: "MASS",
+});
+
+const REQUEST_COMMENT_EVENTS = Object.freeze({
+    SUBMIT: "SUBMIT",
+    RESUBMIT: "RESUBMIT",
+    APPROVE: "APPROVE",
+    REWORK: "REWORK",
+    REJECT: "REJECT",
+});
+
+// A comment with nothing in it is stored as NULL, never "": a Create request has
+// no submit reason to give and an approve remark is optional, so "nothing was
+// said" has one representation instead of two that render differently.
+const buildRequestCommentRow = ({
+    requestKind,
+    requestId,
+    eventType,
+    stage = null,
+    actorUserId = null,
+    comment = null,
+} = {}) => ({
+    request_kind: requestKind,
+    request_id: Number(requestId),
+    event_type: eventType,
+    stage: stage ?? null,
+    actor_user_id: actorUserId ?? null,
+    comment: String(comment ?? "").trim() || null,
+});
+
+// 20260812_mat_request_comment.sql is applied by hand. Until it lands, the
+// action still has to go through — recording what was said is not worth failing
+// the approval that said it.
+const isMissingRequestCommentTableError = error =>
+    error?.code === "42P01" &&
+    /mat_request_comment/i.test(String(error?.message || ""));
+
+// Runs inside a SAVEPOINT because a failed statement poisons the whole
+// transaction: without one, catching the missing-table error here would still
+// leave every following statement — COMMIT included — failing with 25P02. Any
+// other error is rethrown, so a real write problem still fails the action.
+const insertRequestComment = async (client, commentRow = {}) => {
+    const row = buildRequestCommentRow(commentRow);
+
+    await client.query("SAVEPOINT mat_request_comment_insert");
+
+    try {
+        await client.query(
+            `INSERT INTO mat_request_comment (
+                request_kind,
+                request_id,
+                event_type,
+                stage,
+                actor_user_id,
+                comment,
+                created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+            [
+                row.request_kind,
+                row.request_id,
+                row.event_type,
+                row.stage,
+                row.actor_user_id,
+                row.comment,
+            ]
+        );
+        await client.query("RELEASE SAVEPOINT mat_request_comment_insert");
+    } catch (error) {
+        await client.query("ROLLBACK TO SAVEPOINT mat_request_comment_insert");
+
+        if (!isMissingRequestCommentTableError(error)) {
+            throw error;
+        }
+
+        console.warn(
+            `mat_request_comment is missing; skipping ${row.event_type} comment for ${row.request_kind} request ${row.request_id}`
+        );
+    }
+};
+
+// ===========================================================================
 // Material template: description / long-text + value validation.
 // ===========================================================================
 
@@ -4225,6 +4320,14 @@ const MaterialRequests = {
                         requestId,
                         headerPatch
                     );
+                    await insertRequestComment(client, {
+                        requestKind: REQUEST_COMMENT_KINDS.SINGLE,
+                        requestId,
+                        eventType: REQUEST_COMMENT_EVENTS.APPROVE,
+                        stage: activeStepLabel,
+                        actorUserId,
+                        comment: safeRemark,
+                    });
                     await client.query("COMMIT");
 
                     return {
@@ -4398,6 +4501,17 @@ const MaterialRequests = {
                         plan
                     );
 
+                    // Opens the request's comment thread. Only Change/Extend
+                    // asks the requester for a reason, so a Create submission
+                    // records the event with nothing said.
+                    await insertRequestComment(client, {
+                        requestKind: REQUEST_COMMENT_KINDS.SINGLE,
+                        requestId: nextId,
+                        eventType: REQUEST_COMMENT_EVENTS.SUBMIT,
+                        actorUserId: createdBy,
+                        comment: changeExtendReason,
+                    });
+
                     const createdAt =
                         insertResult.rows[0]?.created_at ?? new Date();
                     const resolvedAttachments = attachments.map(file => ({
@@ -4540,6 +4654,16 @@ const MaterialRequests = {
                             createdByUsername,
                         ]
                     );
+                    // Opens the batch's comment thread. The reason is asked for
+                    // once per batch, not per item, so this is the only submit
+                    // comment a mass request has.
+                    await insertRequestComment(client, {
+                        requestKind: REQUEST_COMMENT_KINDS.MASS,
+                        requestId: nextMassId,
+                        eventType: REQUEST_COMMENT_EVENTS.SUBMIT,
+                        actorUserId: createdBy,
+                        comment: massRequestReason,
+                    });
                     const insertedItems = [];
 
                     for (
@@ -4993,6 +5117,14 @@ const MaterialRequests = {
                             ...plan.header,
                             rework_by_user_id: actorUserId ?? null,
                         });
+                        await insertRequestComment(client, {
+                            requestKind: REQUEST_COMMENT_KINDS.SINGLE,
+                            requestId,
+                            eventType: REQUEST_COMMENT_EVENTS.REWORK,
+                            stage: stepLabel(activeStep),
+                            actorUserId,
+                            comment: plan._meta.reason,
+                        });
                         await client.query("COMMIT");
 
                         // Post-commit on purpose (see buildReworkNotifyResult).
@@ -5044,6 +5176,18 @@ const MaterialRequests = {
                     await updateSingleRequestColumns(client, requestId, {
                         ...reworkPatch.header,
                         rework_by_user_id: actorUserId ?? null,
+                    });
+                    // Recorded against the stage that SENT it back, which is the
+                    // active step for both variants — a rewind moves the request
+                    // to an earlier approver, but Master Data is who wrote the
+                    // reason.
+                    await insertRequestComment(client, {
+                        requestKind: REQUEST_COMMENT_KINDS.SINGLE,
+                        requestId,
+                        eventType: REQUEST_COMMENT_EVENTS.REWORK,
+                        stage: stepLabel(activeStep),
+                        actorUserId,
+                        comment: reworkPatch.header.rework_reason,
                     });
                     await client.query("COMMIT");
 
@@ -5136,6 +5280,14 @@ const MaterialRequests = {
                         requestId,
                         rejectPatch.header
                     );
+                    await insertRequestComment(client, {
+                        requestKind: REQUEST_COMMENT_KINDS.SINGLE,
+                        requestId,
+                        eventType: REQUEST_COMMENT_EVENTS.REJECT,
+                        stage: stepLabel(activeStep),
+                        actorUserId,
+                        comment: rejectPatch.step.remark,
+                    });
                     await client.query("COMMIT");
 
                     return {
@@ -5545,6 +5697,18 @@ const MaterialRequests = {
                         );
                     }
 
+                    // The requester answering a rework. The answer is the edited
+                    // request itself; the only text they can type is the
+                    // Change/Extend reason, and only a REWRITTEN one is recorded
+                    // — carrying the unchanged one forward would repeat the
+                    // submit comment on every revise.
+                    await insertRequestComment(client, {
+                        requestKind: REQUEST_COMMENT_KINDS.SINGLE,
+                        requestId,
+                        eventType: REQUEST_COMMENT_EVENTS.RESUBMIT,
+                        actorUserId,
+                        comment: editablePatch.change_extend_reason ?? null,
+                    });
                     await client.query("COMMIT");
                     deleteSingleRequestStoredFiles(removedFilePaths);
 
@@ -5950,6 +6114,14 @@ const MaterialRequests = {
                         [massRequestId, headerStatus, headerAssignedTo]
                     );
 
+                    await insertRequestComment(client, {
+                        requestKind: REQUEST_COMMENT_KINDS.MASS,
+                        requestId: massRequestId,
+                        eventType: REQUEST_COMMENT_EVENTS.APPROVE,
+                        stage: activeStepLabel,
+                        actorUserId,
+                        comment: remark,
+                    });
                     await client.query("COMMIT");
 
                     return {
@@ -6242,6 +6414,14 @@ const MaterialRequests = {
                             );
                         }
 
+                        await insertRequestComment(client, {
+                            requestKind: REQUEST_COMMENT_KINDS.MASS,
+                            requestId: massRequestId,
+                            eventType: REQUEST_COMMENT_EVENTS.REWORK,
+                            stage: stepLabel(activeStep),
+                            actorUserId,
+                            comment: plan._meta.reason,
+                        });
                         await client.query("COMMIT");
 
                         // Post-commit on purpose (see buildReworkNotifyResult).
@@ -6303,6 +6483,14 @@ const MaterialRequests = {
                         );
                     }
 
+                    await insertRequestComment(client, {
+                        requestKind: REQUEST_COMMENT_KINDS.MASS,
+                        requestId: massRequestId,
+                        eventType: REQUEST_COMMENT_EVENTS.REWORK,
+                        stage: stepLabel(activeStep),
+                        actorUserId,
+                        comment: reworkPatch.header.rework_reason,
+                    });
                     await client.query("COMMIT");
 
                     return {
@@ -6458,6 +6646,14 @@ const MaterialRequests = {
                         );
                     }
 
+                    await insertRequestComment(client, {
+                        requestKind: REQUEST_COMMENT_KINDS.MASS,
+                        requestId: massRequestId,
+                        eventType: REQUEST_COMMENT_EVENTS.REJECT,
+                        stage: stepLabel(activeStep),
+                        actorUserId,
+                        comment: rejectPatch.step.remark,
+                    });
                     await client.query("COMMIT");
 
                     return {
@@ -6877,6 +7073,53 @@ const MaterialRequests = {
         }
     },
 
+    // The whole comment thread of one request, oldest first — the order it was
+    // said in, which is the order it has to be read in. The actor's name is
+    // resolved here rather than stored, so a renamed user reads correctly
+    // everywhere at once; the stored user_id is what survives them being
+    // removed.
+    getRequestComments: async ({ requestKind, requestId }) => {
+        try {
+            return await DBClientWrapper(async client => {
+                const result = await client.query(
+                    `SELECT
+                         c.id,
+                         c.event_type,
+                         c.stage,
+                         c.actor_user_id,
+                         COALESCE(au.fullname, au.username, c.actor_user_id) AS actor_name,
+                         c.comment,
+                         c.created_at
+                     FROM mat_request_comment c
+                     LEFT JOIN mst_user au ON au.user_id = c.actor_user_id
+                     WHERE c.request_kind = $1
+                       AND c.request_id = $2
+                     ORDER BY c.created_at ASC, c.id ASC`,
+                    [requestKind, requestId]
+                );
+
+                return result.rows.map(row => ({
+                    id: Number(row.id),
+                    eventType: row.event_type,
+                    stage: row.stage ?? null,
+                    actorUserId: row.actor_user_id ?? null,
+                    actorName: row.actor_name ?? null,
+                    comment: row.comment ?? null,
+                    createdAt: row.created_at,
+                }));
+            });
+        } catch (error) {
+            // Same degradation as the mail thread: until the migration lands,
+            // an empty thread beats a 500 on the request detail.
+            if (isMissingRequestCommentTableError(error)) {
+                return [];
+            }
+
+            console.error("Error fetching request comments:", error);
+            throw error;
+        }
+    },
+
     /**
      * Save revised items after a mass request has been reworked by an approver.
      * Updates item fields, resets the reworked approval stage to WAITING,
@@ -7002,6 +7245,15 @@ const MaterialRequests = {
                         [massRequestId, reworkStepLabel]
                     );
 
+                    // The requester answering a rework. The revised items are
+                    // the answer — the mass rework form asks for no text — so
+                    // this records the event with nothing said.
+                    await insertRequestComment(client, {
+                        requestKind: REQUEST_COMMENT_KINDS.MASS,
+                        requestId: massRequestId,
+                        eventType: REQUEST_COMMENT_EVENTS.RESUBMIT,
+                        actorUserId,
+                    });
                     await client.query("COMMIT");
 
                     return {
@@ -7127,6 +7379,12 @@ module.exports = {
     sendReworkChainReplaceEmail,
     assertActiveApproverUsersExist,
     buildStepRejectPatch,
+    // request comment history
+    REQUEST_COMMENT_KINDS,
+    REQUEST_COMMENT_EVENTS,
+    buildRequestCommentRow,
+    isMissingRequestCommentTableError,
+    insertRequestComment,
     // mass approval
     syncMassRequestItemApprovalSnapshot,
     buildMassStepApprovePatch,
