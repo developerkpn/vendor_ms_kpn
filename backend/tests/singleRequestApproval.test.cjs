@@ -3112,6 +3112,7 @@ test("saveSingleRequestRework keeps requested attachments and appends new upload
         base_uom: "KG",
         template_payload: { templateValues: { density: "1.2" } },
       },
+      comment: "Fixed the description as requested",
       attachments: {
         keepAttachmentIds: [10],
         newAttachments: [
@@ -3223,6 +3224,7 @@ test("saveSingleRequestRework rejects attachment mutation for Change tickets", a
           editedRequest: {
             changeExtendReason: "Need update",
           },
+          comment: "Updated the description as requested",
           attachments: {
             keepAttachmentIds: [10],
             newAttachments: [],
@@ -3357,6 +3359,7 @@ test("saveSingleRequestRework persists selected material group for rework edits"
         base_uom: "KG",
         template_payload: { templateValues: { density: "1.2" } },
       },
+      comment: "Moved to the correct material group",
     });
 
     assert.deepEqual(result, {

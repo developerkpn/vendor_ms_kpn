@@ -1337,6 +1337,7 @@ const MaterialController = {
             let changeExtendReason = String(
                 req.body?.change_extend_reason || ""
             ).trim();
+            let comment = String(req.body?.comment || "").trim();
             let materialSubGroupId = Number.parseInt(
                 req.body?.materialSubGroupId,
                 10
@@ -1360,6 +1361,7 @@ const MaterialController = {
                 changeExtendReason = String(
                     fields.changeExtendReason || ""
                 ).trim();
+                comment = String(fields.comment || "").trim();
                 materialSubGroupId = Number.parseInt(fields.subgroup, 10);
                 requestFields = JSON.parse(fields.requestFields);
                 templateValues = JSON.parse(fields.templateValues);
@@ -1656,6 +1658,7 @@ const MaterialController = {
                 ticketType,
                 materialCode,
                 changeExtendReason,
+                comment,
                 materialGroupId: materialGroup.id,
                 materialSubGroupId,
                 requestFields: normalizedRequestFields,
@@ -2541,6 +2544,7 @@ const MaterialController = {
             ];
             const maxAttachments = 3;
             let editedRequest = req.body?.editedRequest ?? null;
+            let comment = req.body?.comment ?? null;
             let attachments = null;
             const isMultipartRequest = String(
                 req.headers?.["content-type"] || ""
@@ -2566,6 +2570,7 @@ const MaterialController = {
                 const materialGroupCode = String(
                     fields.materialGroupCode || ""
                 ).trim();
+                comment = fields.comment ?? null;
                 let materialSubGroupId = Number.parseInt(fields.subgroup, 10);
                 const requestFields = JSON.parse(fields.requestFields);
                 const templateValues = JSON.parse(fields.templateValues);
@@ -2728,6 +2733,7 @@ const MaterialController = {
                 actorUserId: req.cookies.user_id,
                 actorUsername: req.cookies.username,
                 editedRequest,
+                comment,
                 attachments,
             });
 
@@ -3200,6 +3206,7 @@ const MaterialController = {
                 massRequestId: req.params.id,
                 actorUserId: req.cookies.user_id,
                 items: req.body?.items ?? null,
+                comment: req.body?.comment ?? null,
             });
 
             return res.status(200).json({

@@ -4424,6 +4424,7 @@ const MaterialRequests = {
         ticketType,
         materialCode = null,
         changeExtendReason = null,
+        comment = null,
         materialGroupId,
         materialSubGroupId,
         requestFields = {},
@@ -4552,15 +4553,16 @@ const MaterialRequests = {
                         plan
                     );
 
-                    // Opens the request's comment thread. Only Change/Extend
-                    // asks the requester for a reason, so a Create submission
-                    // records the event with nothing said.
+                    // Opens the request's comment thread. Change/Extend asks
+                    // for a reason on the form itself; Create has no such
+                    // field, so it falls back to the optional submit dialog's
+                    // comment instead.
                     await insertRequestComment(client, {
                         requestKind: REQUEST_COMMENT_KINDS.SINGLE,
                         requestId: nextId,
                         eventType: REQUEST_COMMENT_EVENTS.SUBMIT,
                         actorUserId: createdBy,
-                        comment: changeExtendReason,
+                        comment: changeExtendReason || comment,
                     });
 
                     const createdAt =
@@ -5470,6 +5472,7 @@ const MaterialRequests = {
         actorUserId,
         actorUsername,
         editedRequest,
+        comment = null,
         attachments = null,
     }) => {
         const savedFiles = [];
@@ -5504,6 +5507,15 @@ const MaterialRequests = {
                     ) {
                         throw Object.assign(new Error("Forbidden: only requester or ADMIN can revise this request"), { statusCode: 403, code: "SINGLE_REQUEST_REVISE_FORBIDDEN" });
                     }
+
+                    // The requester answering a rework: required regardless of
+                    // ticket type, so a single Create resubmit is gated the
+                    // same as Change/Extend. Whitespace-only is rejected here,
+                    // same as every rework/reject reason.
+                    const safeComment = assertRequiredActionReason(
+                        comment,
+                        "resubmit"
+                    );
 
                     // Lazy require avoids a module-load cycle (MaterialTemplateModel
                     // re-exports template helpers from this service).
@@ -5748,17 +5760,16 @@ const MaterialRequests = {
                         );
                     }
 
-                    // The requester answering a rework. The answer is the edited
-                    // request itself; the only text they can type is the
-                    // Change/Extend reason, and only a REWRITTEN one is recorded
-                    // — carrying the unchanged one forward would repeat the
-                    // submit comment on every revise.
+                    // The requester answering a rework. Required regardless of
+                    // ticket type; the Change/Extend reason keeps its own
+                    // meaning on the request row and is not reused here — see
+                    // assertRequiredActionReason above for the gate.
                     await insertRequestComment(client, {
                         requestKind: REQUEST_COMMENT_KINDS.SINGLE,
                         requestId,
                         eventType: REQUEST_COMMENT_EVENTS.RESUBMIT,
                         actorUserId,
-                        comment: editablePatch.change_extend_reason ?? null,
+                        comment: safeComment,
                     });
                     await client.query("COMMIT");
                     deleteSingleRequestStoredFiles(removedFilePaths);
@@ -7180,6 +7191,7 @@ const MaterialRequests = {
         massRequestId,
         actorUserId,
         items,
+        comment = null,
     }) => {
         try {
             return await DBClientWrapper(async client => {
@@ -7212,6 +7224,14 @@ const MaterialRequests = {
                             { statusCode: 409, code: "MASS_REQUEST_REWORK_SAVE_CONFLICT" }
                         );
                     }
+
+                    // The requester answering a rework: required the same as
+                    // the single-request surfaces, so the rule does not depend
+                    // on request size.
+                    const safeComment = assertRequiredActionReason(
+                        comment,
+                        "resubmit"
+                    );
 
                     // Step model: the reworked stage is the step currently in
                     // REWORK status (the header assigned_to was 'Requester').
@@ -7296,14 +7316,15 @@ const MaterialRequests = {
                         [massRequestId, reworkStepLabel]
                     );
 
-                    // The requester answering a rework. The revised items are
-                    // the answer — the mass rework form asks for no text — so
-                    // this records the event with nothing said.
+                    // The requester answering a rework — the mass rework
+                    // dialog now asks for it explicitly (see
+                    // assertRequiredActionReason above for the gate).
                     await insertRequestComment(client, {
                         requestKind: REQUEST_COMMENT_KINDS.MASS,
                         requestId: massRequestId,
                         eventType: REQUEST_COMMENT_EVENTS.RESUBMIT,
                         actorUserId,
+                        comment: safeComment,
                     });
                     await client.query("COMMIT");
 
