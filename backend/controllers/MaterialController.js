@@ -14,6 +14,12 @@ const {
 } = require("../services/materialService");
 const { sanitizeUploadName } = require("../utils/uploadName");
 
+// User preference store: key is namespaced page.setting (matches mst_user_preference.pref_key).
+const USER_PREFERENCE_KEY_PATTERN = /^[a-z0-9_.-]{1,100}$/;
+const isValidUserPreferenceKey = key =>
+    typeof key === "string" && USER_PREFERENCE_KEY_PATTERN.test(key);
+const MAX_USER_PREFERENCE_VALUE_LENGTH = 255;
+
 const MaterialController = {
     // Create a new material group
     createMaterialGroup: async (req, res) => {
@@ -2304,6 +2310,90 @@ const MaterialController = {
             });
         }
     },
+
+    // Generic per-user preference store (My Approval's status filter, for now).
+    // The key is a path param but never trusted as free text: it is checked
+    // against a fixed shape before it reaches a query, same as the value on the
+    // write side. The owner is always req.cookies.user_id from the verified
+    // session token, never a param or body field — a client cannot read or
+    // overwrite another user's preferences by editing the URL.
+    getUserPreference: async (req, res) => {
+        try {
+            const userId = req.cookies?.user_id;
+            if (!userId) {
+                return res.status(401).json({
+                    success: false,
+                    message: "Unauthorized",
+                });
+            }
+
+            const key = req.params.key;
+            if (!isValidUserPreferenceKey(key)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid preference key",
+                });
+            }
+
+            const value = await materialService.getUserPreference({ userId, key });
+
+            return res.status(200).json({
+                success: true,
+                data: { key, value },
+            });
+        } catch (error) {
+            // No error detail in the response: a DB error here can carry a
+            // table or column name, and this endpoint has no reason to expose
+            // its schema to the client.
+            console.error("Error fetching user preference:", error);
+            return res.status(500).json({
+                success: false,
+                message: "Failed to fetch user preference",
+            });
+        }
+    },
+
+    setUserPreference: async (req, res) => {
+        try {
+            const userId = req.cookies?.user_id;
+            if (!userId) {
+                return res.status(401).json({
+                    success: false,
+                    message: "Unauthorized",
+                });
+            }
+
+            const key = req.params.key;
+            if (!isValidUserPreferenceKey(key)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid preference key",
+                });
+            }
+
+            const value = req.body?.value;
+            if (typeof value !== "string" || value.trim() === "" || value.length > MAX_USER_PREFERENCE_VALUE_LENGTH) {
+                return res.status(400).json({
+                    success: false,
+                    message: `value is required and must be a non-empty string of at most ${MAX_USER_PREFERENCE_VALUE_LENGTH} characters`,
+                });
+            }
+
+            await materialService.setUserPreference({ userId, key, value });
+
+            return res.status(200).json({
+                success: true,
+                data: { key, value },
+            });
+        } catch (error) {
+            console.error("Error saving user preference:", error);
+            return res.status(500).json({
+                success: false,
+                message: "Failed to save user preference",
+            });
+        }
+    },
+
     getSingleRequestApprovalInbox: async (req, res) => {
         try {
             const actorUsername = req.cookies?.username;
