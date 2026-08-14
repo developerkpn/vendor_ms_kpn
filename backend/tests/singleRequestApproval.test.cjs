@@ -2975,6 +2975,32 @@ test("saveSingleRequestRework keeps requested attachments and appends new upload
   const deletedAttachmentParams = [];
   let insertedAttachmentParams = null;
 
+  // The two approver steps behind the snapshot's approval_1/approval_2
+  // columns. The reworked stage is Approval 1, and saveSingleRequestRework
+  // resolves it from this read before it applies the revision.
+  const reworkSteps = [
+    {
+      id: 7701,
+      request_id: 77,
+      level: 1,
+      kind: "MANUAL",
+      approver_user_id: "APP-01",
+      status: "REWORK",
+      acted_at: null,
+      remark: "Need update",
+    },
+    {
+      id: 7702,
+      request_id: 77,
+      level: 2,
+      kind: "MANUAL",
+      approver_user_id: "APP-02",
+      status: "WAITING",
+      acted_at: null,
+      remark: null,
+    },
+  ];
+
   require("fs").existsSync = pathValue =>
     String(pathValue).includes("single-request");
   require("fs").mkdirSync = () => {};
@@ -3034,6 +3060,18 @@ test("saveSingleRequestRework keeps requested attachments and appends new upload
           ],
           rowCount: 1,
         };
+      }
+
+      if (/FOR UPDATE OF s/.test(queryText)) {
+        return { rows: reworkSteps };
+      }
+
+      if (/UPDATE mat_single_request_approval_step/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (/INSERT INTO mat_single_request_edit_history/i.test(queryText)) {
+        return { rows: [], rowCount: 1 };
       }
 
       if (/SELECT id, file_name, file_path, file_type\s+FROM mat_single_request_attachment/i.test(queryText)) {
@@ -3164,6 +3202,32 @@ test("saveSingleRequestRework keeps requested attachments and appends new upload
 test("saveSingleRequestRework rejects attachment mutation for Change tickets", async () => {
   const originalConnect = db.connect;
 
+  // The reworked step named by rework_stage. saveSingleRequestRework resolves
+  // it before it reaches the ticket-type attachment guard, so the stub has to
+  // answer the step read for the guard to be exercised at all.
+  const reworkSteps = [
+    {
+      id: 7701,
+      request_id: 77,
+      level: 1,
+      kind: "MANUAL",
+      approver_user_id: "APP-01",
+      status: "REWORK",
+      acted_at: null,
+      remark: null,
+    },
+    {
+      id: 7702,
+      request_id: 77,
+      level: 2,
+      kind: "MDM",
+      approver_user_id: null,
+      status: "WAITING",
+      acted_at: null,
+      remark: null,
+    },
+  ];
+
   db.connect = async () => ({
     query: async queryText => {
       if (queryText === "BEGIN" || queryText === "ROLLBACK") {
@@ -3201,6 +3265,10 @@ test("saveSingleRequestRework rejects attachment mutation for Change tickets", a
           ],
           rowCount: 1,
         };
+      }
+
+      if (/FOR UPDATE OF s/.test(queryText)) {
+        return { rows: reworkSteps };
       }
 
       // Every request action also appends to the request comment history; the
@@ -3248,6 +3316,32 @@ test("saveSingleRequestRework persists selected material group for rework edits"
     MaterialTemplate.validateMaterialRequestTemplate;
   const queryLog = [];
   let validationMaterialGroupCode = null;
+
+  // The two approver steps behind the snapshot's approval_1/approval_2
+  // columns. The reworked stage is Approval 1, and saveSingleRequestRework
+  // resolves it from this read before it applies the revision.
+  const reworkSteps = [
+    {
+      id: 7701,
+      request_id: 77,
+      level: 1,
+      kind: "MANUAL",
+      approver_user_id: "APP-01",
+      status: "REWORK",
+      acted_at: null,
+      remark: "Need update",
+    },
+    {
+      id: 7702,
+      request_id: 77,
+      level: 2,
+      kind: "MANUAL",
+      approver_user_id: "APP-02",
+      status: "WAITING",
+      acted_at: null,
+      remark: null,
+    },
+  ];
 
   db.connect = async () => ({
     query: async (queryText, params = []) => {
@@ -3301,6 +3395,18 @@ test("saveSingleRequestRework persists selected material group for rework edits"
           ],
           rowCount: 1,
         };
+      }
+
+      if (/FOR UPDATE OF s/.test(queryText)) {
+        return { rows: reworkSteps };
+      }
+
+      if (/UPDATE mat_single_request_approval_step/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (/INSERT INTO mat_single_request_edit_history/i.test(queryText)) {
+        return { rows: [], rowCount: 1 };
       }
 
       if (
