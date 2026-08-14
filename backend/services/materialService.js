@@ -2321,6 +2321,39 @@ const deleteSingleRequestStoredFiles = filepaths => {
     }
 };
 
+// Change and Extend tickets never had an attachment UI and carry none, so any
+// keep/new instruction against one is a client sending a change it has no
+// business sending. Shared by every caller that carries attachment changes
+// against a single request (resubmit, approve, rework) — one place decides
+// which ticket types support attachments at all.
+const assertAttachmentsSupportedForTicketType = (
+    ticketType,
+    attachmentInstructions
+) => {
+    if (
+        ticketType === SINGLE_REQUEST_TICKET_TYPES.CREATE ||
+        !attachmentInstructions
+    ) {
+        return;
+    }
+
+    const keepAttachmentIds = Array.isArray(
+        attachmentInstructions.keepAttachmentIds
+    )
+        ? attachmentInstructions.keepAttachmentIds
+        : [];
+    const newAttachments = Array.isArray(attachmentInstructions.newAttachments)
+        ? attachmentInstructions.newAttachments
+        : [];
+
+    if (keepAttachmentIds.length > 0 || newAttachments.length > 0) {
+        throw Object.assign(
+            new Error(`${ticketType} requests do not support attachments`),
+            { statusCode: 400, code: "SINGLE_REQUEST_ATTACHMENT_UNSUPPORTED" }
+        );
+    }
+};
+
 // Pure: resolves a { keepAttachmentIds, newAttachments } instruction against
 // the existing row set and enforces the count limit against the RESULTING set
 // (kept + new). One definition of "what may be attached, and how many",
@@ -4419,29 +4452,10 @@ const MaterialRequests = {
                     const attachmentInstructions =
                         normalizeAttachmentInstructions(attachments);
 
-                    if (
-                        normalizedTicketType !==
-                            SINGLE_REQUEST_TICKET_TYPES.CREATE &&
+                    assertAttachmentsSupportedForTicketType(
+                        normalizedTicketType,
                         attachmentInstructions
-                    ) {
-                        const keepAttachmentIds = Array.isArray(
-                            attachmentInstructions.keepAttachmentIds
-                        )
-                            ? attachmentInstructions.keepAttachmentIds
-                            : [];
-                        const newAttachmentsRequested = Array.isArray(
-                            attachmentInstructions.newAttachments
-                        )
-                            ? attachmentInstructions.newAttachments
-                            : [];
-
-                        if (
-                            keepAttachmentIds.length > 0 ||
-                            newAttachmentsRequested.length > 0
-                        ) {
-                            throw Object.assign(new Error(`${normalizedTicketType} requests do not support attachments`), { statusCode: 400, code: "SINGLE_REQUEST_ATTACHMENT_UNSUPPORTED" });
-                        }
-                    }
+                    );
 
                     let removedAttachments = [];
 
@@ -5522,29 +5536,10 @@ const MaterialRequests = {
                     const attachmentInstructions =
                         normalizeAttachmentInstructions(attachments);
 
-                    if (
-                        normalizedTicketType !==
-                            SINGLE_REQUEST_TICKET_TYPES.CREATE &&
+                    assertAttachmentsSupportedForTicketType(
+                        normalizedTicketType,
                         attachmentInstructions
-                    ) {
-                        const keepAttachmentIds = Array.isArray(
-                            attachmentInstructions.keepAttachmentIds
-                        )
-                            ? attachmentInstructions.keepAttachmentIds
-                            : [];
-                        const newAttachmentsRequested = Array.isArray(
-                            attachmentInstructions.newAttachments
-                        )
-                            ? attachmentInstructions.newAttachments
-                            : [];
-
-                        if (
-                            keepAttachmentIds.length > 0 ||
-                            newAttachmentsRequested.length > 0
-                        ) {
-                            throw Object.assign(new Error(`${normalizedTicketType} requests do not support attachments`), { statusCode: 400, code: "SINGLE_REQUEST_ATTACHMENT_UNSUPPORTED" });
-                        }
-                    }
+                    );
 
                     let removedAttachments = [];
 
@@ -6098,28 +6093,10 @@ const MaterialRequests = {
                         snapshot.ticket_type
                     );
 
-                    if (
-                        ticketType !== SINGLE_REQUEST_TICKET_TYPES.CREATE &&
+                    assertAttachmentsSupportedForTicketType(
+                        ticketType,
                         attachmentInstructions
-                    ) {
-                        const keepAttachmentIds = Array.isArray(
-                            attachmentInstructions.keepAttachmentIds
-                        )
-                            ? attachmentInstructions.keepAttachmentIds
-                            : [];
-                        const newAttachments = Array.isArray(
-                            attachmentInstructions.newAttachments
-                        )
-                            ? attachmentInstructions.newAttachments
-                            : [];
-
-                        if (
-                            keepAttachmentIds.length > 0 ||
-                            newAttachments.length > 0
-                        ) {
-                            throw Object.assign(new Error(`${ticketType} requests do not support attachments`), { statusCode: 400, code: "SINGLE_REQUEST_ATTACHMENT_UNSUPPORTED" });
-                        }
-                    }
+                    );
 
                     if (ticketType === SINGLE_REQUEST_TICKET_TYPES.EXTEND) {
                         const nextPlantCode = String(
