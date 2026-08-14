@@ -20,6 +20,116 @@ const isValidUserPreferenceKey = key =>
     typeof key === "string" && USER_PREFERENCE_KEY_PATTERN.test(key);
 const MAX_USER_PREFERENCE_VALUE_LENGTH = 255;
 
+// Reviewer attachment changes (approve/rework on both approval dialogs): same
+// type/size limit as the requester's own upload — one definition of what may
+// be attached, applied to whoever is attaching. See saveSingleRequestRework
+// above for the prior art this mirrors.
+const ATTACHMENT_ALLOWED_EXTENSIONS = [
+    "pdf",
+    "doc",
+    "docx",
+    "png",
+    "jpg",
+    "jpeg",
+];
+const ATTACHMENT_MAX_FILE_SIZE = 5 * 1024 * 1024;
+
+const isMultipartFormRequest = req =>
+    String(req.headers?.["content-type"] || "").includes(
+        "multipart/form-data"
+    );
+
+const buildUploadedAttachment = file => {
+    const originalFilename = file.originalFilename || file.newFilename;
+    const { extension, safeOriginalName, safeBaseName } =
+        sanitizeUploadName(originalFilename);
+
+    if (!ATTACHMENT_ALLOWED_EXTENSIONS.includes(extension)) {
+        const error = new Error(
+            "Invalid file format. Please upload files with valid extensions: " +
+                ATTACHMENT_ALLOWED_EXTENSIONS.join(", ")
+        );
+        error.statusCode = 400;
+        throw error;
+    }
+
+    return {
+        tempPath: file.filepath,
+        originalName: safeOriginalName,
+        newName: `${Date.now()}_${safeBaseName}.${extension}`,
+        extension,
+        mimeType: getMimeType(extension),
+    };
+};
+
+const parseKeepAttachmentIds = value =>
+    Array.isArray(value)
+        ? value.map(id => Number.parseInt(id, 10)).filter(Number.isInteger)
+        : [];
+
+// Merges a mass approve/rework request's optional `items` JSON field with its
+// per-file `attachmentItemId` mapping into the `{ id, attachments }[]` shape
+// the service layer expects. An item attaches against a specific item (a mass
+// attachment belongs to the item, not the batch), so each uploaded file is
+// tagged with the item id it targets via a parallel `attachmentItemId` field,
+// the same convention createMassRequest already uses (there: `fileRowIndex`).
+// Shared by both the approve and rework multipart branches so the wiring is
+// defined once.
+const buildMassRequestItemsWithAttachments = (fields, files) => {
+    const items = fields.items ? JSON.parse(fields.items) : [];
+    const attachmentItemIds = Array.isArray(fields.attachmentItemId)
+        ? fields.attachmentItemId
+        : fields.attachmentItemId != null
+          ? [fields.attachmentItemId]
+          : [];
+
+    const newAttachmentsByItemId = new Map();
+    for (let i = 0; i < files.length; i += 1) {
+        const itemId = attachmentItemIds[i];
+        if (itemId == null) {
+            const error = new Error(
+                "Invalid attachment upload. Each file must be linked to an item id."
+            );
+            error.statusCode = 400;
+            throw error;
+        }
+        const key = String(itemId);
+        if (!newAttachmentsByItemId.has(key)) {
+            newAttachmentsByItemId.set(key, []);
+        }
+        newAttachmentsByItemId.get(key).push(buildUploadedAttachment(files[i]));
+    }
+
+    const itemIds = new Set([
+        ...items.map(item => String(item.id)),
+        ...newAttachmentsByItemId.keys(),
+    ]);
+
+    return Array.from(itemIds).map(idKey => {
+        const original = items.find(item => String(item.id) === idKey) || {
+            id: idKey,
+        };
+        const newAttachments = newAttachmentsByItemId.get(idKey) || [];
+        const hasAttachmentChange =
+            Boolean(original.attachments) || newAttachments.length > 0;
+
+        if (!hasAttachmentChange) {
+            return original;
+        }
+
+        return {
+            ...original,
+            id: original.id ?? idKey,
+            attachments: {
+                keepAttachmentIds: parseKeepAttachmentIds(
+                    original.attachments?.keepAttachmentIds
+                ),
+                newAttachments,
+            },
+        };
+    });
+};
+
 const MaterialController = {
     // Create a new material group
     createMaterialGroup: async (req, res) => {
@@ -2041,17 +2151,46 @@ const MaterialController = {
     },
 
     approveMassRequest: async (req, res) => {
+        let tempFilePaths = [];
+
         try {
-            const result = await materialService.approveMassRequest({
-                massRequestId: req.params.id,
-                actorUserId: req.cookies.user_id,
-                actorUsername: req.cookies.username,
-                remark: req.body?.remark ?? null,
-                items: req.body?.items ?? null,
-                // One running number per item, keyed by item_id, entered one
-                // by one. Required at the Master Data step.
-                finalCodeSuffixes: req.body?.finalCodeSuffixes ?? null,
-            });
+            let result;
+
+            if (isMultipartFormRequest(req)) {
+                const form = new formidable.IncomingForm();
+                form.options.multiples = true;
+                form.options.maxFileSize = ATTACHMENT_MAX_FILE_SIZE;
+
+                const [fields, filesResult] = await form.parse(req);
+                const files = filesResult.files
+                    ? filesResult.files.filter(Boolean)
+                    : [];
+                tempFilePaths = files.map(file => file.filepath).filter(Boolean);
+
+                result = await materialService.approveMassRequest({
+                    massRequestId: req.params.id,
+                    actorUserId: req.cookies.user_id,
+                    actorUsername: req.cookies.username,
+                    remark: fields.remark
+                        ? String(fields.remark).trim() || null
+                        : null,
+                    items: buildMassRequestItemsWithAttachments(fields, files),
+                    finalCodeSuffixes: fields.finalCodeSuffixes
+                        ? JSON.parse(fields.finalCodeSuffixes)
+                        : null,
+                });
+            } else {
+                result = await materialService.approveMassRequest({
+                    massRequestId: req.params.id,
+                    actorUserId: req.cookies.user_id,
+                    actorUsername: req.cookies.username,
+                    remark: req.body?.remark ?? null,
+                    items: req.body?.items ?? null,
+                    // One running number per item, keyed by item_id, entered one
+                    // by one. Required at the Master Data step.
+                    finalCodeSuffixes: req.body?.finalCodeSuffixes ?? null,
+                });
+            }
 
             return res.status(200).json({
                 success: true,
@@ -2081,28 +2220,80 @@ const MaterialController = {
                 message: "Failed to approve mass request",
                 error: error.message,
             });
+        } finally {
+            for (const filepath of tempFilePaths) {
+                if (!filepath) {
+                    continue;
+                }
+
+                try {
+                    if (fs.existsSync(filepath)) {
+                        fs.unlinkSync(filepath);
+                    }
+                } catch (error) {
+                    console.error("Failed to clean up temp upload:", error);
+                }
+            }
         }
     },
 
     requestMassRequestRework: async (req, res) => {
+        let tempFilePaths = [];
+
         try {
-            const result = await materialService.requestMassRequestRework({
-                massRequestId: req.params.id,
-                actorUserId: req.cookies.user_id,
-                actorUsername: req.cookies.username,
-                reason: req.body?.reason ?? null,
-                // Optional replacement approver chain (ordered user_ids) and
-                // notification channel; the service validates both. Accepts
-                // `newApprovers` (preferred) or the `newApproverIds` alias.
-                // No `reworkToLevel` here — mass rework has no rewind mode.
-                newApprovers:
-                    req.body?.newApprovers ?? req.body?.newApproverIds ?? null,
-                notifyVia: req.body?.notifyVia ?? null,
-                // Mail content, editable by Master Data; required (and
-                // validated) by the service only on the EMAIL channel.
-                emailSubject: req.body?.emailSubject ?? null,
-                emailBody: req.body?.emailBody ?? null,
-            });
+            let result;
+
+            if (isMultipartFormRequest(req)) {
+                const form = new formidable.IncomingForm();
+                form.options.multiples = true;
+                form.options.maxFileSize = ATTACHMENT_MAX_FILE_SIZE;
+
+                const [fields, filesResult] = await form.parse(req);
+                const files = filesResult.files
+                    ? filesResult.files.filter(Boolean)
+                    : [];
+                tempFilePaths = files.map(file => file.filepath).filter(Boolean);
+
+                result = await materialService.requestMassRequestRework({
+                    massRequestId: req.params.id,
+                    actorUserId: req.cookies.user_id,
+                    actorUsername: req.cookies.username,
+                    reason: fields.reason
+                        ? String(fields.reason).trim() || null
+                        : null,
+                    newApprovers: fields.newApprovers
+                        ? JSON.parse(fields.newApprovers)
+                        : null,
+                    notifyVia: fields.notifyVia
+                        ? String(fields.notifyVia).trim() || null
+                        : null,
+                    emailSubject: fields.emailSubject
+                        ? String(fields.emailSubject)
+                        : null,
+                    emailBody: fields.emailBody
+                        ? String(fields.emailBody)
+                        : null,
+                    items: buildMassRequestItemsWithAttachments(fields, files),
+                });
+            } else {
+                result = await materialService.requestMassRequestRework({
+                    massRequestId: req.params.id,
+                    actorUserId: req.cookies.user_id,
+                    actorUsername: req.cookies.username,
+                    reason: req.body?.reason ?? null,
+                    // Optional replacement approver chain (ordered user_ids) and
+                    // notification channel; the service validates both. Accepts
+                    // `newApprovers` (preferred) or the `newApproverIds` alias.
+                    // No `reworkToLevel` here — mass rework has no rewind mode.
+                    newApprovers:
+                        req.body?.newApprovers ?? req.body?.newApproverIds ?? null,
+                    notifyVia: req.body?.notifyVia ?? null,
+                    // Mail content, editable by Master Data; required (and
+                    // validated) by the service only on the EMAIL channel.
+                    emailSubject: req.body?.emailSubject ?? null,
+                    emailBody: req.body?.emailBody ?? null,
+                });
+            }
 
             return res.status(200).json({
                 success: true,
@@ -2126,6 +2317,20 @@ const MaterialController = {
             }
 
             return res.status(statusCode).json(payload);
+        } finally {
+            for (const filepath of tempFilePaths) {
+                if (!filepath) {
+                    continue;
+                }
+
+                try {
+                    if (fs.existsSync(filepath)) {
+                        fs.unlinkSync(filepath);
+                    }
+                } catch (error) {
+                    console.error("Failed to clean up temp upload:", error);
+                }
+            }
         }
     },
 
@@ -2423,25 +2628,74 @@ const MaterialController = {
     },
 
     requestSingleRequestRework: async (req, res) => {
+        let tempFilePaths = [];
+
         try {
-            const result = await materialService.requestSingleRequestRework({
-                requestId: req.params.id,
-                actorUserId: req.cookies.user_id,
-                actorUsername: req.cookies.username,
-                reason: req.body?.reason ?? null,
-                // Optional rewind target; the service validates the level.
-                reworkToLevel: req.body?.reworkToLevel ?? null,
-                // Optional replacement approver chain (ordered user_ids) and
-                // notification channel; the service validates both. Accepts
-                // `newApprovers` (preferred) or the `newApproverIds` alias.
-                newApprovers:
-                    req.body?.newApprovers ?? req.body?.newApproverIds ?? null,
-                notifyVia: req.body?.notifyVia ?? null,
-                // Mail content, editable by Master Data; required (and
-                // validated) by the service only on the EMAIL channel.
-                emailSubject: req.body?.emailSubject ?? null,
-                emailBody: req.body?.emailBody ?? null,
-            });
+            let result;
+
+            if (isMultipartFormRequest(req)) {
+                const form = new formidable.IncomingForm();
+                form.options.multiples = true;
+                form.options.maxFileSize = ATTACHMENT_MAX_FILE_SIZE;
+
+                const [fields, filesResult] = await form.parse(req);
+                const attachmentInstructions = fields.attachments
+                    ? JSON.parse(fields.attachments)
+                    : {};
+                const files = filesResult.files
+                    ? filesResult.files.filter(Boolean)
+                    : [];
+                tempFilePaths = files.map(file => file.filepath).filter(Boolean);
+
+                result = await materialService.requestSingleRequestRework({
+                    requestId: req.params.id,
+                    actorUserId: req.cookies.user_id,
+                    actorUsername: req.cookies.username,
+                    reason: fields.reason
+                        ? String(fields.reason).trim() || null
+                        : null,
+                    reworkToLevel: fields.reworkToLevel
+                        ? String(fields.reworkToLevel).trim() || null
+                        : null,
+                    newApprovers: fields.newApprovers
+                        ? JSON.parse(fields.newApprovers)
+                        : null,
+                    notifyVia: fields.notifyVia
+                        ? String(fields.notifyVia).trim() || null
+                        : null,
+                    emailSubject: fields.emailSubject
+                        ? String(fields.emailSubject)
+                        : null,
+                    emailBody: fields.emailBody
+                        ? String(fields.emailBody)
+                        : null,
+                    attachments: {
+                        keepAttachmentIds: parseKeepAttachmentIds(
+                            attachmentInstructions.keepAttachmentIds
+                        ),
+                        newAttachments: files.map(buildUploadedAttachment),
+                    },
+                });
+            } else {
+                result = await materialService.requestSingleRequestRework({
+                    requestId: req.params.id,
+                    actorUserId: req.cookies.user_id,
+                    actorUsername: req.cookies.username,
+                    reason: req.body?.reason ?? null,
+                    // Optional rewind target; the service validates the level.
+                    reworkToLevel: req.body?.reworkToLevel ?? null,
+                    // Optional replacement approver chain (ordered user_ids) and
+                    // notification channel; the service validates both. Accepts
+                    // `newApprovers` (preferred) or the `newApproverIds` alias.
+                    newApprovers:
+                        req.body?.newApprovers ?? req.body?.newApproverIds ?? null,
+                    notifyVia: req.body?.notifyVia ?? null,
+                    // Mail content, editable by Master Data; required (and
+                    // validated) by the service only on the EMAIL channel.
+                    emailSubject: req.body?.emailSubject ?? null,
+                    emailBody: req.body?.emailBody ?? null,
+                });
+            }
 
             return res.status(200).json({
                 success: true,
@@ -2465,6 +2719,20 @@ const MaterialController = {
             }
 
             return res.status(statusCode).json(payload);
+        } finally {
+            for (const filepath of tempFilePaths) {
+                if (!filepath) {
+                    continue;
+                }
+
+                try {
+                    if (fs.existsSync(filepath)) {
+                        fs.unlinkSync(filepath);
+                    }
+                } catch (error) {
+                    console.error("Failed to clean up temp upload:", error);
+                }
+            }
         }
     },
 
@@ -2817,15 +3085,58 @@ const MaterialController = {
     },
 
     approveSingleRequest: async (req, res) => {
+        let tempFilePaths = [];
+
         try {
-            const result = await materialService.approveSingleRequestByAdmin({
-                requestId: req.params.id,
-                actorUserId: req.cookies.user_id,
-                actorUsername: req.cookies.username,
-                remark: req.body?.remark ?? null,
-                editedRequest: req.body?.editedRequest ?? null,
-                finalCodeSuffix: req.body?.finalCodeSuffix ?? null,
-            });
+            let result;
+
+            if (isMultipartFormRequest(req)) {
+                // Multipart only when the reviewer actually staged an
+                // attachment change; a plain JSON approve (no files touched)
+                // keeps using the branch below unchanged.
+                const form = new formidable.IncomingForm();
+                form.options.multiples = true;
+                form.options.maxFileSize = ATTACHMENT_MAX_FILE_SIZE;
+
+                const [fields, filesResult] = await form.parse(req);
+                const attachmentInstructions = fields.attachments
+                    ? JSON.parse(fields.attachments)
+                    : {};
+                const files = filesResult.files
+                    ? filesResult.files.filter(Boolean)
+                    : [];
+                tempFilePaths = files.map(file => file.filepath).filter(Boolean);
+
+                result = await materialService.approveSingleRequestByAdmin({
+                    requestId: req.params.id,
+                    actorUserId: req.cookies.user_id,
+                    actorUsername: req.cookies.username,
+                    remark: fields.remark
+                        ? String(fields.remark).trim() || null
+                        : null,
+                    editedRequest: fields.editedRequest
+                        ? JSON.parse(fields.editedRequest)
+                        : null,
+                    finalCodeSuffix: fields.finalCodeSuffix
+                        ? String(fields.finalCodeSuffix).trim() || null
+                        : null,
+                    attachments: {
+                        keepAttachmentIds: parseKeepAttachmentIds(
+                            attachmentInstructions.keepAttachmentIds
+                        ),
+                        newAttachments: files.map(buildUploadedAttachment),
+                    },
+                });
+            } else {
+                result = await materialService.approveSingleRequestByAdmin({
+                    requestId: req.params.id,
+                    actorUserId: req.cookies.user_id,
+                    actorUsername: req.cookies.username,
+                    remark: req.body?.remark ?? null,
+                    editedRequest: req.body?.editedRequest ?? null,
+                    finalCodeSuffix: req.body?.finalCodeSuffix ?? null,
+                });
+            }
 
             return res.status(200).json({
                 success: true,
@@ -2855,6 +3166,20 @@ const MaterialController = {
                 message: "Failed to approve single request",
                 error: error.message,
             });
+        } finally {
+            for (const filepath of tempFilePaths) {
+                if (!filepath) {
+                    continue;
+                }
+
+                try {
+                    if (fs.existsSync(filepath)) {
+                        fs.unlinkSync(filepath);
+                    }
+                } catch (error) {
+                    console.error("Failed to clean up temp upload:", error);
+                }
+            }
         }
     },
 
