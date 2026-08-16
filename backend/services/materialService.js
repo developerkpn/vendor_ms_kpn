@@ -239,7 +239,16 @@ const hasActorApprovedEarlierStep = (steps = [], activeStep, actorUserId) =>
             matchesActorUserId(step.approver_user_id, actorUserId)
     );
 
-const assertRequiredActionReason = (reason, actionLabel = "action") => {
+// fieldKey names the input the client should attach the message to. It
+// defaults to "reason" because every rework and reject path calls that input
+// a reason; the resubmit paths pass "comment", which is what their input is
+// actually called. A key naming no input on the page means the client renders
+// nothing and the requester is told only that something failed.
+const assertRequiredActionReason = (
+    reason,
+    actionLabel = "action",
+    fieldKey = "reason"
+) => {
     if (!String(reason || "").trim()) {
         const error = new Error(`${actionLabel} reason is required`);
         error.statusCode = 400;
@@ -248,7 +257,7 @@ const assertRequiredActionReason = (reason, actionLabel = "action") => {
             .toUpperCase()}_REASON_REQUIRED`;
         error.errors = [
             {
-                fieldKey: "reason",
+                fieldKey,
                 message: `${actionLabel} reason is required`,
             },
         ];
@@ -5514,7 +5523,8 @@ const MaterialRequests = {
                     // same as every rework/reject reason.
                     const safeComment = assertRequiredActionReason(
                         comment,
-                        "resubmit"
+                        "resubmit",
+                        "comment"
                     );
 
                     // Lazy require avoids a module-load cycle (MaterialTemplateModel
@@ -7230,7 +7240,8 @@ const MaterialRequests = {
                     // on request size.
                     const safeComment = assertRequiredActionReason(
                         comment,
-                        "resubmit"
+                        "resubmit",
+                        "comment"
                     );
 
                     // Step model: the reworked stage is the step currently in
