@@ -20,10 +20,13 @@ const isValidUserPreferenceKey = key =>
     typeof key === "string" && USER_PREFERENCE_KEY_PATTERN.test(key);
 const MAX_USER_PREFERENCE_VALUE_LENGTH = 255;
 
-// Reviewer attachment changes (approve/rework on both approval dialogs): same
-// type/size limit as the requester's own upload — one definition of what may
-// be attached, applied to whoever is attaching. See saveSingleRequestRework
-// above for the prior art this mirrors.
+// Reviewer attachment changes (approve/rework on both approval dialogs). The
+// values match the ones the requester's own upload paths enforce inline, so a
+// reviewer may attach exactly what a requester may — deliberately no separate
+// rule for reviewers. They are named here rather than repeated inline because
+// four reviewer entry points share them; the requester paths still carry their
+// own copies, so a change to what may be attached has to be made in both
+// places until those are folded in too.
 const ATTACHMENT_ALLOWED_EXTENSIONS = [
     "pdf",
     "doc",
@@ -62,30 +65,62 @@ const buildUploadedAttachment = file => {
     };
 };
 
+// An absent or malformed keep list means "no instruction given", which
+// resolveAttachmentChangeSet reads as keep everything. Returning [] instead
+// would read as "keep none" and delete every existing attachment — the
+// requester's resubmit path has always passed the raw value for exactly this
+// reason, and the reviewer paths must not diverge from it.
 const parseKeepAttachmentIds = value =>
     Array.isArray(value)
         ? value.map(id => Number.parseInt(id, 10)).filter(Number.isInteger)
-        : [];
+        : null;
 
-// Merges a mass approve/rework request's optional `items` JSON field with its
-// per-file `attachmentItemId` mapping into the `{ id, attachments }[]` shape
-// the service layer expects. An item attaches against a specific item (a mass
-// attachment belongs to the item, not the batch), so each uploaded file is
-// tagged with the item id it targets via a parallel `attachmentItemId` field,
-// the same convention createMassRequest already uses (there: `fileRowIndex`).
-// Shared by both the approve and rework multipart branches so the wiring is
-// defined once.
+// Merges the three parts of a mass approve/rework multipart body into the
+// `{ id, attachments }[]` shape the service layer expects:
+//
+//   items            JSON, the per-item FIELD EDITS the reviewer made
+//   itemAttachments  JSON, [{ id, keepAttachmentIds }] — which existing files
+//                    each item keeps; anything absent from the list is removed
+//   fileItemId       one per uploaded file, naming the item that file lands on
+//
+// Edits and attachment changes travel separately because they are independent:
+// a reviewer can edit an item without touching its files, or the reverse. An
+// item that appears in either list ends up in the result; one that appears in
+// neither is untouched.
+//
+// Files are paired with items positionally — fileItemId[i] belongs to files[i]
+// — which is the convention createMassRequest already uses (there:
+// `fileRowIndex`). Shared by both the approve and rework multipart branches so
+// the wiring is defined once.
+// A JSON body carries no files, so it has no legitimate way to describe an
+// attachment change — only the multipart branch does. Dropping `attachments`
+// here means a hand-written JSON body cannot reach the attachment code at all,
+// rather than relying on the service to reject each way it might be abused.
+const stripAttachmentInstructions = items =>
+    Array.isArray(items)
+        ? items.map(item => {
+              if (!item || typeof item !== "object" || !("attachments" in item)) {
+                  return item;
+              }
+              const { attachments: _ignored, ...rest } = item;
+              return rest;
+          })
+        : items;
+
 const buildMassRequestItemsWithAttachments = (fields, files) => {
     const items = fields.items ? JSON.parse(fields.items) : [];
-    const attachmentItemIds = Array.isArray(fields.attachmentItemId)
-        ? fields.attachmentItemId
-        : fields.attachmentItemId != null
-          ? [fields.attachmentItemId]
+    const itemAttachments = fields.itemAttachments
+        ? JSON.parse(fields.itemAttachments)
+        : [];
+    const fileItemIds = Array.isArray(fields.fileItemId)
+        ? fields.fileItemId
+        : fields.fileItemId != null
+          ? [fields.fileItemId]
           : [];
 
     const newAttachmentsByItemId = new Map();
     for (let i = 0; i < files.length; i += 1) {
-        const itemId = attachmentItemIds[i];
+        const itemId = fileItemIds[i];
         if (itemId == null) {
             const error = new Error(
                 "Invalid attachment upload. Each file must be linked to an item id."
@@ -100,8 +135,18 @@ const buildMassRequestItemsWithAttachments = (fields, files) => {
         newAttachmentsByItemId.get(key).push(buildUploadedAttachment(files[i]));
     }
 
+    const keepIdsByItemId = new Map(
+        (Array.isArray(itemAttachments) ? itemAttachments : [])
+            .filter(entry => entry?.id != null)
+            .map(entry => [
+                String(entry.id),
+                parseKeepAttachmentIds(entry.keepAttachmentIds),
+            ])
+    );
+
     const itemIds = new Set([
         ...items.map(item => String(item.id)),
+        ...keepIdsByItemId.keys(),
         ...newAttachmentsByItemId.keys(),
     ]);
 
@@ -111,7 +156,7 @@ const buildMassRequestItemsWithAttachments = (fields, files) => {
         };
         const newAttachments = newAttachmentsByItemId.get(idKey) || [];
         const hasAttachmentChange =
-            Boolean(original.attachments) || newAttachments.length > 0;
+            keepIdsByItemId.has(idKey) || newAttachments.length > 0;
 
         if (!hasAttachmentChange) {
             return original;
@@ -121,9 +166,7 @@ const buildMassRequestItemsWithAttachments = (fields, files) => {
             ...original,
             id: original.id ?? idKey,
             attachments: {
-                keepAttachmentIds: parseKeepAttachmentIds(
-                    original.attachments?.keepAttachmentIds
-                ),
+                keepAttachmentIds: keepIdsByItemId.get(idKey) ?? null,
                 newAttachments,
             },
         };
@@ -2185,7 +2228,9 @@ const MaterialController = {
                     actorUserId: req.cookies.user_id,
                     actorUsername: req.cookies.username,
                     remark: req.body?.remark ?? null,
-                    items: req.body?.items ?? null,
+                    items: stripAttachmentInstructions(
+                        req.body?.items ?? null
+                    ),
                     // One running number per item, keyed by item_id, entered one
                     // by one. Required at the Master Data step.
                     finalCodeSuffixes: req.body?.finalCodeSuffixes ?? null,

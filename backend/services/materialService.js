@@ -8,6 +8,7 @@
 // module dissolves the lazy circular require they used to need.
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const pool = require("../config/connection");
 const DBClientWrapper = require("../helper/DBClientWrapper.js");
@@ -1233,12 +1234,17 @@ const REQUEST_COMMENT_KINDS = Object.freeze({
     MASS: "MASS",
 });
 
+// CORRESPONDENCE is the email-only rework channel: a message went out, the
+// request did not move. It exists because a reviewer can change attachments on
+// that channel and a removal still needs an audit line — REWORK would tell
+// every later reader the request was reworked when nothing was.
 const REQUEST_COMMENT_EVENTS = Object.freeze({
     SUBMIT: "SUBMIT",
     RESUBMIT: "RESUBMIT",
     APPROVE: "APPROVE",
     REWORK: "REWORK",
     REJECT: "REJECT",
+    CORRESPONDENCE: "CORRESPONDENCE",
 });
 
 // A comment with nothing in it is stored as NULL, never "": a Create request has
@@ -2212,7 +2218,7 @@ const applyMassItemFinalCodes = async (client, { massRequestId, plan = [] }) => 
 
 const getSingleRequestAttachments = async (client, requestId) => {
     const result = await client.query(
-        `SELECT id, file_name, file_path, file_type
+        `SELECT id, file_name, file_path, file_type, uploaded_by
          FROM mat_single_request_attachment
          WHERE request_id = $1
          ORDER BY id`,
@@ -2227,7 +2233,8 @@ const insertSingleRequestAttachment = async (
     requestId,
     requestNo,
     attachment,
-    createdAt = new Date()
+    createdAt = new Date(),
+    uploadedBy = null
 ) => {
     const newName =
         attachment.new_name ??
@@ -2247,8 +2254,9 @@ const insertSingleRequestAttachment = async (
             file_name,
             file_path,
             file_type,
+            uploaded_by,
             created_at
-        ) VALUES ($1, $2, $3, $4, NOW())`,
+        ) VALUES ($1, $2, $3, $4, $5, NOW())`,
         [
             requestId,
             attachment.file_name ??
@@ -2260,6 +2268,7 @@ const insertSingleRequestAttachment = async (
                 attachment.mimeType ??
                 attachment.type ??
             null,
+            uploadedBy,
         ]
     );
 };
@@ -2360,6 +2369,42 @@ const assertAttachmentsSupportedForTicketType = (
 // shared by the requester's resubmit path and every reviewer action that also
 // carries attachment changes (approve, rework) — no attachment-count rule is
 // ever written twice.
+// A new attachment is always a file THIS request just uploaded, and the
+// multipart parser writes those into the OS temp directory. A tempPath that
+// resolves anywhere else did not come from an upload — it came from a JSON
+// body — and reading it would copy an arbitrary server-readable file into the
+// public attachment directory and serve it. Checked before any read, on every
+// path that accepts attachment instructions.
+const assertUploadsCameFromThisRequest = attachments => {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+        return;
+    }
+
+    const uploadRoot = path.resolve(os.tmpdir());
+    const invalidUpload = () =>
+        Object.assign(new Error("Invalid attachment upload"), {
+            statusCode: 400,
+            code: "ATTACHMENT_INVALID_UPLOAD",
+        });
+
+    for (const attachment of attachments) {
+        const tempPath = attachment?.tempPath;
+
+        if (typeof tempPath !== "string" || tempPath === "") {
+            throw invalidUpload();
+        }
+
+        const resolved = path.resolve(tempPath);
+
+        if (
+            resolved !== uploadRoot &&
+            !resolved.startsWith(uploadRoot + path.sep)
+        ) {
+            throw invalidUpload();
+        }
+    }
+};
+
 const resolveAttachmentChangeSet = ({
     existingAttachments = [],
     attachmentInstructions,
@@ -2458,7 +2503,14 @@ const normalizeAttachmentInstructions = attachments => {
 // AFTER commit succeeds (a rollback must leave the files on disk untouched).
 const applySingleRequestAttachmentChange = async (
     client,
-    { requestId, removedAttachments, newAttachments, requestNo, createdAt }
+    {
+        requestId,
+        removedAttachments,
+        newAttachments,
+        requestNo,
+        createdAt,
+        uploadedBy = null,
+    }
 ) => {
     if (removedAttachments.length > 0) {
         const removedAttachmentIds = removedAttachments.map(
@@ -2478,25 +2530,30 @@ const applySingleRequestAttachmentChange = async (
             requestId,
             requestNo,
             attachment,
-            createdAt
+            createdAt,
+            uploadedBy
         );
     }
 };
 
 // --- Mass-request attachment helpers (mat_mass_request_attachment) --------
 // Same shape as the single-request helpers above, keyed by item_id instead of
-// request_id: on a mass request the attachment belongs to the item, not the
-// batch (see the "Mass requests" note in the approver-attachments spec).
+// request_id: on a mass request the attachment row belongs to the item, not
+// the batch.
 
 const MASS_REQUEST_MAX_ATTACHMENTS_PER_ITEM = 3;
 
-const getMassRequestItemAttachments = async (client, itemId) => {
+// Scoped by the batch as well as the item. item_id alone would let a reviewer
+// acting on one batch read and delete attachments belonging to another batch's
+// items, since item ids are global and only the join says which batch owns one.
+const getMassRequestItemAttachments = async (client, massRequestId, itemId) => {
     const result = await client.query(
-        `SELECT id, file_name, file_path, file_type
-         FROM mat_mass_request_attachment
-         WHERE item_id = $1
-         ORDER BY id`,
-        [itemId]
+        `SELECT a.id, a.file_name, a.file_path, a.file_type, a.uploaded_by
+         FROM mat_mass_request_attachment a
+         JOIN mat_mass_request_item i ON i.id = a.item_id
+         WHERE a.item_id = $1 AND i.mass_request_id = $2
+         ORDER BY a.id`,
+        [itemId, massRequestId]
     );
 
     return result.rows;
@@ -2507,7 +2564,8 @@ const insertMassRequestAttachment = async (
     itemId,
     itemRequestNo,
     attachment,
-    createdAt = new Date()
+    createdAt = new Date(),
+    uploadedBy = null
 ) => {
     const newName =
         attachment.new_name ??
@@ -2527,8 +2585,9 @@ const insertMassRequestAttachment = async (
             file_name,
             file_path,
             file_type,
+            uploaded_by,
             created_at
-        ) VALUES ($1, $2, $3, $4, NOW())`,
+        ) VALUES ($1, $2, $3, $4, $5, NOW())`,
         [
             itemId,
             attachment.file_name ??
@@ -2540,6 +2599,7 @@ const insertMassRequestAttachment = async (
                 attachment.mimeType ??
                 attachment.type ??
                 null,
+            uploadedBy,
         ]
     );
 };
@@ -2582,17 +2642,32 @@ const persistMassRequestAttachmentFiles = (
 
 const applyMassRequestAttachmentChange = async (
     client,
-    { itemId, removedAttachments, newAttachments, itemRequestNo, createdAt }
+    {
+        massRequestId,
+        itemId,
+        removedAttachments,
+        newAttachments,
+        itemRequestNo,
+        createdAt,
+        uploadedBy = null,
+    }
 ) => {
     if (removedAttachments.length > 0) {
         const removedAttachmentIds = removedAttachments.map(
             attachment => attachment.id
         );
 
+        // The batch is in the WHERE clause, not just the item: the ids being
+        // deleted arrived in a request body, so the statement itself has to
+        // prove they belong to the batch under approval.
         await client.query(
-            `DELETE FROM mat_mass_request_attachment
-             WHERE item_id = $1 AND id = ANY($2)`,
-            [itemId, removedAttachmentIds]
+            `DELETE FROM mat_mass_request_attachment a
+             USING mat_mass_request_item i
+             WHERE a.item_id = i.id
+               AND a.item_id = $1
+               AND i.mass_request_id = $2
+               AND a.id = ANY($3)`,
+            [itemId, massRequestId, removedAttachmentIds]
         );
     }
 
@@ -2602,7 +2677,8 @@ const applyMassRequestAttachmentChange = async (
             itemId,
             itemRequestNo,
             attachment,
-            createdAt
+            createdAt,
+            uploadedBy
         );
     }
 };
@@ -2614,7 +2690,7 @@ const applyMassRequestAttachmentChange = async (
 // `attachments` is left untouched.
 const applyMassRequestItemAttachmentChanges = async (
     client,
-    { massRequestId, items }
+    { massRequestId, items, uploadedBy = null }
 ) => {
     const savedFiles = [];
     const removedFilePaths = [];
@@ -2637,8 +2713,35 @@ const applyMassRequestItemAttachmentChanges = async (
             continue;
         }
 
+        assertUploadsCameFromThisRequest(attachmentInstructions.newAttachments);
+
+        // Ownership is established BEFORE anything is read or written. The item
+        // id arrived in a request body and only this row proves it belongs to
+        // the batch being approved; an id from another batch is refused rather
+        // than acted on.
+        const itemRequestNoResult = await client.query(
+            `SELECT request_no
+             FROM mat_mass_request_item
+             WHERE id = $1 AND mass_request_id = $2`,
+            [item.id, massRequestId]
+        );
+
+        if (itemRequestNoResult.rows.length === 0) {
+            throw Object.assign(
+                new Error("Item does not belong to this mass request"),
+                {
+                    statusCode: 400,
+                    code: "MASS_REQUEST_ITEM_NOT_IN_BATCH",
+                }
+            );
+        }
+
+        const itemRequestNo =
+            itemRequestNoResult.rows[0].request_no ?? item.id;
+
         const existingAttachments = await getMassRequestItemAttachments(
             client,
+            massRequestId,
             item.id
         );
         const resolvedChange = resolveAttachmentChangeSet({
@@ -2647,22 +2750,16 @@ const applyMassRequestItemAttachmentChanges = async (
             maxAttachments: MASS_REQUEST_MAX_ATTACHMENTS_PER_ITEM,
             limitErrorCode: "MASS_REQUEST_ATTACHMENT_LIMIT_EXCEEDED",
         });
-        const itemRequestNoResult = await client.query(
-            `SELECT request_no
-             FROM mat_mass_request_item
-             WHERE id = $1 AND mass_request_id = $2`,
-            [item.id, massRequestId]
-        );
-        const itemRequestNo =
-            itemRequestNoResult.rows[0]?.request_no ?? item.id;
         const attachmentCreatedAt = new Date();
 
         await applyMassRequestAttachmentChange(client, {
+            massRequestId,
             itemId: item.id,
             removedAttachments: resolvedChange.removedAttachments,
             newAttachments: resolvedChange.newAttachments,
             itemRequestNo,
             createdAt: attachmentCreatedAt,
+            uploadedBy,
         });
         removedFilePaths.push(
             ...resolvedChange.removedAttachments.map(
@@ -3366,7 +3463,8 @@ const buildSingleRequestSelectFields = ({
                                     'id', att.id,
                                     'file_name', att.file_name,
                                     'file_path', att.file_path,
-                                    'file_type', att.file_type
+                                    'file_type', att.file_type,
+                                    'uploaded_by', att.uploaded_by
                                 )
                                 ORDER BY att.id
                             ) FILTER (WHERE att.id IS NOT NULL),
@@ -3509,7 +3607,8 @@ const buildSingleRequestApprovalInboxQuery = ({
                                         'id', att.id,
                                         'file_name', att.file_name,
                                         'file_path', att.file_path,
-                                        'file_type', att.file_type
+                                        'file_type', att.file_type,
+                                        'uploaded_by', att.uploaded_by
                                     )
                                     ORDER BY att.id
                                 ) FILTER (WHERE att.id IS NOT NULL),
@@ -4452,6 +4551,9 @@ const MaterialRequests = {
                     const attachmentInstructions =
                         normalizeAttachmentInstructions(attachments);
 
+                    assertUploadsCameFromThisRequest(
+                        attachmentInstructions?.newAttachments
+                    );
                     assertAttachmentsSupportedForTicketType(
                         normalizedTicketType,
                         attachmentInstructions
@@ -4481,6 +4583,7 @@ const MaterialRequests = {
                             newAttachments: resolvedChange.newAttachments,
                             requestNo: snapshot.request_no,
                             createdAt: attachmentCreatedAt,
+                            uploadedBy: actorUsername ?? null,
                         });
                         removedFilePaths.push(
                             ...removedAttachments.map(
@@ -5536,6 +5639,9 @@ const MaterialRequests = {
                     const attachmentInstructions =
                         normalizeAttachmentInstructions(attachments);
 
+                    assertUploadsCameFromThisRequest(
+                        attachmentInstructions?.newAttachments
+                    );
                     assertAttachmentsSupportedForTicketType(
                         normalizedTicketType,
                         attachmentInstructions
@@ -5565,6 +5671,7 @@ const MaterialRequests = {
                             newAttachments: resolvedChange.newAttachments,
                             requestNo: snapshot.request_no,
                             createdAt: attachmentCreatedAt,
+                            uploadedBy: actorUsername ?? null,
                         });
                         removedFilePaths.push(
                             ...removedAttachments.map(
@@ -5629,7 +5736,8 @@ const MaterialRequests = {
                                 await insertRequestComment(client, {
                                     requestKind: REQUEST_COMMENT_KINDS.SINGLE,
                                     requestId,
-                                    eventType: REQUEST_COMMENT_EVENTS.REWORK,
+                                    eventType:
+                                        REQUEST_COMMENT_EVENTS.CORRESPONDENCE,
                                     stage: stepLabel(activeStep),
                                     actorUserId,
                                     comment: attachmentRemovalNote,
@@ -6093,6 +6201,9 @@ const MaterialRequests = {
                         snapshot.ticket_type
                     );
 
+                    assertUploadsCameFromThisRequest(
+                        attachmentInstructions?.newAttachments
+                    );
                     assertAttachmentsSupportedForTicketType(
                         ticketType,
                         attachmentInstructions
@@ -6220,6 +6331,7 @@ const MaterialRequests = {
                             newAttachments,
                             requestNo: snapshot.request_no,
                             createdAt: attachmentCreatedAt,
+                            uploadedBy: actorUsername ?? null,
                         });
                         removedFilePaths.push(
                             ...removedAttachments.map(
@@ -6590,12 +6702,10 @@ const MaterialRequests = {
                     }
 
                     // Staged per-item attachment changes, carried with the
-                    // approval into the same transaction. An attachment
-                    // belongs to the item, not the batch (see the "Mass
-                    // requests" note in the approver-attachments spec), so
-                    // each item's add/remove and count limit is resolved
-                    // independently — one item's attachments never consume
-                    // another's allowance.
+                    // approval into the same transaction. mat_mass_request_attachment
+                    // is keyed by item_id, so each item's add/remove and count
+                    // limit is resolved independently — one item's attachments
+                    // never consume another's allowance.
                     const {
                         savedFiles: attachmentSavedFiles,
                         removedFilePaths: attachmentRemovedFilePaths,
@@ -6603,6 +6713,7 @@ const MaterialRequests = {
                     } = await applyMassRequestItemAttachmentChanges(client, {
                         massRequestId,
                         items,
+                        uploadedBy: actorUsername ?? null,
                     });
                     savedFiles.push(...attachmentSavedFiles);
                     removedFilePaths.push(...attachmentRemovedFilePaths);
@@ -6886,6 +6997,7 @@ const MaterialRequests = {
                     } = await applyMassRequestItemAttachmentChanges(client, {
                         massRequestId,
                         items,
+                        uploadedBy: actorUsername ?? null,
                     });
                     savedFiles.push(...attachmentSavedFiles);
                     removedFilePaths.push(...attachmentRemovedFilePaths);
@@ -6929,7 +7041,8 @@ const MaterialRequests = {
                                 await insertRequestComment(client, {
                                     requestKind: REQUEST_COMMENT_KINDS.MASS,
                                     requestId: massRequestId,
-                                    eventType: REQUEST_COMMENT_EVENTS.REWORK,
+                                    eventType:
+                                        REQUEST_COMMENT_EVENTS.CORRESPONDENCE,
                                     stage: stepLabel(activeStep),
                                     actorUserId,
                                     comment: attachmentRemovalNote,
@@ -7483,7 +7596,11 @@ const MaterialRequests = {
                         i.sap_pushed_at,
                         i.sap_error_msg,
                         COALESCE(item_steps.approval_steps, '[]'::jsonb) AS approval_steps,
-                        item_steps.active_step
+                        item_steps.active_step,
+                        -- The reviewer dialog stages attachment changes against
+                        -- what the item already has, so it needs the existing
+                        -- rows, not just a count.
+                        COALESCE(item_attachments.attachments, '[]'::jsonb) AS attachments
                     FROM mat_mass_request_item i
                     LEFT JOIN LATERAL (
                         SELECT
@@ -7519,6 +7636,23 @@ const MaterialRequests = {
                         LEFT JOIN mst_user sau ON sau.user_id = s.approver_user_id
                         WHERE s.item_id = i.id
                     ) item_steps ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT COALESCE(
+                            jsonb_agg(
+                                jsonb_build_object(
+                                    'id', att.id,
+                                    'file_name', att.file_name,
+                                    'file_path', att.file_path,
+                                    'file_type', att.file_type,
+                                    'uploaded_by', att.uploaded_by
+                                )
+                                ORDER BY att.id
+                            ),
+                            '[]'::jsonb
+                        ) AS attachments
+                        FROM mat_mass_request_attachment att
+                        WHERE att.item_id = i.id
+                    ) item_attachments ON TRUE
                     WHERE i.mass_request_id = $1
                     ORDER BY i.item_no ASC`,
                     [massRequestId]
@@ -8078,6 +8212,7 @@ module.exports = {
     persistSingleRequestAttachmentFiles,
     deleteSingleRequestStoredFiles,
     resolveAttachmentChangeSet,
+    assertUploadsCameFromThisRequest,
     buildAttachmentRemovalNote,
     appendCommentNote,
     normalizeAttachmentInstructions,
