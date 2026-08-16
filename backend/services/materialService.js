@@ -5770,16 +5770,30 @@ const MaterialRequests = {
                         );
                     }
 
-                    // The requester answering a rework. Required regardless of
-                    // ticket type; the Change/Extend reason keeps its own
-                    // meaning on the request row and is not reused here — see
-                    // assertRequiredActionReason above for the gate.
+                    // The requester answering a rework. The comment is required
+                    // regardless of ticket type — see assertRequiredActionReason
+                    // above for the gate.
+                    //
+                    // A REWRITTEN Change/Extend reason is recorded alongside the
+                    // comment, not instead of it: the reason says why the change
+                    // is wanted, the comment says what the requester fixed. Only
+                    // a rewritten one is carried — an unchanged reason still
+                    // holds the text the submit event already recorded, and
+                    // repeating it on every revise would bury the thread.
+                    //
+                    // safeComment is trimmed and non-empty by the gate above, so
+                    // there is nothing to guard against on that side.
+                    const rewrittenChangeExtendReason =
+                        editablePatch.change_extend_reason ?? null;
+
                     await insertRequestComment(client, {
                         requestKind: REQUEST_COMMENT_KINDS.SINGLE,
                         requestId,
                         eventType: REQUEST_COMMENT_EVENTS.RESUBMIT,
                         actorUserId,
-                        comment: safeComment,
+                        comment: rewrittenChangeExtendReason
+                            ? `${safeComment}\n${rewrittenChangeExtendReason}`
+                            : safeComment,
                     });
                     await client.query("COMMIT");
                     deleteSingleRequestStoredFiles(removedFilePaths);
