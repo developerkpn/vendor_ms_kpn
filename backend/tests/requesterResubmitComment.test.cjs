@@ -255,6 +255,45 @@ test("saveSingleRequestRework (Change/Extend dialog) requires its own comment, i
     }
 });
 
+test("saveSingleRequestRework records a rewritten Change/Extend reason alongside the comment", async () => {
+    const originalConnect = db.connect;
+    const commentInserts = [];
+    db.connect = connectSingleReworkStub({
+        snapshot: baseSingleSnapshot({
+            ticket_type: "Extend",
+            change_extend_reason: "Need a new storage location",
+        }),
+        commentInserts,
+    });
+
+    try {
+        const result = await materialService.saveSingleRequestRework({
+            requestId: 810,
+            actorUserId: "REQ-01",
+            actorUsername: "requester.user",
+            editedRequest: {
+                change_extend_reason: "Need two storage locations, not one",
+            },
+            comment: "Storage location sudah saya perbaiki",
+        });
+
+        assert.equal(result.status, "Submit");
+        assert.equal(commentInserts.length, 1);
+        // Both are kept: the comment says what was fixed, the reason says why
+        // the change is wanted. One resubmit event carries the pair.
+        assert.deepEqual(commentInserts[0].params, [
+            "SINGLE",
+            810,
+            "RESUBMIT",
+            null,
+            "REQ-01",
+            "Storage location sudah saya perbaiki\nNeed two storage locations, not one",
+        ]);
+    } finally {
+        db.connect = originalConnect;
+    }
+});
+
 // ---------------------------------------------------------------------------
 // Mass request resubmit — saveMassRequestRework (the mass rework dialog).
 // ---------------------------------------------------------------------------
