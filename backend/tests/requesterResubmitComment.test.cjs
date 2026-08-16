@@ -119,6 +119,12 @@ test("saveSingleRequestRework (single Create) rejects a resubmit with no comment
             error => {
                 assert.equal(error.statusCode, 400);
                 assert.equal(error.code, "RESUBMIT_REASON_REQUIRED");
+                // The key has to name an input that exists on the resubmit
+                // surfaces, or the client has nothing to attach the message to.
+                assert.deepEqual(
+                    error.errors.map(e => e.fieldKey),
+                    ["comment"]
+                );
                 return true;
             }
         );
@@ -144,6 +150,12 @@ test("saveSingleRequestRework (single Create) rejects whitespace-only comment", 
             error => {
                 assert.equal(error.statusCode, 400);
                 assert.equal(error.code, "RESUBMIT_REASON_REQUIRED");
+                // The key has to name an input that exists on the resubmit
+                // surfaces, or the client has nothing to attach the message to.
+                assert.deepEqual(
+                    error.errors.map(e => e.fieldKey),
+                    ["comment"]
+                );
                 return true;
             }
         );
@@ -210,6 +222,12 @@ test("saveSingleRequestRework (Change/Extend dialog) requires its own comment, i
             error => {
                 assert.equal(error.statusCode, 400);
                 assert.equal(error.code, "RESUBMIT_REASON_REQUIRED");
+                // The key has to name an input that exists on the resubmit
+                // surfaces, or the client has nothing to attach the message to.
+                assert.deepEqual(
+                    error.errors.map(e => e.fieldKey),
+                    ["comment"]
+                );
                 return true;
             }
         );
@@ -307,6 +325,12 @@ test("saveMassRequestRework rejects a resubmit with no comment", async () => {
             error => {
                 assert.equal(error.statusCode, 400);
                 assert.equal(error.code, "RESUBMIT_REASON_REQUIRED");
+                // The key has to name an input that exists on the resubmit
+                // surfaces, or the client has nothing to attach the message to.
+                assert.deepEqual(
+                    error.errors.map(e => e.fieldKey),
+                    ["comment"]
+                );
                 return true;
             }
         );
@@ -331,6 +355,12 @@ test("saveMassRequestRework rejects whitespace-only comment", async () => {
             error => {
                 assert.equal(error.statusCode, 400);
                 assert.equal(error.code, "RESUBMIT_REASON_REQUIRED");
+                // The key has to name an input that exists on the resubmit
+                // surfaces, or the client has nothing to attach the message to.
+                assert.deepEqual(
+                    error.errors.map(e => e.fieldKey),
+                    ["comment"]
+                );
                 return true;
             }
         );
