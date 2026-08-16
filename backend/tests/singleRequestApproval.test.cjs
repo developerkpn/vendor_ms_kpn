@@ -1,5 +1,11 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const os = require("os");
+const path = require("path");
+
+// The service only reads an upload out of the directory the multipart parser
+// writes to, so a fixture path has to live there too.
+const uploadPath = name => path.join(os.tmpdir(), name);
 const Material = require("../models/MaterialModel");
 const materialService = require("../services/materialService");
 const MaterialController = require("../controllers/MaterialController");
@@ -2745,7 +2751,7 @@ test("createMassRequest stores attachments under item request number path", asyn
       attachmentsByRow: [
         [
           {
-            tempPath: "C:\\tmp\\spec.pdf",
+            tempPath: uploadPath("spec.pdf"),
             originalName: "spec.pdf",
             newName: "1717578000001_spec.pdf",
             mimeType: "application/pdf",
@@ -3074,7 +3080,7 @@ test("saveSingleRequestRework keeps requested attachments and appends new upload
         return { rows: [], rowCount: 1 };
       }
 
-      if (/SELECT id, file_name, file_path, file_type\s+FROM mat_single_request_attachment/i.test(queryText)) {
+      if (/SELECT id, file_name, file_path, file_type[^\n]*\s+FROM mat_single_request_attachment/i.test(queryText)) {
         return {
           rows: [
             {
@@ -3155,7 +3161,7 @@ test("saveSingleRequestRework keeps requested attachments and appends new upload
         keepAttachmentIds: [10],
         newAttachments: [
           {
-            tempPath: "C:\\tmp\\new-file.pdf",
+            tempPath: uploadPath("new-file.pdf"),
             originalName: "new-file.pdf",
             newName: "1778000000001_new-file.pdf",
             mimeType: "application/pdf",

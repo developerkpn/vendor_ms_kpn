@@ -1,14 +1,83 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+// The service only reads an upload out of the directory the multipart parser
+// writes to, so a fixture path has to live there too — a bare "/tmp/x" is
+// rejected as a body-supplied path, which is the point of the guard.
+const uploadPath = name => path.join(os.tmpdir(), name);
 const materialService = require("../services/materialService");
 const MaterialController = require("../controllers/MaterialController");
 const db = require("../config/connection");
 const {
   resolveAttachmentChangeSet,
+  assertUploadsCameFromThisRequest,
   buildAttachmentRemovalNote,
   normalizeAttachmentInstructions,
 } = materialService;
+
+// ---------------------------------------------------------------------------
+// assertUploadsCameFromThisRequest — the gate between "a file this request
+// uploaded" and "a path somebody typed into a JSON body". Everything below the
+// upload directory is a real upload; anything else is refused before it can be
+// read and copied into the public attachment directory.
+// ---------------------------------------------------------------------------
+
+test("assertUploadsCameFromThisRequest accepts a path inside the upload directory", () => {
+  assert.doesNotThrow(() =>
+    assertUploadsCameFromThisRequest([{ tempPath: uploadPath("upload-1") }])
+  );
+});
+
+test("assertUploadsCameFromThisRequest rejects an absolute path outside the upload directory", () => {
+  for (const outside of [
+    "/etc/passwd",
+    "C:\\Windows\\win.ini",
+    // A secrets file sitting next to a checkout — the realistic target, and
+    // the reason this guard exists. Anchored to the home directory rather
+    // than process.cwd() so it stays outside the upload root even when the
+    // checkout itself lives under the temp directory.
+    path.join(os.homedir(), "development.env"),
+  ]) {
+    assert.throws(
+      () => assertUploadsCameFromThisRequest([{ tempPath: outside }]),
+      error => {
+        assert.equal(error.statusCode, 400);
+        assert.equal(error.code, "ATTACHMENT_INVALID_UPLOAD");
+        return true;
+      }
+    );
+  }
+});
+
+test("assertUploadsCameFromThisRequest rejects a traversal that climbs out of the upload directory", () => {
+  assert.throws(
+    () =>
+      assertUploadsCameFromThisRequest([
+        { tempPath: uploadPath("../../../etc/passwd") },
+      ]),
+    error => {
+      assert.equal(error.code, "ATTACHMENT_INVALID_UPLOAD");
+      return true;
+    }
+  );
+});
+
+test("assertUploadsCameFromThisRequest rejects a missing or non-string tempPath", () => {
+  for (const bad of [{}, { tempPath: "" }, { tempPath: 42 }, { tempPath: null }]) {
+    assert.throws(() => assertUploadsCameFromThisRequest([bad]), {
+      code: "ATTACHMENT_INVALID_UPLOAD",
+    });
+  }
+});
+
+test("assertUploadsCameFromThisRequest ignores an empty or absent list", () => {
+  assert.doesNotThrow(() => assertUploadsCameFromThisRequest([]));
+  assert.doesNotThrow(() => assertUploadsCameFromThisRequest(undefined));
+  assert.doesNotThrow(() => assertUploadsCameFromThisRequest(null));
+});
 
 // ---------------------------------------------------------------------------
 // fs stub helper — every test below that inserts a new attachment writes a
@@ -358,7 +427,7 @@ test(
         attachments: {
           newAttachments: [
             {
-              tempPath: "/tmp/upload-1",
+              tempPath: uploadPath("upload-1"),
               originalName: "drawing.pdf",
               newName: "1_drawing.pdf",
               mimeType: "application/pdf",
@@ -430,7 +499,7 @@ test(
           keepAttachmentIds: [1],
           newAttachments: [
             {
-              tempPath: "/tmp/upload-2",
+              tempPath: uploadPath("upload-2"),
               originalName: "swap-in.pdf",
               newName: "2_swap-in.pdf",
               mimeType: "application/pdf",
@@ -472,7 +541,7 @@ test(
           attachments: {
             newAttachments: [
               {
-                tempPath: "/tmp/upload-3",
+                tempPath: uploadPath("upload-3"),
                 originalName: "d.pdf",
                 newName: "3_d.pdf",
                 mimeType: "application/pdf",
@@ -675,6 +744,7 @@ test(
     const originalConnect = db.connect;
     const deletesByItem = {};
     const insertsByItem = {};
+    const deleteScopedToBatch = [];
 
     const existingByItem = {
       601: [
@@ -722,13 +792,17 @@ test(
           return { rows: [{ request_no: requestNoByItem[itemId] }], rowCount: 1 };
         }
 
+        // DELETE ... USING mat_mass_request_item: ($1 item, $2 batch, $3 ids).
+        // The batch is in the statement so an id from another batch cannot be
+        // deleted; the ids are therefore the THIRD parameter, not the second.
         if (
           trimmed.startsWith("DELETE") &&
           queryText.includes("mat_mass_request_attachment")
         ) {
           const itemId = params[0];
-          deletesByItem[itemId] = params[1];
-          return { rows: [], rowCount: Array.isArray(params[1]) ? params[1].length : 0 };
+          deletesByItem[itemId] = params[2];
+          deleteScopedToBatch.push(params[1]);
+          return { rows: [], rowCount: Array.isArray(params[2]) ? params[2].length : 0 };
         }
 
         if (trimmed.startsWith("INSERT INTO mat_mass_request_attachment")) {
@@ -767,7 +841,7 @@ test(
             attachments: {
               keepAttachmentIds: [],
               newAttachments: [
-                { tempPath: "/tmp/601", originalName: "item601-new.pdf", newName: "n1.pdf", mimeType: "application/pdf" },
+                { tempPath: uploadPath("601"), originalName: "item601-new.pdf", newName: "n1.pdf", mimeType: "application/pdf" },
               ],
             },
           },
@@ -776,8 +850,8 @@ test(
             attachments: {
               keepAttachmentIds: [21],
               newAttachments: [
-                { tempPath: "/tmp/602a", originalName: "item602-b.pdf", newName: "n2.pdf", mimeType: "application/pdf" },
-                { tempPath: "/tmp/602b", originalName: "item602-c.pdf", newName: "n3.pdf", mimeType: "application/pdf" },
+                { tempPath: uploadPath("602a"), originalName: "item602-b.pdf", newName: "n2.pdf", mimeType: "application/pdf" },
+                { tempPath: uploadPath("602b"), originalName: "item602-c.pdf", newName: "n3.pdf", mimeType: "application/pdf" },
               ],
             },
           },
@@ -785,6 +859,11 @@ test(
       });
 
       assert.equal(result.status, "Submit");
+
+      // Every removal names the batch as well as the item, so an attachment
+      // id belonging to a different batch cannot be deleted through this path.
+      assert.ok(deleteScopedToBatch.length > 0);
+      assert.ok(deleteScopedToBatch.every(id => String(id) === "900"));
 
       // Item 601: removed its one existing row, added one — its own limit
       // (3) never sees item 602's files.
@@ -799,5 +878,113 @@ test(
     } finally {
       db.connect = originalConnect;
     }
+  })
+);
+
+// ---------------------------------------------------------------------------
+// applyMassRequestItemAttachmentChanges — batch ownership.
+//
+// Item ids arrive in a request body and item ids are global, so only a row in
+// mat_mass_request_item says which batch owns one. These cover the case where
+// a reviewer acting on batch A names an item belonging to batch B.
+// ---------------------------------------------------------------------------
+
+const { applyMassRequestItemAttachmentChanges } = materialService;
+
+test(
+  "applyMassRequestItemAttachmentChanges refuses an item that belongs to another batch",
+  withStubbedFs(async () => {
+    const queries = [];
+    const client = {
+      query: async (queryText, params = []) => {
+        queries.push(queryText.trimStart());
+        // No row: the item exists, but not inside this batch.
+        if (queryText.includes("SELECT request_no")) {
+          return { rows: [], rowCount: 0 };
+        }
+        throw new Error(`Unexpected query: ${queryText}`);
+      },
+    };
+
+    await assert.rejects(
+      () =>
+        applyMassRequestItemAttachmentChanges(client, {
+          massRequestId: 900,
+          items: [{ id: 4242, attachments: { keepAttachmentIds: [] } }],
+        }),
+      error => {
+        assert.equal(error.statusCode, 400);
+        assert.equal(error.code, "MASS_REQUEST_ITEM_NOT_IN_BATCH");
+        return true;
+      }
+    );
+
+    // Ownership is settled before anything is read or written: the only
+    // statement issued is the ownership check itself.
+    assert.equal(queries.length, 1);
+    assert.ok(queries[0].startsWith("SELECT request_no"));
+  })
+);
+
+test(
+  "applyMassRequestItemAttachmentChanges scopes the existing-attachment read to the batch",
+  withStubbedFs(async () => {
+    const selectParams = [];
+    const client = {
+      query: async (queryText, params = []) => {
+        const trimmed = queryText.trimStart();
+        if (queryText.includes("SELECT request_no")) {
+          return { rows: [{ request_no: "1000000601" }], rowCount: 1 };
+        }
+        if (
+          trimmed.startsWith("SELECT") &&
+          queryText.includes("mat_mass_request_attachment")
+        ) {
+          selectParams.push(params);
+          return { rows: [], rowCount: 0 };
+        }
+        throw new Error(`Unexpected query: ${queryText}`);
+      },
+    };
+
+    await applyMassRequestItemAttachmentChanges(client, {
+      massRequestId: 900,
+      items: [{ id: 601, attachments: { keepAttachmentIds: [] } }],
+    });
+
+    assert.deepEqual(selectParams, [[601, 900]]);
+  })
+);
+
+test(
+  "applyMassRequestItemAttachmentChanges refuses a body-supplied file path before touching the database",
+  withStubbedFs(async () => {
+    let queried = false;
+    const client = {
+      query: async () => {
+        queried = true;
+        return { rows: [], rowCount: 0 };
+      },
+    };
+
+    await assert.rejects(
+      () =>
+        applyMassRequestItemAttachmentChanges(client, {
+          massRequestId: 900,
+          items: [
+            {
+              id: 601,
+              attachments: {
+                newAttachments: [
+                  { tempPath: "/etc/passwd", newName: "x.pdf" },
+                ],
+              },
+            },
+          ],
+        }),
+      { code: "ATTACHMENT_INVALID_UPLOAD" }
+    );
+
+    assert.equal(queried, false);
   })
 );
