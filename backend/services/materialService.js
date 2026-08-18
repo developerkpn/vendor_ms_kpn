@@ -6359,9 +6359,6 @@ const MaterialRequests = {
                     // a rewritten one is carried — an unchanged reason still
                     // holds the text the submit event already recorded, and
                     // repeating it on every revise would bury the thread.
-                    //
-                    // safeComment is trimmed and non-empty by the gate above, so
-                    // there is nothing to guard against on that side.
                     const rewrittenChangeExtendReason =
                         editablePatch.change_extend_reason ?? null;
 
@@ -6370,9 +6367,10 @@ const MaterialRequests = {
                         requestId,
                         eventType: REQUEST_COMMENT_EVENTS.RESUBMIT,
                         actorUserId,
-                        comment: rewrittenChangeExtendReason
-                            ? `${safeComment}\n${rewrittenChangeExtendReason}`
-                            : safeComment,
+                        comment: appendCommentNote(
+                            safeComment,
+                            rewrittenChangeExtendReason
+                        ),
                     });
                     await client.query("COMMIT");
                     deleteSingleRequestStoredFiles(removedFilePaths);
