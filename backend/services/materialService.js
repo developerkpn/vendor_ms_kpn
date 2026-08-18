@@ -1302,6 +1302,57 @@ const insertRequestComment = async (client, commentRow = {}) => {
 };
 
 // ===========================================================================
+// User preference store: one row per (user, key). Generic over the key so a
+// second preference (a different page, a different setting) is a new row, not
+// a migration.
+// ===========================================================================
+
+// 20260814_mst_user_preference.sql is applied by hand, same as the comment
+// table. Until it lands, a read degrading to "nothing stored" is exactly the
+// first-visit case the caller already has to handle, so there is no separate
+// fallback to write.
+const isMissingUserPreferenceTableError = error =>
+    error?.code === "42P01" &&
+    /mst_user_preference/i.test(String(error?.message || ""));
+
+const getUserPreference = async ({ userId, key }) => {
+    try {
+        return await DBClientWrapper(async client => {
+            const result = await client.query(
+                `SELECT pref_value
+                 FROM mst_user_preference
+                 WHERE user_id = $1
+                   AND pref_key = $2`,
+                [userId, key]
+            );
+            return result.rows[0]?.pref_value ?? null;
+        });
+    } catch (error) {
+        if (isMissingUserPreferenceTableError(error)) {
+            return null;
+        }
+
+        console.error("Error fetching user preference:", error);
+        throw error;
+    }
+};
+
+// One row per (user, key) by construction: ON CONFLICT overwrites in place
+// rather than a read-modify-write, so two tabs saving at once never race into
+// two rows.
+const setUserPreference = async ({ userId, key, value }) => {
+    await DBClientWrapper(async client => {
+        await client.query(
+            `INSERT INTO mst_user_preference (user_id, pref_key, pref_value, updated_at)
+             VALUES ($1, $2, $3, NOW())
+             ON CONFLICT (user_id, pref_key)
+             DO UPDATE SET pref_value = EXCLUDED.pref_value, updated_at = EXCLUDED.updated_at`,
+            [userId, key, value]
+        );
+    });
+};
+
+// ===========================================================================
 // Material template: description / long-text + value validation.
 // ===========================================================================
 
@@ -7385,6 +7436,10 @@ module.exports = {
     buildRequestCommentRow,
     isMissingRequestCommentTableError,
     insertRequestComment,
+    // user preference store
+    isMissingUserPreferenceTableError,
+    getUserPreference,
+    setUserPreference,
     // mass approval
     syncMassRequestItemApprovalSnapshot,
     buildMassStepApprovePatch,

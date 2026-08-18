@@ -305,6 +305,19 @@ router.get(
     MaterialController.getMassRequestComments
 );
 
+// Per-user preference store, generic over the key. The owner is always the
+// authenticated session, never a param or body field.
+router.get(
+    "/preferences/:key",
+    AuthToken.authSession,
+    MaterialController.getUserPreference
+);
+router.put(
+    "/preferences/:key",
+    AuthToken.authSession,
+    MaterialController.setUserPreference
+);
+
 
 // Material template endpoints
 router.get("/templates", MaterialController.getMaterialTemplates);
