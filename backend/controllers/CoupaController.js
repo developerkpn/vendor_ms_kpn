@@ -111,10 +111,10 @@ exports.getDetail = async (req, res) => {
             const ppnData = item["custom-fields"]?.["ppn-type"];
 
             const fullAddress = [
-                address["street-address"],
-                address["street-address2"],
-                address["street-address3"],
-                address["street-address4"],
+                address?.["street-address"],
+                address?.["street-address2"],
+                address?.["street-address3"],
+                address?.["street-address4"],
             ]
                 .filter(Boolean)
                 .join(" ");
@@ -194,17 +194,19 @@ exports.getDetail = async (req, res) => {
                 company_address: {
                     ...streetLines,
                     city: address?.city || null,
-                    postal: address?.["postal-code"] || null,
+                    postal: address?.["postal-code"]?.trim() || null,
                 },
                 npwp_address: {
                     ...npwpLines,
                     city_npwp: insurance?.["npwp-city"]?.name || null,
-                    postal_npwp: insurance?.["npwp-postal-code"] || null,
+                    postal_npwp:
+                        insurance?.["npwp-postal-code"]?.trim() || null,
                 },
                 sppkp_address: {
                     ...skkpLines,
                     city_sppkp: enterprise?.["sppkp-city"]?.name || null,
-                    postal_sppkp: enterprise?.["sppkp-postal-code"] || null,
+                    postal_sppkp:
+                        enterprise?.["sppkp-postal-code"]?.trim() || null,
                 },
                 tax_payment: {
                     is_pkp: insurance?.statuspkp || null,
