@@ -141,7 +141,7 @@ const EmailGen = {
     </html>
     `;
     },
-    Submit_Manager: (opening, ven_detail, banks_html, approve, reject) => {
+    Submit_Manager: (opening, ven_detail, banks_html, approve, reject, ai_html = "") => {
         return `
       <!doctype html>
       <html lang="en">
@@ -506,6 +506,7 @@ const EmailGen = {
                             ${banks_html.join(" ")}
                         </table>
                     </tr>
+                    ${ai_html}
                     <tr>
                         <table class="bg_white" width="100%">
                             <tr>
@@ -1001,7 +1002,7 @@ const EmailGen = {
         `;
     },
 
-    Submit_Manager_CG: (opening, ven_detail, banks_html, approve, reject) => {
+    Submit_Manager_CG: (opening, ven_detail, banks_html, approve, reject, ai_html = "") => {
         return `
       <!doctype html>
       <html lang="en">
@@ -1297,6 +1298,7 @@ const EmailGen = {
                             ${banks_html.join(" ")}
                         </table>
                     </tr>
+                    ${ai_html}
                     <tr>
                         <table class="bg_white" width="100%">
                             <tr>

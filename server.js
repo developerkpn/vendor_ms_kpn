@@ -23,6 +23,7 @@ const { SchedulerSyncStaged } = require("./backend/helper/Scheduler");
 const Material = require("./backend/models/MaterialModel");
 const materialSapStagingService = require("./backend/services/materialSapStagingService");
 const reworkEmailInboundService = require("./backend/services/reworkEmailInboundService");
+const aiValidationService = require("./backend/services/aiValidationService");
 const cron = require("node-cron");
 const moment = require("moment-timezone");
 
@@ -61,6 +62,15 @@ if (os.platform() === "linux") {
     app.set("views", path.join(__dirname, "\\backend\\views\\pages"));
 }
 app.use(cors(corsOption));
+// The AI-validation webhook authenticates with an HMAC computed over the raw
+// request body, so it must reach the handler as bytes. body-parser sets
+// req._body once it has consumed the stream, which is what makes the
+// express.json() below skip this path instead of double-parsing it. Order
+// matters: move this after express.json() and every signature check fails.
+app.use(
+    "/api/ai-validation/webhook",
+    express.raw({ type: () => true, limit: "5mb" })
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
@@ -191,6 +201,32 @@ cron.schedule(
         }
     },
     // A slow IMAP round trip must not stack ticks on the same mailbox.
+    { noOverlap: true }
+);
+
+// Close out AI validation runs that can never complete — every 5 minutes.
+//
+// A run stays PROCESSING from the 202 until its webhook lands. When that
+// webhook never comes there is nothing else to end the wait: the service has no
+// status endpoint to poll, and its retry ladder (5s/15s/45s) is spent within a
+// minute. Without this the form panel reports "Processing…" forever and a dead
+// run looks exactly like a slow one.
+//
+// It only relabels — no retry, no recovery. A late webhook still overwrites the
+// row, because storeValidationResult matches on request_id regardless of
+// submit_status.
+cron.schedule(
+    "*/5 * * * *",
+    async () => {
+        if (process.env.AI_VALIDATION_ENABLED !== "true") {
+            return;
+        }
+        try {
+            await aiValidationService.sweepStaleValidations();
+        } catch (error) {
+            console.error("[CRON] AI validation stale sweep failed:", error);
+        }
+    },
     { noOverlap: true }
 );
 

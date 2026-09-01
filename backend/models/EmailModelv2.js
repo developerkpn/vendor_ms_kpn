@@ -5,6 +5,8 @@ const os = require("os");
 const path = require("path");
 const { Client } = require("pg");
 const EmailGen = require("../helper/EmailGenv2");
+const aiValidationService = require("../services/aiValidationService");
+const { buildAiSummaryHtml } = require("../helper/aiValidationEmailBlock");
 const mailer = require("nodemailer");
 
 const tp = mailer.createTransport({
@@ -341,6 +343,24 @@ EmailModel.SendManager = async (
                 content: fs.createReadStream(pathStream),
             };
         });
+        // Manager and C-Level approve straight from this e-mail without opening
+        // VMS, so the AI verdict has to travel with it — the on-form panel is
+        // Master Data only. Never let this block the mail: a missing or failed
+        // lookup just means the e-mail goes out exactly as it did before.
+        let ai_html = "";
+        try {
+            const latestValidation =
+                await aiValidationService.getLatestValidation(
+                    detail_vendor.ven_id
+                );
+            ai_html = buildAiSummaryHtml(latestValidation);
+        } catch (error) {
+            console.error(
+                "[AI-VALIDATION] could not attach summary to approval e-mail:",
+                error && error.message
+            );
+        }
+
         let html_gen = "";
         if (bu == "NON_CG") {
             html_gen = EmailGen.Submit_Manager(
@@ -348,7 +368,8 @@ EmailModel.SendManager = async (
                 detail_vendor,
                 bankTable,
                 approveLink,
-                rejectLink
+                rejectLink,
+                ai_html
             );
         } else {
             html_gen = EmailGen.Submit_Manager_CG(
@@ -356,7 +377,8 @@ EmailModel.SendManager = async (
                 detail_vendor,
                 bankTable,
                 approveLink,
-                rejectLink
+                rejectLink,
+                ai_html
             );
         }
         let setup = {
@@ -518,6 +540,24 @@ EmailModel.SendCLevel = async (
             };
         });
 
+        // Manager and C-Level approve straight from this e-mail without opening
+        // VMS, so the AI verdict has to travel with it — the on-form panel is
+        // Master Data only. Never let this block the mail: a missing or failed
+        // lookup just means the e-mail goes out exactly as it did before.
+        let ai_html = "";
+        try {
+            const latestValidation =
+                await aiValidationService.getLatestValidation(
+                    detail_vendor.ven_id
+                );
+            ai_html = buildAiSummaryHtml(latestValidation);
+        } catch (error) {
+            console.error(
+                "[AI-VALIDATION] could not attach summary to approval e-mail:",
+                error && error.message
+            );
+        }
+
         let html_gen = "";
         if (bu == "NON_CG") {
             html_gen = EmailGen.Submit_Manager(
@@ -525,7 +565,8 @@ EmailModel.SendCLevel = async (
                 detail_vendor,
                 bankTable,
                 approveLink,
-                rejectLink
+                rejectLink,
+                ai_html
             );
         } else {
             html_gen = EmailGen.Submit_Manager_CG(
@@ -533,7 +574,8 @@ EmailModel.SendCLevel = async (
                 detail_vendor,
                 bankTable,
                 approveLink,
-                rejectLink
+                rejectLink,
+                ai_html
             );
         }
         let setup = {

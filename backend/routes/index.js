@@ -13,6 +13,7 @@ const Material = require("./MaterialRoute");
 const ETender = require("./ETenderRoute");
 const Report = require("./ReportRoute");
 const Coupa = require("./CoupaRoute");
+const AiValidation = require("./AiValidationRoute");
 const openAPI = require("./ApiRoute");
 const router = express.Router();
 
@@ -32,6 +33,8 @@ router.use("/api/report", Report);
 router.use("/api/etender", ETender);
 // Coupa
 router.use("/api/coupa", Coupa);
+// AI document validation (external AWS service)
+router.use("/api/ai-validation", AiValidation);
 // Open API
 router.use("/api/v1", openAPI);
 
