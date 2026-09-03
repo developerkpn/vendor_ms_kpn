@@ -3487,14 +3487,26 @@ const MaterialController = {
                 subGroupCode
             );
 
-            let filename = "materials.xlsx";
-            if (groupCode && subGroupCode)
-                filename = `materials_group_${groupCode}_subgroup_${subGroupCode}.xlsx`;
-            else if (subGroupCode)
-                filename = `materials_subgroup_${subGroupCode}.xlsx`;
-            else if (groupCode) filename = `materials_group_${groupCode}.xlsx`;
-            if (searchTerm && searchTerm.trim() !== "")
-                filename = `materials_search_${searchTerm}.xlsx`;
+            // `q` is user input that ends up in a response header, so the name is
+            // held to a conservative character set. Every active filter is kept:
+            // the search term previously overwrote the group, so two exports of
+            // different data could land under the same filename.
+            const safeForFilename = value =>
+                String(value)
+                    .trim()
+                    .replace(/[^A-Za-z0-9._-]+/g, "_")
+                    .replace(/^_+|_+$/g, "")
+                    .slice(0, 60);
+
+            const nameParts = ["materials"];
+            if (searchTerm && searchTerm.trim() !== "") {
+                const safeTerm = safeForFilename(searchTerm);
+                if (safeTerm) nameParts.push(`search_${safeTerm}`);
+            }
+            if (groupCode) nameParts.push(`group_${safeForFilename(groupCode)}`);
+            if (subGroupCode)
+                nameParts.push(`subgroup_${safeForFilename(subGroupCode)}`);
+            const filename = `${nameParts.join("_")}.xlsx`;
 
             console.log("[ExportExcel] Final filename:", filename);
 
