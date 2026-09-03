@@ -3383,11 +3383,20 @@ const SINGLE_REQUEST_LEGACY_REWORK_SELECT_FIELDS = `NULL::varchar AS rework_stag
                         NULL::text AS rework_reason`;
 
 // =====================================================================
-// Rework e-mail replies — list/inbox reply indicator.
+// Rework e-mail — list/inbox approval indicator.
 // A rework sent "via email" (chain replacement, notifyVia='EMAIL') stores
 // the mail in mat_rework_email and every polled answer in
-// mat_rework_email_reply. The list and inbox rows carry the reply COUNT so
-// the Status cell can say a reply is waiting without opening the detail.
+// mat_rework_email_reply. The list and inbox rows carry the counts the
+// Status cell needs to say whether the mailed approver has answered, without
+// opening the detail. Three and not one, because a request can be reworked by
+// mail more than once and each mail is answered on its own: the sent count
+// separates "no mail was ever sent" from "sent", and the count of sent mails
+// with NO reply is what decides answered vs still waiting.
+//
+// Neither total works on its own. Replies are not one per mail — an approver
+// who writes twice leaves two rows against one mail — so comparing the two
+// totals reads a request with one answered and one ignored mail as fully
+// answered, and a request whose single mail got two replies as unanswered.
 // =====================================================================
 
 // Scalar subquery, never a join: the count hangs off the row it belongs to
@@ -3413,6 +3422,41 @@ const buildEmailReplyCountSql = (kind, idExpr) => `(
 // so the fallback drops the subquery for a constant instead, exactly as the
 // pre-rework-column fallbacks below do. The payload field never disappears.
 const EMAIL_REPLY_COUNT_ABSENT_SQL = `0::int AS email_reply_count`;
+
+// Sibling scalar, same shape and same fallback: mails that actually left the
+// mailbox. FAILED sends are excluded deliberately — nothing is waiting on a
+// mail that never went out, and the request detail's thread section is where
+// that failure is reported.
+const buildEmailSentCountSql = (kind, idExpr) => `(
+                            SELECT COUNT(e.id)
+                            FROM mat_rework_email e
+                            WHERE e.request_kind = '${kind}'
+                              AND e.request_id = ${idExpr}
+                              AND UPPER(COALESCE(e.send_status, '')) = 'SENT'
+                        )::int AS email_sent_count`;
+
+const EMAIL_SENT_COUNT_ABSENT_SQL = `0::int AS email_sent_count`;
+
+// Sent mails nobody has written back to, counted per mail rather than by
+// totalling replies: EXISTS asks each mail its own question, so a mail with
+// three replies weighs the same as a mail with one, and a mail with none is
+// still outstanding however many replies its siblings collected. A request with
+// no sent mail lands on 0, the same as one whose mails are all answered — the
+// sent count above is what tells those two apart.
+const buildEmailUnansweredCountSql = (kind, idExpr) => `(
+                            SELECT COUNT(e.id)
+                            FROM mat_rework_email e
+                            WHERE e.request_kind = '${kind}'
+                              AND e.request_id = ${idExpr}
+                              AND UPPER(COALESCE(e.send_status, '')) = 'SENT'
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM mat_rework_email_reply rp
+                                  WHERE rp.rework_email_id = e.id
+                              )
+                        )::int AS email_unanswered_count`;
+
+const EMAIL_UNANSWERED_COUNT_ABSENT_SQL = `0::int AS email_unanswered_count`;
 
 const buildSingleRequestSelectFields = ({
     includeReworkFields = true,
@@ -3450,6 +3494,16 @@ const buildSingleRequestSelectFields = ({
                           },
                           COALESCE(u.username, r.created_by) AS created_by,
                           u.email AS requester_email,
+                          ${
+                              includeEmailReplyCount
+                                  ? buildEmailSentCountSql("SINGLE", "r.id")
+                                  : EMAIL_SENT_COUNT_ABSENT_SQL
+                          },
+                          ${
+                              includeEmailReplyCount
+                                  ? buildEmailUnansweredCountSql("SINGLE", "r.id")
+                                  : EMAIL_UNANSWERED_COUNT_ABSENT_SQL
+                          },
                           ${
                               includeEmailReplyCount
                                   ? buildEmailReplyCountSql("SINGLE", "r.id")
@@ -3535,6 +3589,16 @@ const buildSingleRequestApprovalInboxQuery = ({
                         r.created_by AS requester_user_id,
                         COALESCE(u.username, r.created_by) AS created_by,
                         u.email AS requester_email,
+                        ${
+                            includeEmailReplyCount
+                                ? buildEmailSentCountSql("SINGLE", "r.id")
+                                : EMAIL_SENT_COUNT_ABSENT_SQL
+                        },
+                        ${
+                            includeEmailReplyCount
+                                ? buildEmailUnansweredCountSql("SINGLE", "r.id")
+                                : EMAIL_UNANSWERED_COUNT_ABSENT_SQL
+                        },
                         ${
                             includeEmailReplyCount
                                 ? buildEmailReplyCountSql("SINGLE", "r.id")
@@ -3702,12 +3766,17 @@ const MASS_REQUEST_SAP_PUSH_STATUS_SQL = `(
     WHERE si.mass_request_id = m.id
 ) AS sap_push_status`;
 
-// Mass counterpart of the single-request reply scalar, keyed on the batch id
-// (mat_mass_request.id) the rework mail was filed under.
-const buildMassEmailReplyCountSql = includeEmailReplyCount =>
+// Mass counterpart of the single-request scalars, keyed on the batch id
+// (mat_mass_request.id) the rework mail was filed under, so one pair of counts
+// covers the whole batch's thread rather than a single item.
+const buildMassEmailCountsSql = includeEmailReplyCount =>
     includeEmailReplyCount
-        ? buildEmailReplyCountSql("MASS", "m.id")
-        : EMAIL_REPLY_COUNT_ABSENT_SQL;
+        ? `${buildEmailSentCountSql("MASS", "m.id")},
+    ${buildEmailUnansweredCountSql("MASS", "m.id")},
+    ${buildEmailReplyCountSql("MASS", "m.id")}`
+        : `${EMAIL_SENT_COUNT_ABSENT_SQL},
+    ${EMAIL_UNANSWERED_COUNT_ABSENT_SQL},
+    ${EMAIL_REPLY_COUNT_ABSENT_SQL}`;
 
 const buildMassRequestsByUserQuery = ({
     includeEmailReplyCount = true,
@@ -3719,7 +3788,7 @@ const buildMassRequestsByUserQuery = ({
     m.created_by,
     m.created_by_username,
     u.email AS requester_email,
-    ${buildMassEmailReplyCountSql(includeEmailReplyCount)},
+    ${buildMassEmailCountsSql(includeEmailReplyCount)},
     TO_CHAR(m.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
     first_item.first_item_material_description,
     first_item.first_item_uom AS first_item_uom,
@@ -3744,7 +3813,7 @@ const buildMassRequestApprovalInboxQuery = ({
     m.created_by,
     m.created_by_username,
     u.email AS requester_email,
-    ${buildMassEmailReplyCountSql(includeEmailReplyCount)},
+    ${buildMassEmailCountsSql(includeEmailReplyCount)},
     TO_CHAR(m.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
     first_item.first_item_status,
     first_item.first_item_assigned_to,
@@ -8103,6 +8172,8 @@ const __private = {
     buildMassRequestsByUserQuery,
     buildMassRequestApprovalInboxQuery,
     EMAIL_REPLY_COUNT_ABSENT_SQL,
+    EMAIL_SENT_COUNT_ABSENT_SQL,
+    EMAIL_UNANSWERED_COUNT_ABSENT_SQL,
     MASS_REQUEST_SAP_PUSH_STATUS_SQL,
     SINGLE_REQUEST_ATTACHMENT_ROOT,
     MASS_REQUEST_ATTACHMENT_ROOT,
@@ -8239,6 +8310,10 @@ module.exports = {
     buildMassRequestApprovalInboxQuery,
     buildEmailReplyCountSql,
     EMAIL_REPLY_COUNT_ABSENT_SQL,
+    buildEmailSentCountSql,
+    EMAIL_SENT_COUNT_ABSENT_SQL,
+    buildEmailUnansweredCountSql,
+    EMAIL_UNANSWERED_COUNT_ABSENT_SQL,
     isMissingSingleRequestEditHistoryTableError,
     isMissingSingleRequestReworkColumnsError,
     isMissingReworkEmailTableError,
