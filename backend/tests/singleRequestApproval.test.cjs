@@ -997,6 +997,12 @@ test("rework edit validation allows material group change and validates subgroup
   assert.equal(receivedValidationPayload.materialGroupCode, "PACK");
 });
 
+test("approval action workflow lets the approver change the material group", () => {
+  const source = materialService.approveSingleRequestByAdmin.toString();
+  assert.match(source, /prepareSingleRequestApprovalEditPatch/);
+  assert.match(source, /allowMaterialGroupChange:\s*true/);
+});
+
 test("approval edit validation surfaces template validation errors", async () => {
   await assert.rejects(
     materialService.__private.prepareSingleRequestApprovalEditPatch({
