@@ -1979,6 +1979,106 @@ const claimMdmSingleRequestStep = async (client, stepId, actorUserId) => {
     return result.rowCount === 1;
 };
 
+// --- Mass-item row helpers (mat_mass_request_item) -------------------------
+// A batch is written with one statement per table rather than one per row: the
+// database is remote, so a statement costs a network round trip regardless of
+// how many rows it carries, and a per-row loop makes submit time grow linearly
+// with the batch while holding the transaction open the whole time.
+
+// Reserves `count` ids in one call. The caller derives request_no from each id
+// (3000000000 + id) and pairs ids with item_no by position, so the ids are
+// returned sorted and nothing downstream depends on statement result order.
+const allocateMassItemIds = async (client, count) => {
+    if (count < 1) {
+        return [];
+    }
+
+    const result = await client.query(
+        `SELECT nextval(pg_get_serial_sequence('mat_mass_request_item', 'id')) AS next_id
+         FROM generate_series(1, $1)`,
+        [count]
+    );
+
+    return result.rows
+        .map(row => Number(row.next_id))
+        .sort((a, b) => a - b);
+};
+
+const insertMassRequestItems = async (client, items = []) => {
+    if (items.length < 1) {
+        return;
+    }
+
+    await client.query(
+        `INSERT INTO mat_mass_request_item (
+            id,
+            mass_request_id,
+            item_no,
+            request_no,
+            ticket_type,
+            plant_code,
+            sloc_code,
+            material_group,
+            material_sub_group,
+            material_description,
+            po_text,
+            base_uom,
+            spesifikasi_tambahan,
+            status,
+            assigned_to,
+            created_by,
+            created_at,
+            updated_at
+        )
+        SELECT
+            t.id,
+            t.mass_request_id,
+            t.item_no,
+            t.request_no,
+            t.ticket_type,
+            t.plant_code,
+            t.sloc_code,
+            t.material_group,
+            t.material_sub_group,
+            t.material_description,
+            t.po_text,
+            t.base_uom,
+            t.spesifikasi_tambahan,
+            'Submit',
+            t.assigned_to,
+            t.created_by,
+            NOW(),
+            NOW()
+        FROM unnest(
+            $1::bigint[], $2::bigint[], $3::int[], $4::text[], $5::text[],
+            $6::text[], $7::text[], $8::text[], $9::text[], $10::text[],
+            $11::text[], $12::text[], $13::text[], $14::text[], $15::text[]
+        ) AS t(
+            id, mass_request_id, item_no, request_no, ticket_type,
+            plant_code, sloc_code, material_group, material_sub_group,
+            material_description, po_text, base_uom, spesifikasi_tambahan,
+            assigned_to, created_by
+        )`,
+        [
+            items.map(item => item.id),
+            items.map(item => item.massRequestId),
+            items.map(item => item.itemNo),
+            items.map(item => item.requestNo),
+            items.map(item => item.ticketType),
+            items.map(item => item.plantCode),
+            items.map(item => item.slocCode),
+            items.map(item => item.materialGroup),
+            items.map(item => item.materialSubGroup),
+            items.map(item => item.materialDescription),
+            items.map(item => item.poText),
+            items.map(item => item.baseUom),
+            items.map(item => item.spesifikasiTambahan),
+            items.map(item => item.assignedTo),
+            items.map(item => item.createdBy),
+        ]
+    );
+};
+
 // --- Mass-item step helpers (mat_mass_request_item_approval_step) ---------
 
 const insertMassItemApprovalSteps = async (client, itemId, plan = []) => {
@@ -2002,6 +2102,54 @@ const insertMassItemApprovalSteps = async (client, itemId, plan = []) => {
             ]
         );
     }
+};
+
+// Every item in a batch shares one plan, so the step rows are the cross-product
+// of the item ids and that plan. One statement writes all of them; the per-item
+// helper above stays for callers that add steps to a single item.
+const insertMassItemApprovalStepsBatch = async (
+    client,
+    itemIds = [],
+    plan = []
+) => {
+    if (itemIds.length < 1 || plan.length < 1) {
+        return;
+    }
+
+    const rows = [];
+    for (const itemId of itemIds) {
+        for (const step of plan) {
+            rows.push({
+                itemId,
+                level: step.level,
+                kind: step.kind,
+                approverUserId: step.approverUserId ?? null,
+                status: step.status ?? "WAITING",
+            });
+        }
+    }
+
+    await client.query(
+        `INSERT INTO mat_mass_request_item_approval_step (
+            item_id,
+            level,
+            kind,
+            approver_user_id,
+            status,
+            created_at,
+            updated_at
+        )
+        SELECT t.item_id, t.level, t.kind, t.approver_user_id, t.status, NOW(), NOW()
+        FROM unnest($1::bigint[], $2::int[], $3::text[], $4::text[], $5::text[])
+            AS t(item_id, level, kind, approver_user_id, status)`,
+        [
+            rows.map(row => row.itemId),
+            rows.map(row => row.level),
+            rows.map(row => row.kind),
+            rows.map(row => row.approverUserId),
+            rows.map(row => row.status),
+        ]
+    );
 };
 
 // Load the step rows for the FIRST item of a batch (all items share the plan).
@@ -2602,6 +2750,42 @@ const insertMassRequestAttachment = async (
             uploadedBy,
         ]
     );
+};
+
+// Writes every attachment in a batch with one statement. The caller supplies
+// file_path already resolved, and the rows come back ordered by id so they can
+// be grouped onto their items in the order they were supplied. uploadedBy is
+// per attachment because one batch can carry files from more than one person;
+// leave it unset only where the uploader genuinely was not captured, since a
+// null there reads as an attachment predating the column.
+const insertMassRequestAttachmentsBatch = async (client, attachments = []) => {
+    if (attachments.length < 1) {
+        return [];
+    }
+
+    const result = await client.query(
+        `INSERT INTO mat_mass_request_attachment (
+            item_id,
+            file_name,
+            file_path,
+            file_type,
+            uploaded_by,
+            created_at
+        )
+        SELECT t.item_id, t.file_name, t.file_path, t.file_type, t.uploaded_by, NOW()
+        FROM unnest($1::bigint[], $2::text[], $3::text[], $4::text[], $5::text[])
+            AS t(item_id, file_name, file_path, file_type, uploaded_by)
+        RETURNING id, item_id, file_name, file_path, file_type, created_at`,
+        [
+            attachments.map(attachment => attachment.itemId),
+            attachments.map(attachment => attachment.fileName),
+            attachments.map(attachment => attachment.filePath),
+            attachments.map(attachment => attachment.fileType),
+            attachments.map(attachment => attachment.uploadedBy ?? null),
+        ]
+    );
+
+    return [...result.rows].sort((a, b) => Number(a.id) - Number(b.id));
 };
 
 const persistMassRequestAttachmentFiles = (
@@ -5335,152 +5519,135 @@ const MaterialRequests = {
                         actorUserId: createdBy,
                         comment: massRequestReason,
                     });
-                    const insertedItems = [];
+                    // One statement per table instead of one per row: the
+                    // ids are reserved up front so request_no and item_no can
+                    // be paired with them here rather than read back.
+                    const itemIds = await allocateMassItemIds(
+                        client,
+                        rows.length
+                    );
+                    const massCreatedAt =
+                        massHeaderResult.rows[0]?.created_at ?? new Date();
+                    const itemDrafts = rows.map((row, itemIndex) => ({
+                        id: itemIds[itemIndex],
+                        massRequestId: nextMassId,
+                        itemNo: itemIndex + 1,
+                        requestNo: String(3000000000 + itemIds[itemIndex]),
+                        ticketType: "Create",
+                        plantCode: String(row.plant || "").trim() || null,
+                        slocCode: String(row.sloc || "").trim() || null,
+                        materialGroup:
+                            String(row.materialGroup || "").trim() || null,
+                        materialSubGroup:
+                            String(row.materialSubGroup || "").trim() || null,
+                        materialDescription: String(row.description || "").trim(),
+                        poText: String(row.poText || "").trim() || null,
+                        baseUom: String(row.uom || "").trim(),
+                        spesifikasiTambahan:
+                            String(row.spesifikasiTambahan || "").trim() || null,
+                        assignedTo: massFirstStepLabel,
+                        createdBy,
+                    }));
 
-                    for (
-                        let itemIndex = 0;
-                        itemIndex < rows.length;
-                        itemIndex += 1
-                    ) {
-                        const row = rows[itemIndex];
-                        const {
-                            rows: [{ next_id: nextItemId }],
-                        } = await client.query(
-                            "SELECT nextval(pg_get_serial_sequence('mat_mass_request_item', 'id')) AS next_id"
-                        );
-                        const itemRequestNo = String(
-                            3000000000 + Number(nextItemId)
-                        );
-                        const itemNo = itemIndex + 1;
+                    await insertMassRequestItems(client, itemDrafts);
+                    await insertMassItemApprovalStepsBatch(
+                        client,
+                        itemIds,
+                        massPlan
+                    );
 
-                        const itemResult = await client.query(
-                            `INSERT INTO mat_mass_request_item (
-                                id,
-                                mass_request_id,
-                                item_no,
-                                request_no,
-                                ticket_type,
-                                plant_code,
-                                sloc_code,
-                                material_group,
-                                material_sub_group,
-                                material_description,
-                                po_text,
-                                base_uom,
-                                spesifikasi_tambahan,
-                                status,
-                                assigned_to,
-                                created_by,
-                                created_at,
-                                updated_at
-                            ) VALUES (
-                                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                                'Submit', $14, $15, NOW(), NOW()
-                            )
-                            RETURNING id, item_no, request_no, ticket_type, status, assigned_to, created_by, created_at`,
-                            [
-                                nextItemId,
-                                nextMassId,
-                                itemNo,
-                                itemRequestNo,
-                                "Create",
-                                String(row.plant || "").trim() || null,
-                                String(row.sloc || "").trim() || null,
-                                String(row.materialGroup || "").trim() ||
-                                    null,
-                                String(row.materialSubGroup || "").trim() ||
-                                    null,
-                                String(row.description || "").trim(),
-                                String(row.poText || "").trim() || null,
-                                String(row.uom || "").trim(),
-                                String(row.spesifikasiTambahan || "").trim() ||
-                                    null,
-                                massFirstStepLabel,
-                                createdBy,
-                            ]
-                        );
-
-                        await insertMassItemApprovalSteps(
-                            client,
-                            nextItemId,
-                            massPlan
-                        );
-
-                        const itemRow = itemResult.rows[0];
+                    // Flat across the whole batch, grouped by item in order, so
+                    // the rows coming back can be handed to the right item.
+                    const attachmentDrafts = [];
+                    for (const draft of itemDrafts) {
                         const rowAttachments =
-                            attachmentsByRow[itemIndex] || [];
-                        const attachmentCreatedAt =
-                            itemRow?.created_at ??
-                            massHeaderResult.rows[0]?.created_at ??
-                            new Date();
-                        const resolvedAttachments = rowAttachments.map(file => ({
-                            tempPath: file.tempPath,
-                            file_name: file.originalName,
-                            file_path: (itemRow?.request_no ?? itemRequestNo)
-                                ? path.posix.join(
-                                      MASS_REQUEST_ATTACHMENT_ROOT,
-                                      formatAttachmentDateSegment(
-                                          attachmentCreatedAt
-                                      ),
-                                      String(
-                                          itemRow?.request_no ?? itemRequestNo
-                                      ),
-                                      path.basename(String(file.newName))
-                                  )
-                                : path.posix.join(
-                                      MASS_REQUEST_ATTACHMENT_ROOT,
-                                      formatAttachmentDateSegment(
-                                          attachmentCreatedAt
-                                      ),
-                                      String(nextMassId),
-                                      String(nextItemId),
-                                      path.basename(String(file.newName))
-                                  ),
-                            file_type: file.mimeType,
-                        }));
-                        const persistedAttachments = [];
+                            attachmentsByRow[draft.itemNo - 1] || [];
 
-                        for (const attachment of resolvedAttachments) {
-                            const attachmentResult = await client.query(
-                                `INSERT INTO mat_mass_request_attachment (
-                                    item_id,
-                                    file_name,
-                                    file_path,
-                                    file_type,
-                                    created_at
-                                ) VALUES ($1, $2, $3, $4, NOW())
-                                RETURNING id, file_name, file_path, file_type, created_at`,
-                                [
-                                    nextItemId,
-                                    attachment.file_name,
-                                    attachment.file_path,
-                                    attachment.file_type,
-                                ]
-                            );
-                            persistedAttachments.push(
-                                attachmentResult.rows[0]
-                            );
+                        for (const file of rowAttachments) {
+                            attachmentDrafts.push({
+                                itemId: draft.id,
+                                fileName: file.originalName,
+                                filePath: path.posix.join(
+                                    MASS_REQUEST_ATTACHMENT_ROOT,
+                                    formatAttachmentDateSegment(massCreatedAt),
+                                    String(draft.requestNo),
+                                    path.basename(String(file.newName))
+                                ),
+                                fileType: file.mimeType,
+                                tempPath: file.tempPath,
+                            });
                         }
-
-                        const publicDir = MASS_REQUEST_PUBLIC_DIRECTORY;
-                        for (const attachment of resolvedAttachments) {
-                            const finalPath = path.join(
-                                publicDir,
-                                attachment.file_path
-                            );
-                            const finalDir = path.dirname(finalPath);
-                            if (!fs.existsSync(finalDir)) {
-                                fs.mkdirSync(finalDir, { recursive: true });
-                            }
-                            const rawData = fs.readFileSync(attachment.tempPath);
-                            fs.writeFileSync(finalPath, rawData);
-                            savedFiles.push(finalPath);
-                        }
-                        insertedItems.push({
-                            ...itemRow,
-                            attachments: persistedAttachments,
-                        });
                     }
+
+                    const persistedAttachments =
+                        await insertMassRequestAttachmentsBatch(
+                            client,
+                            attachmentDrafts
+                        );
+                    const attachmentsByItemId = new Map(
+                        itemDrafts.map(draft => [draft.id, []])
+                    );
+                    let groupedAttachmentCount = 0;
+                    for (const persisted of persistedAttachments) {
+                        const itemAttachments = attachmentsByItemId.get(
+                            Number(persisted.item_id)
+                        );
+
+                        if (itemAttachments) {
+                            itemAttachments.push(persisted);
+                            groupedAttachmentCount += 1;
+                        }
+                    }
+
+                    // Every row that was inserted has to land on the item it
+                    // belongs to. One that cannot be placed is committed to the
+                    // table but missing from the response, so the requester is
+                    // told the item has no files while the files are there.
+                    // Fail the submit rather than answer with a partial list.
+                    if (groupedAttachmentCount !== attachmentDrafts.length) {
+                        console.error(
+                            `Mass request ${massRequestNo}: matched ${groupedAttachmentCount} of ${attachmentDrafts.length} attachments to an item`
+                        );
+                        throw Object.assign(
+                            new Error("Failed to save mass request attachments"),
+                            {
+                                statusCode: 500,
+                                code: "MASS_REQUEST_ATTACHMENT_PERSIST_MISMATCH",
+                            }
+                        );
+                    }
+
+                    // Files are written once, after every insert has succeeded:
+                    // a failed insert then leaves nothing on disk to clean up.
+                    const publicDir = MASS_REQUEST_PUBLIC_DIRECTORY;
+                    for (const attachment of attachmentDrafts) {
+                        const finalPath = path.join(
+                            publicDir,
+                            attachment.filePath
+                        );
+                        const finalDir = path.dirname(finalPath);
+                        if (!fs.existsSync(finalDir)) {
+                            fs.mkdirSync(finalDir, { recursive: true });
+                        }
+                        const rawData = fs.readFileSync(attachment.tempPath);
+                        fs.writeFileSync(finalPath, rawData);
+                        savedFiles.push(finalPath);
+                    }
+
+                    const insertedItems = itemDrafts.map(draft => ({
+                        // id is bigserial, which the driver reads back as a
+                        // string; the response carried that type before the
+                        // ids were reserved up front, so keep it.
+                        id: String(draft.id),
+                        item_no: draft.itemNo,
+                        request_no: draft.requestNo,
+                        ticket_type: draft.ticketType,
+                        status: "Submit",
+                        assigned_to: draft.assignedTo,
+                        created_by: draft.createdBy,
+                        created_at: massCreatedAt,
+                        attachments: attachmentsByItemId.get(draft.id) ?? [],
+                    }));
 
                     await client.query("COMMIT");
 
@@ -8273,6 +8440,9 @@ module.exports = {
     updateSingleRequestStepRow,
     claimMdmSingleRequestStep,
     insertMassItemApprovalSteps,
+    insertMassItemApprovalStepsBatch,
+    allocateMassItemIds,
+    insertMassRequestItems,
     loadMassItemSteps,
     updateMassItemStepRowsByLevel,
     claimMdmMassItemStep,
@@ -8289,6 +8459,7 @@ module.exports = {
     MASS_REQUEST_MAX_ATTACHMENTS_PER_ITEM,
     getMassRequestItemAttachments,
     insertMassRequestAttachment,
+    insertMassRequestAttachmentsBatch,
     persistMassRequestAttachmentFiles,
     applyMassRequestAttachmentChange,
     applyMassRequestItemAttachmentChanges,
