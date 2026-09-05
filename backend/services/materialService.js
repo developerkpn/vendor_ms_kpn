@@ -4513,6 +4513,11 @@ const MaterialRequests = {
                         await prepareSingleRequestApprovalEditPatch({
                             snapshot,
                             editedRequest,
+                            // An approver corrects the request as part of approving it, so
+                            // the material group is editable on this path too. A sub group
+                            // sent alongside it is re-validated against the corrected group,
+                            // not against the one the request was submitted with.
+                            allowMaterialGroupChange: true,
                             getSubGroupById: module.exports.getSubGroupById,
                             validateMaterialRequestTemplate:
                                 MaterialTemplate.validateMaterialRequestTemplate,
