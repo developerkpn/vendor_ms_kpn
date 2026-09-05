@@ -2609,6 +2609,17 @@ const Material = {
                 let materialsQueryResult = [];
                 let groupCode = null;
                 let subGroupCode = null;
+                // The filename reports the filters that produced the file, so the
+                // group code is needed on every branch, not only the one that
+                // filters by group alone.
+                if (groupId) {
+                    const groupRes = await client.query(
+                        "SELECT code FROM mat_item_group WHERE id = $1",
+                        [groupId]
+                    );
+                    if (groupRes.rows.length > 0)
+                        groupCode = groupRes.rows[0].code;
+                }
                 if (searchTerm && searchTerm.trim() !== "") {
                     const safeSearchTerm = String(searchTerm || "").trim();
                     const wildcard = parseWildcardSearch(safeSearchTerm);
@@ -2668,8 +2679,11 @@ const Material = {
                             LEFT JOIN mst_user u ON m.created_by = u.user_id
                             WHERE (m.dffromclient IS NULL OR m.dffromclient = false)
                             AND CONCAT_WS(' ', ${searchableFields.join(", ")}) ILIKE ALL(ARRAY[${ilikePatterns.join(", ")}])
+                            ${groupId ? ` AND mig.id = $${wildcard.segments.length + 1}` : ""}
                             ORDER BY m.code ASC, m.name ASC`,
-                            [...wildcard.segments]
+                            groupId
+                                ? [...wildcard.segments, groupId]
+                                : [...wildcard.segments]
                         );
                     } else {
                         const toTsQuery = input =>
@@ -2733,8 +2747,11 @@ const Material = {
                                     FROM unnest(string_to_array($2, ' ')) AS word
                                 )
                             )
+                            ${groupId ? " AND mig.id = $3" : ""}
                             ORDER BY m.code ASC, m.name ASC`,
-                            [tsQuery, safeSearchTerm]
+                            groupId
+                                ? [tsQuery, safeSearchTerm, groupId]
+                                : [tsQuery, safeSearchTerm]
                         );
                     }
                     materialsQueryResult = result.rows;
@@ -2785,13 +2802,6 @@ const Material = {
                     } else if (groupId) {
                         where.push("mig.id = $" + (params.length + 1));
                         params.push(groupId);
-                        // Fetch group code
-                        const groupRes = await client.query(
-                            "SELECT code FROM mat_item_group WHERE id = $1",
-                            [groupId]
-                        );
-                        if (groupRes.rows.length > 0)
-                            groupCode = groupRes.rows[0].code;
                     }
                     if (where.length > 0) {
                         query += " WHERE " + where.join(" AND ");
