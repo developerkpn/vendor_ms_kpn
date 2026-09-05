@@ -1495,12 +1495,15 @@ test("getReworkEmailThread hides itself until the migration is applied", async (
 });
 
 // ---------------------------------------------------------------------------
-// Reply indicator: email_reply_count on the list / approval-inbox rows.
-// The Status cell says "a reply came back" without opening the detail, so the
-// count has to ride along on the four read queries that already feed it.
+// Approval indicator: email_sent_count + email_reply_count on the list /
+// approval-inbox rows. The Status cell says whether the mailed approver has
+// answered without opening the detail, so both counts have to ride along on
+// the four read queries that already feed it. Two and not one: zero replies
+// means both "no mail was ever sent" and "sent, still waiting".
 // ---------------------------------------------------------------------------
 
-// The scalar as each query composes it: a subquery, joined only inside itself.
+// The scalars as each query composes them: subqueries, joined only inside
+// themselves.
 const emailReplyCountScalarPattern = (kind, idExpr) =>
     new RegExp(
         String.raw`\(\s*SELECT COUNT\(rp\.id\)\s*` +
@@ -1512,32 +1515,100 @@ const emailReplyCountScalarPattern = (kind, idExpr) =>
         "i"
     );
 
-test("single request list and inbox queries expose email_reply_count", () => {
+const emailUnansweredCountScalarPattern = (kind, idExpr) =>
+    new RegExp(
+        String.raw`\(\s*SELECT COUNT\(e\.id\)\s*` +
+            String.raw`FROM mat_rework_email e\s*` +
+            String.raw`WHERE e\.request_kind = '${kind}'\s*` +
+            String.raw`AND e\.request_id = ${idExpr.replace(".", "\\.")}\s*` +
+            String.raw`AND UPPER\(COALESCE\(e\.send_status, ''\)\) = 'SENT'\s*` +
+            String.raw`AND NOT EXISTS \(\s*` +
+            String.raw`SELECT 1\s*` +
+            String.raw`FROM mat_rework_email_reply rp\s*` +
+            String.raw`WHERE rp\.rework_email_id = e\.id\s*\)\s*` +
+            String.raw`\)::int AS email_unanswered_count`,
+        "i"
+    );
+
+const emailSentCountScalarPattern = (kind, idExpr) =>
+    new RegExp(
+        String.raw`\(\s*SELECT COUNT\(e\.id\)\s*` +
+            String.raw`FROM mat_rework_email e\s*` +
+            String.raw`WHERE e\.request_kind = '${kind}'\s*` +
+            String.raw`AND e\.request_id = ${idExpr.replace(".", "\\.")}\s*` +
+            String.raw`AND UPPER\(COALESCE\(e\.send_status, ''\)\) = 'SENT'\s*` +
+            String.raw`\)::int AS email_sent_count`,
+        "i"
+    );
+
+test("single request list and inbox queries expose both e-mail counts", () => {
     for (const query of [
         materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
         materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     ]) {
         assert.match(query, emailReplyCountScalarPattern("SINGLE", "r.id"));
+        assert.match(query, emailSentCountScalarPattern("SINGLE", "r.id"));
+        assert.match(query, emailUnansweredCountScalarPattern("SINGLE", "r.id"));
     }
 });
 
-test("mass request list and inbox queries count replies across the batch thread", () => {
+test("mass request list and inbox queries count across the batch thread", () => {
     // MASS rows are filed under mat_mass_request.id (reworkEmailSender), so one
-    // count covers the whole batch's thread rather than a single item.
+    // pair of counts covers the whole batch's thread rather than a single item.
     for (const query of [
         materialService.__private.GET_MASS_REQUESTS_BY_USER_QUERY,
         materialService.__private.GET_MASS_REQUEST_APPROVAL_INBOX_QUERY,
     ]) {
         assert.match(query, emailReplyCountScalarPattern("MASS", "m.id"));
+        assert.match(query, emailSentCountScalarPattern("MASS", "m.id"));
+        assert.match(query, emailUnansweredCountScalarPattern("MASS", "m.id"));
     }
 });
 
-test("the reply count is additive — it can never multiply a request row", () => {
-    // Cutting the scalar subquery out must leave no reference to either e-mail
-    // table behind: anything left over would be a join in the FROM chain, and a
-    // request with three replies would render as three rows.
-    const scalarSubquery =
-        /\(\s*SELECT COUNT\(rp\.id\)[\s\S]*?\)::int AS email_reply_count/g;
+test("outstanding mails are counted per mail, never by totalling replies", () => {
+    // A request can be reworked by mail more than once, and each mail is
+    // answered on its own. EXISTS asks each mail its own question, so a mail
+    // with three replies weighs the same as one with a single reply, and a mail
+    // with none stays outstanding however many its siblings collected.
+    // Comparing the sent and reply totals instead would call a request with one
+    // answered and one ignored mail fully answered.
+    for (const query of [
+        materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
+        materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+        materialService.__private.GET_MASS_REQUESTS_BY_USER_QUERY,
+        materialService.__private.GET_MASS_REQUEST_APPROVAL_INBOX_QUERY,
+    ]) {
+        assert.match(
+            query,
+            /NOT EXISTS \(\s*SELECT 1\s*FROM mat_rework_email_reply rp\s*WHERE rp\.rework_email_id = e\.id\s*\)/
+        );
+        assert.equal(query.match(/AS email_unanswered_count/gi).length, 1);
+    }
+});
+
+test("the sent count ignores a mail that never left the mailbox", () => {
+    // A FAILED send is reported by the thread section. Counting it here would
+    // park a request on "waiting for the approver" forever, because no reply
+    // can ever arrive to a mail that was not delivered.
+    for (const query of [
+        materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
+        materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
+        materialService.__private.GET_MASS_REQUESTS_BY_USER_QUERY,
+        materialService.__private.GET_MASS_REQUEST_APPROVAL_INBOX_QUERY,
+    ]) {
+        assert.match(query, /AND UPPER\(COALESCE\(e\.send_status, ''\)\) = 'SENT'/);
+    }
+});
+
+test("both counts are additive — neither can multiply a request row", () => {
+    // Cutting the scalar subqueries out must leave no reference to either
+    // e-mail table behind: anything left over would be a join in the FROM
+    // chain, and a request with three replies would render as three rows.
+    // One lazy pattern for all three: each match ends at the nearest
+    // ")::int AS email_<name>_count", so they strip individually whatever order
+    // the SELECT lists them in.
+    const emailScalarSubquery =
+        /\(\s*SELECT COUNT\([a-z]+\.id\)[\s\S]*?\)::int AS email_[a-z_]*count/g;
 
     for (const query of [
         materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
@@ -1546,11 +1617,13 @@ test("the reply count is additive — it can never multiply a request row", () =
         materialService.__private.GET_MASS_REQUEST_APPROVAL_INBOX_QUERY,
     ]) {
         assert.equal(query.match(/AS email_reply_count/gi).length, 1);
-        assert.doesNotMatch(query.replace(scalarSubquery, ""), /mat_rework_email/i);
+        assert.equal(query.match(/AS email_sent_count/gi).length, 1);
+        assert.equal(query.match(/AS email_unanswered_count/gi).length, 1);
+        assert.doesNotMatch(query.replace(emailScalarSubquery, ""), /mat_rework_email/i);
     }
 });
 
-test("every read query keeps email_reply_count when the migration is missing", () => {
+test("every read query keeps both e-mail counts when the migration is missing", () => {
     // 20260807_rework_email_thread.sql is applied by hand, and Postgres rejects
     // the whole statement at parse time when the tables are absent — so the
     // fallback drops the subquery for a constant instead of dropping the field.
@@ -1571,6 +1644,8 @@ test("every read query keeps email_reply_count when the migration is missing", (
 
     for (const query of legacyQueries) {
         assert.match(query, /0::int AS email_reply_count/i);
+        assert.match(query, /0::int AS email_sent_count/i);
+        assert.match(query, /0::int AS email_unanswered_count/i);
         assert.doesNotMatch(query, /mat_rework_email/i);
     }
 });
@@ -1597,7 +1672,7 @@ const makePreMigrationClient = () => {
     };
 };
 
-test("the single-request runners retry without the reply scalar before the migration", async () => {
+test("the single-request runners retry without the e-mail scalars before the migration", async () => {
     const listClient = makePreMigrationClient();
     await materialService.runSingleRequestListQuery(
         listClient,
@@ -1616,7 +1691,7 @@ test("the single-request runners retry without the reply scalar before the migra
     assert.match(inboxClient.attempts[1], /0::int AS email_reply_count/i);
 });
 
-test("the mass-request runners retry without the reply scalar before the migration", async () => {
+test("the mass-request runners retry without the e-mail scalars before the migration", async () => {
     const listClient = makePreMigrationClient();
     await materialService.runMassRequestsByUserQuery(listClient, "req.user");
 

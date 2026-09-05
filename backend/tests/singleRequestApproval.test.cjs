@@ -2670,7 +2670,9 @@ test("createMassRequest stores attachments under item request number path", asyn
         return { rows: [{ next_id: 15 }], rowCount: 1 };
       }
 
-      if (/SELECT approval_1_user_id, approval_2_user_id, approval_3_user_id\s+FROM mat_single_request_approval/i.test(queryText)) {
+      // No manual approvers configured for this requester, so the plan is
+      // MDM-only.
+      if (/FROM mat_approvers_matrix_level/i.test(queryText)) {
         return { rows: [], rowCount: 0 };
       }
 
@@ -2701,7 +2703,7 @@ test("createMassRequest stores attachments under item request number path", asyn
             {
               id: 88,
               item_no: 1,
-              request_no: "2000000088",
+              request_no: "3000000088",
               ticket_type: "Create",
               status: "Submit",
               assigned_to: "Approval 1",
@@ -2713,19 +2715,23 @@ test("createMassRequest stores attachments under item request number path", asyn
         };
       }
 
+      if (/INSERT INTO mat_mass_request_item_approval_step\s*\(/i.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
       if (/INSERT INTO mat_mass_request_attachment\s*\(/i.test(queryText)) {
         insertedAttachmentParams = params;
+        const [itemIds, fileNames, filePaths, fileTypes] = params;
         return {
-          rows: [
-            {
-              id: 501,
-              file_name: params[1],
-              file_path: params[2],
-              file_type: params[3],
-              created_at: new Date("2026-06-05T09:00:00.000Z"),
-            },
-          ],
-          rowCount: 1,
+          rows: itemIds.map((itemId, index) => ({
+            id: 501 + index,
+            item_id: itemId,
+            file_name: fileNames[index],
+            file_path: filePaths[index],
+            file_type: fileTypes[index],
+            created_at: new Date("2026-06-05T09:00:00.000Z"),
+          })),
+          rowCount: itemIds.length,
         };
       }
 
@@ -2769,19 +2775,24 @@ test("createMassRequest stores attachments under item request number path", asyn
       massRequestReason: "Project",
     });
 
+    // The batch writes every attachment in one statement, so each parameter is
+    // the column's values across the whole batch. uploaded_by stays null on a
+    // submit: these files are the requester's own and this path has never
+    // captured a name for them.
     assert.deepEqual(insertedAttachmentParams, [
-      88,
-      "spec.pdf",
-      "attachments/mass-request/2026-06-05/2000000088/1717578000001_spec.pdf",
-      "application/pdf",
+      [88],
+      ["spec.pdf"],
+      ["attachments/mass-request/2026-06-05/3000000088/1717578000001_spec.pdf"],
+      ["application/pdf"],
+      [null],
     ]);
     assert.equal(
       result.items[0].attachments[0].file_path,
-      "attachments/mass-request/2026-06-05/2000000088/1717578000001_spec.pdf"
+      "attachments/mass-request/2026-06-05/3000000088/1717578000001_spec.pdf"
     );
     assert.match(
       writtenFilePaths[0],
-      /\/attachments\/mass-request\/2026-06-05\/2000000088\/1717578000001_spec\.pdf$/
+      /\/attachments\/mass-request\/2026-06-05\/3000000088\/1717578000001_spec\.pdf$/
     );
   } finally {
     db.connect = originalConnect;
@@ -2790,6 +2801,278 @@ test("createMassRequest stores attachments under item request number path", asyn
     require("fs").readFileSync = originalReadFileSync;
     require("fs").writeFileSync = originalWriteFileSync;
   }
+});
+
+// Shared rig for the batched mass-submit tests below. Records every statement
+// the service issues so a test can assert on the count as well as the values,
+// and stubs the fs calls so nothing touches the disk.
+const withMassRequestStubs = async (
+  { failOn = null, chainLevels = 0, unmatchedAttachmentItemId = null } = {},
+  run
+) => {
+  const originalConnect = db.connect;
+  const fsModule = require("fs");
+  const originalFs = {
+    existsSync: fsModule.existsSync,
+    mkdirSync: fsModule.mkdirSync,
+    readFileSync: fsModule.readFileSync,
+    writeFileSync: fsModule.writeFileSync,
+    unlinkSync: fsModule.unlinkSync,
+  };
+  const written = [];
+  const unlinked = [];
+  const statements = [];
+
+  fsModule.existsSync = target =>
+    written.includes(String(target).replace(/\\/g, "/"));
+  fsModule.mkdirSync = () => {};
+  fsModule.readFileSync = () => Buffer.from("stub");
+  fsModule.writeFileSync = target => {
+    written.push(String(target).replace(/\\/g, "/"));
+  };
+  fsModule.unlinkSync = target => {
+    unlinked.push(String(target).replace(/\\/g, "/"));
+  };
+
+  let nextItemId = 88;
+
+  db.connect = async () => ({
+    query: async (queryText, params = []) => {
+      statements.push({ queryText, params });
+
+      if (failOn && failOn.test(queryText)) {
+        throw new Error("simulated database failure");
+      }
+
+      if (queryText === "BEGIN" || queryText === "COMMIT" || queryText === "ROLLBACK") {
+        return { rows: [], rowCount: null };
+      }
+
+      if (/FROM mat_approvers_matrix_level/i.test(queryText)) {
+        return {
+          rows: Array.from({ length: chainLevels }, (_unused, index) => ({
+            level: index + 1,
+            approver_user_id: `APPROVER-${index + 1}`,
+          })),
+          rowCount: chainLevels,
+        };
+      }
+
+      if (/nextval\(pg_get_serial_sequence\('mat_mass_request', 'id'\)\)/i.test(queryText)) {
+        return { rows: [{ next_id: 15 }], rowCount: 1 };
+      }
+
+      if (/INSERT INTO mat_mass_request\s*\(/i.test(queryText)) {
+        return {
+          rows: [
+            {
+              id: 15,
+              mass_request_no: "2000000015",
+              created_at: new Date("2026-06-05T09:00:00.000Z"),
+            },
+          ],
+          rowCount: 1,
+        };
+      }
+
+      if (/nextval\(pg_get_serial_sequence\('mat_mass_request_item', 'id'\)\)/i.test(queryText)) {
+        const count = Number(params[0]);
+        return {
+          rows: Array.from({ length: count }, () => ({
+            next_id: nextItemId++,
+          })),
+          rowCount: count,
+        };
+      }
+
+      if (/INSERT INTO mat_mass_request_attachment\s*\(/i.test(queryText)) {
+        const [itemIds, fileNames, filePaths, fileTypes] = params;
+        return {
+          rows: itemIds.map((itemId, index) => ({
+            id: 501 + index,
+            item_id: unmatchedAttachmentItemId ?? itemId,
+            file_name: fileNames[index],
+            file_path: filePaths[index],
+            file_type: fileTypes[index],
+            created_at: new Date("2026-06-05T09:00:00.000Z"),
+          })),
+          rowCount: itemIds.length,
+        };
+      }
+
+      if (/INSERT INTO mat_mass_request_item\s*\(/i.test(queryText)) {
+        return { rows: [], rowCount: params[0].length };
+      }
+
+      if (/INSERT INTO mat_mass_request_item_approval_step\s*\(/i.test(queryText)) {
+        return { rows: [], rowCount: params[0].length };
+      }
+
+      if (/mat_request_comment/.test(queryText)) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      throw new Error(`Unexpected query: ${queryText}`);
+    },
+    release: () => {},
+  });
+
+  try {
+    return await run({ statements, written, unlinked });
+  } finally {
+    db.connect = originalConnect;
+    Object.assign(fsModule, originalFs);
+  }
+};
+
+const massRequestRows = count =>
+  Array.from({ length: count }, (_unused, index) => ({
+    plant: "P1",
+    sloc: "S1",
+    materialGroup: "CHEM",
+    materialSubGroup: "SUB",
+    description: `Item ${index + 1}`,
+    poText: "PO",
+    uom: "EA",
+    spesifikasiTambahan: "Spec",
+  }));
+
+const massRequestAttachments = count =>
+  Array.from({ length: count }, (_unused, index) => [
+    {
+      tempPath: uploadPath(`spec-${index + 1}.pdf`),
+      originalName: `spec-${index + 1}.pdf`,
+      newName: `1717578000001_spec-${index + 1}.pdf`,
+      mimeType: "application/pdf",
+    },
+  ]);
+
+test("createMassRequest pairs item_no and request_no across a multi-row batch", async () => {
+  await withMassRequestStubs({ chainLevels: 2 }, async ({ statements }) => {
+    const result = await materialService.createMassRequest({
+      rows: massRequestRows(3),
+      attachmentsByRow: massRequestAttachments(3),
+      createdBy: "REQ-01",
+      createdByUsername: "requester.user",
+      massRequestReason: "Project",
+    });
+
+    const itemInsert = statements.find(entry =>
+      /INSERT INTO mat_mass_request_item\s*\(/i.test(entry.queryText)
+    );
+    const [ids, massRequestIds, itemNos, requestNos] = itemInsert.params;
+
+    assert.deepEqual(ids, [88, 89, 90]);
+    assert.deepEqual(massRequestIds, [15, 15, 15]);
+    assert.deepEqual(itemNos, [1, 2, 3]);
+    assert.deepEqual(requestNos, ["3000000088", "3000000089", "3000000090"]);
+    assert.deepEqual(
+      result.items.map(item => item.request_no),
+      ["3000000088", "3000000089", "3000000090"]
+    );
+    // Each item keeps its own attachment rather than collecting the batch's.
+    assert.deepEqual(
+      result.items.map(item => item.attachments.map(a => a.item_id)),
+      [[88], [89], [90]]
+    );
+    // id is bigserial, so the response carries it as a string.
+    assert.deepEqual(
+      result.items.map(item => item.id),
+      ["88", "89", "90"]
+    );
+  });
+});
+
+test("createMassRequest writes one approval step row per item per plan level", async () => {
+  await withMassRequestStubs({ chainLevels: 2 }, async ({ statements }) => {
+    await materialService.createMassRequest({
+      rows: massRequestRows(3),
+      attachmentsByRow: massRequestAttachments(3),
+      createdBy: "REQ-01",
+      massRequestReason: "Project",
+    });
+
+    const stepInserts = statements.filter(entry =>
+      /INSERT INTO mat_mass_request_item_approval_step\s*\(/i.test(entry.queryText)
+    );
+
+    assert.equal(stepInserts.length, 1);
+    // 3 items x (2 manual approvers + MDM).
+    const [itemIds, levels, kinds] = stepInserts[0].params;
+    assert.equal(itemIds.length, 9);
+    assert.deepEqual(itemIds, [88, 88, 88, 89, 89, 89, 90, 90, 90]);
+    assert.deepEqual(levels, [1, 2, 3, 1, 2, 3, 1, 2, 3]);
+    assert.deepEqual(kinds.slice(0, 3), ["MANUAL", "MANUAL", "MDM"]);
+  });
+});
+
+test("createMassRequest statement count does not grow with the batch size", async () => {
+  const countFor = async rowCount =>
+    withMassRequestStubs({ chainLevels: 2 }, async ({ statements }) => {
+      await materialService.createMassRequest({
+        rows: massRequestRows(rowCount),
+        attachmentsByRow: massRequestAttachments(rowCount),
+        createdBy: "REQ-01",
+        massRequestReason: "Project",
+      });
+
+      return statements.length;
+    });
+
+  const twoRows = await countFor(2);
+  const tenRows = await countFor(10);
+
+  assert.equal(twoRows, tenRows);
+  assert.equal(tenRows, 12);
+});
+
+test("createMassRequest leaves no files behind when an insert fails", async () => {
+  await withMassRequestStubs(
+    { chainLevels: 2, failOn: /INSERT INTO mat_mass_request_attachment/i },
+    async ({ written, unlinked }) => {
+      await assert.rejects(
+        materialService.createMassRequest({
+          rows: massRequestRows(3),
+          attachmentsByRow: massRequestAttachments(3),
+          createdBy: "REQ-01",
+          massRequestReason: "Project",
+        }),
+        /simulated database failure/
+      );
+
+      // Files are written only after every insert succeeds, so a failed insert
+      // has nothing to roll back on disk.
+      assert.deepEqual(written, []);
+      assert.deepEqual(unlinked, []);
+    }
+  );
+});
+
+test("createMassRequest fails the submit when an attachment cannot be placed on its item", async () => {
+  await withMassRequestStubs(
+    { chainLevels: 2, unmatchedAttachmentItemId: 999 },
+    async ({ statements, written }) => {
+      await assert.rejects(
+        materialService.createMassRequest({
+          rows: massRequestRows(3),
+          attachmentsByRow: massRequestAttachments(3),
+          createdBy: "REQ-01",
+          massRequestReason: "Project",
+        }),
+        error =>
+          error.code === "MASS_REQUEST_ATTACHMENT_PERSIST_MISMATCH" &&
+          error.statusCode === 500
+      );
+
+      // Rather than answer with items whose files are missing from the
+      // response, the whole batch is rolled back and nothing reaches disk.
+      assert.equal(
+        statements.filter(entry => entry.queryText === "ROLLBACK").length,
+        1
+      );
+      assert.deepEqual(written, []);
+    }
+  );
 });
 
 test("material model exposes single request rework and detail methods", () => {
