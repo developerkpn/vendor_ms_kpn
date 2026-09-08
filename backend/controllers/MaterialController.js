@@ -3466,8 +3466,8 @@ const MaterialController = {
             const groupId = req.query.groupId || null;
             const subGroupId = req.query.subGroupId || null;
             const searchTerm = req.query.q || null;
-            const { buffer, groupCode, subGroupCode } =
-                await Material.exportMaterialsToExcel(
+            const { groupCode, subGroupCode } =
+                await Material.resolveMaterialExportFilterCodes(
                     groupId,
                     subGroupId,
                     searchTerm
@@ -3518,10 +3518,24 @@ const MaterialController = {
                 "Content-Disposition",
                 `attachment; filename=${filename}`
             );
-            res.setHeader("Content-Length", buffer.length);
-            res.send(buffer);
+            // No Content-Length: the workbook is written to the response as it
+            // is built, so its size is not known when the headers go out.
+            await Material.streamMaterialsToExcel(
+                res,
+                groupId,
+                subGroupId,
+                searchTerm
+            );
         } catch (error) {
             console.error("Materials Excel export error:", error);
+            if (res.headersSent) {
+                // Part of the workbook is already on the wire, so there is no
+                // way back to a JSON error. Destroying the response fails the
+                // transfer instead of handing the client a truncated file that
+                // looks like a complete one.
+                res.destroy();
+                return;
+            }
             res.status(500).json({
                 success: false,
                 message: "Failed to export materials to Excel",
