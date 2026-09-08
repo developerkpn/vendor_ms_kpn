@@ -4,15 +4,15 @@ const TRANS = require("../config/transaction");
 const Vendor = require("../models/VendorModel");
 
 const Coupa = {
-    async getBankId(client, bank_key) {
-        const res = await client.query(
-            `select id from mst_bank_sap where bank_key = $1`,
-            [bank_key]
-        );
+async getBankId(client, bank_id_or_key) {
+    const res = await client.query(
+        'select id from mst_bank_sap where bank_key = $1 or bank_code = $1 or id::text = $1',
+        [bank_id_or_key]
+    );
 
-        return res.rows[0]?.id || null;
-    },
-    async submitVendorCoupa({ ven_detail, ven_banks }) {
+    return res.rows[0]?.id || null;
+},
+async submitVendorCoupa({ ven_detail, ven_banks }) {
         const client = await db.connect();
 
         try {
