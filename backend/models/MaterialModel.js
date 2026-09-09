@@ -5,6 +5,7 @@ const path = require("path");
 const DBClientWrapper = require("../helper/DBClientWrapper.js");
 const getMimeType = require("../helper/mimetype.js");
 const xlsx = require("xlsx");
+const Exceljs = require("exceljs");
 const axios = require("axios");
 const pool = require("../config/connection");
 const saveToDatabase = require("../helper/sap_seeding");
@@ -16,6 +17,263 @@ function parseWildcardSearch(term) {
     const segments = term.split('*').map(s => s.trim()).filter(s => s.length > 0);
     if (segments.length === 0) return null;
     return { isWildcard: true, segments };
+}
+
+// Material Excel export. The workbook is streamed to the caller's response as
+// it is built, so the pieces below are written to be used one page at a time
+// rather than over a whole result set.
+
+const MATERIAL_EXPORT_BATCH_SIZE = 10000;
+const MATERIAL_EXPORT_ROW_HEIGHT = 22;
+
+const MATERIAL_EXPORT_COLUMNS = [
+    { header: "Code", key: "code", width: 20 },
+    { header: "Description", key: "description", width: 60 },
+    { header: "UOM", key: "uom", width: 10 },
+    { header: "Group Code", key: "groupCode", width: 15 },
+    { header: "Group Name", key: "groupName", width: 25 },
+    { header: "Subgroup Code", key: "subGroupCode", width: 15 },
+    { header: "Subgroup Name", key: "subGroupName", width: 25 },
+    { header: "Alias 1", key: "alias1", width: 20 },
+    { header: "Alias 2", key: "alias2", width: 20 },
+    { header: "Alias 3", key: "alias3", width: 20 },
+    { header: "Created At", key: "createdAt", width: 22 },
+    { header: "Updated At", key: "updatedAt", width: 22 },
+];
+
+// Builds one page of export rows, ordered by code and starting after
+// `lastCode` (null for the first page). mat_sap_data.code is UNIQUE and NOT
+// NULL, so walking it with `code > lastCode` visits every row exactly once,
+// and the unique index makes each page a range scan rather than a fresh sort
+// of the whole table.
+function buildMaterialExportBatchQuery(
+    groupId,
+    subGroupId,
+    searchTerm,
+    lastCode
+) {
+    if (searchTerm && searchTerm.trim() !== "") {
+        const safeSearchTerm = String(searchTerm || "").trim();
+        const wildcard = parseWildcardSearch(safeSearchTerm);
+
+        const searchableFields = [
+            "m.code",
+            "m.name",
+            "COALESCE(m.description, '')",
+            "COALESCE(m.long_text, '')",
+            "COALESCE(m.unit_of_measurement, '')",
+            "COALESCE(m.alias1, '')",
+            "COALESCE(m.alias2, '')",
+            "COALESCE(m.alias3, '')",
+        ];
+
+        if (wildcard) {
+            const params = [...wildcard.segments];
+            const ilikePatterns = wildcard.segments.map(
+                (_, i) => `'%' || $${i + 1} || '%'`
+            );
+            let groupClause = "";
+            if (groupId) {
+                params.push(groupId);
+                groupClause = `AND mig.id = $${params.length}`;
+            }
+            let keysetClause = "";
+            if (lastCode !== null) {
+                params.push(lastCode);
+                keysetClause = `AND m.code > $${params.length}`;
+            }
+            params.push(MATERIAL_EXPORT_BATCH_SIZE);
+            const sql = `SELECT
+                    m.id,
+                    m.code,
+                    m.name,
+                    m.description,
+                    m.long_text,
+                    m.unit_of_measurement,
+                    CASE
+                        WHEN m.description IS NOT NULL AND TRIM(m.description) <> '' AND m.long_text IS NOT NULL AND TRIM(m.long_text) <> '' THEN CONCAT(m.description, ' - ', m.long_text)
+                        WHEN m.description IS NOT NULL AND TRIM(m.description) <> '' THEN m.description
+                        WHEN m.long_text IS NOT NULL AND TRIM(m.long_text) <> '' THEN m.long_text
+                        ELSE NULL
+                    END AS combined_description,
+                    CASE
+                        WHEN m.dffromclient IS TRUE THEN 'Inactive'
+                        ELSE 'Active'
+                    END AS status,
+                    u.fullname AS "user_fullname",
+                    m.alias1,
+                    m.alias2,
+                    m.alias3,
+                    m.filter_code_1,
+                    m.filter_code_2,
+                    m.material_sub_group_id,
+                    m.created_at,
+                    m.updated_at,
+                    m.dfFromClient,
+                    m.created_by,
+                    mis.code AS "subGroupCode",
+                    mis.name AS "subGroupName",
+                    mig.code AS "groupCode",
+                    mig.name AS "groupName"
+                FROM mat_sap_data m
+                JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
+                JOIN mat_item_group mig ON mis.item_group_id = mig.id
+                LEFT JOIN mst_user u ON m.created_by = u.user_id
+                WHERE (m.dffromclient IS NULL OR m.dffromclient = false)
+                AND CONCAT_WS(' ', ${searchableFields.join(", ")}) ILIKE ALL(ARRAY[${ilikePatterns.join(", ")}])
+                ${groupClause}
+                ${keysetClause}
+                ORDER BY m.code ASC, m.name ASC
+                LIMIT $${params.length}`;
+            return { sql, params };
+        }
+
+        const toTsQuery = input =>
+            input
+                .trim()
+                .split(/\s+/)
+                .map(word => `${word}:*`)
+                .join(" & ");
+        const params = [toTsQuery(safeSearchTerm), safeSearchTerm];
+        let groupClause = "";
+        if (groupId) {
+            params.push(groupId);
+            groupClause = `AND mig.id = $${params.length}`;
+        }
+        let keysetClause = "";
+        if (lastCode !== null) {
+            params.push(lastCode);
+            keysetClause = `AND m.code > $${params.length}`;
+        }
+        params.push(MATERIAL_EXPORT_BATCH_SIZE);
+        const sql = `SELECT
+                m.id,
+                m.code,
+                m.name,
+                m.description,
+                m.long_text,
+                m.unit_of_measurement,
+                CASE
+                    WHEN m.description IS NOT NULL AND TRIM(m.description) <> '' AND m.long_text IS NOT NULL AND TRIM(m.long_text) <> '' THEN CONCAT(m.description, ' - ', m.long_text)
+                    WHEN m.description IS NOT NULL AND TRIM(m.description) <> '' THEN m.description
+                    WHEN m.long_text IS NOT NULL AND TRIM(m.long_text) <> '' THEN m.long_text
+                    ELSE NULL
+                END AS combined_description,
+                CASE
+                    WHEN m.dffromclient IS TRUE THEN 'Inactive'
+                    ELSE 'Active'
+                END AS status,
+                u.fullname AS "user_fullname",
+                m.alias1,
+                m.alias2,
+                m.alias3,
+                m.filter_code_1,
+                m.filter_code_2,
+                m.material_sub_group_id,
+                m.created_at,
+                m.updated_at,
+                m.dfFromClient,
+                m.created_by,
+                mis.code AS "subGroupCode",
+                mis.name AS "subGroupName",
+                mig.code AS "groupCode",
+                mig.name AS "groupName"
+            FROM mat_sap_data m
+            JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
+            JOIN mat_item_group mig ON mis.item_group_id = mig.id
+            LEFT JOIN mst_user u ON m.created_by = u.user_id
+            WHERE (m.dffromclient IS NULL OR m.dffromclient = false)
+            AND (
+                to_tsvector('english', COALESCE(m.name, '') || ' ' || COALESCE(m.description, '') || ' ' || COALESCE(m.long_text, '') || ' ' || COALESCE(m.unit_of_measurement, '') || ' ' || COALESCE(m.alias1, '') || ' ' || COALESCE(m.alias2, '') || ' ' || COALESCE(m.alias3, '') || ' ' || COALESCE(m.code, '')) @@ to_tsquery('english', $1)
+                OR (
+                    SELECT bool_and(
+                        m.code ILIKE '%' || word || '%'
+                        OR m.name ILIKE '%' || word || '%'
+                        OR m.description ILIKE '%' || word || '%'
+                        OR m.long_text ILIKE '%' || word || '%'
+                        OR COALESCE(m.unit_of_measurement, '') ILIKE '%' || word || '%'
+                        OR m.alias1 ILIKE '%' || word || '%'
+                        OR m.alias2 ILIKE '%' || word || '%'
+                        OR m.alias3 ILIKE '%' || word || '%'
+                    )
+                    FROM unnest(string_to_array($2, ' ')) AS word
+                )
+            )
+            ${groupClause}
+            ${keysetClause}
+            ORDER BY m.code ASC, m.name ASC
+            LIMIT $${params.length}`;
+        return { sql, params };
+    }
+
+    const params = [];
+    const where = [];
+    if (subGroupId) {
+        params.push(subGroupId);
+        where.push(`mis.id = $${params.length}`);
+    } else if (groupId) {
+        params.push(groupId);
+        where.push(`mig.id = $${params.length}`);
+    }
+    if (lastCode !== null) {
+        params.push(lastCode);
+        where.push(`m.code > $${params.length}`);
+    }
+    params.push(MATERIAL_EXPORT_BATCH_SIZE);
+    const sql = `
+        SELECT
+            m.code,
+            m.name,
+            m.description,
+            m.long_text,
+            m.unit_of_measurement,
+            mig.code as group_code,
+            mig.name as group_name,
+            mis.code as subgroup_code,
+            mis.name as subgroup_name,
+            m.alias1,
+            m.alias2,
+            m.alias3,
+            m.created_at,
+            m.updated_at
+        FROM mat_sap_data m
+        JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
+        JOIN mat_item_group mig ON mis.item_group_id = mig.id
+        LEFT JOIN mst_user u ON m.created_by = u.user_id
+        ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+        ORDER BY m.code ASC, m.name ASC
+        LIMIT $${params.length}`;
+    return { sql, params };
+}
+
+// Turns one database row into a sheet row. The search branches alias the group
+// and subgroup columns in camelCase and the no-search branch in snake_case, so
+// both spellings are read here.
+function buildMaterialExportRow(row) {
+    let desc =
+        row.description && row.long_text
+            ? `${row.description} - ${row.long_text}`
+            : row.description || row.long_text || "";
+    // Remove carriage returns and newlines
+    desc = desc.replace(/\r\n|\r|\n/g, " ");
+    return {
+        code: row.code,
+        description: desc,
+        uom: row.unit_of_measurement || "",
+        groupCode: row.group_code || row.groupCode,
+        groupName: row.group_name || row.groupName,
+        subGroupCode: row.subgroup_code || row.subGroupCode,
+        subGroupName: row.subgroup_name || row.subGroupName,
+        alias1: row.alias1,
+        alias2: row.alias2,
+        alias3: row.alias3,
+        createdAt: row.created_at
+            ? row.created_at.toISOString().slice(0, 19).replace("T", " ")
+            : "",
+        updatedAt: row.updated_at
+            ? row.updated_at.toISOString().slice(0, 19).replace("T", " ")
+            : "",
+    };
 }
 
 const Material = {
@@ -2602,16 +2860,19 @@ const Material = {
         }
     },
 
-    // Export materials to Excel (filtered by group/subgroup or search query)
-    exportMaterialsToExcel: async (groupId, subGroupId, searchTerm) => {
+    // Resolves the group/subgroup codes an export was filtered by. The filename
+    // reports those filters and has to be on the response before the workbook
+    // starts streaming, so they are looked up ahead of the rows. Only the
+    // no-search export filters by subgroup, so a search never reports one.
+    resolveMaterialExportFilterCodes: async (
+        groupId,
+        subGroupId,
+        searchTerm
+    ) => {
         try {
             return await DBClientWrapper(async client => {
-                let materialsQueryResult = [];
                 let groupCode = null;
                 let subGroupCode = null;
-                // The filename reports the filters that produced the file, so the
-                // group code is needed on every branch, not only the one that
-                // filters by group alone.
                 if (groupId) {
                     const groupRes = await client.query(
                         "SELECT code FROM mat_item_group WHERE id = $1",
@@ -2620,258 +2881,97 @@ const Material = {
                     if (groupRes.rows.length > 0)
                         groupCode = groupRes.rows[0].code;
                 }
-                if (searchTerm && searchTerm.trim() !== "") {
-                    const safeSearchTerm = String(searchTerm || "").trim();
-                    const wildcard = parseWildcardSearch(safeSearchTerm);
-
-                    const searchableFields = [
-                        "m.code",
-                        "m.name",
-                        "COALESCE(m.description, '')",
-                        "COALESCE(m.long_text, '')",
-                        "COALESCE(m.unit_of_measurement, '')",
-                        "COALESCE(m.alias1, '')",
-                        "COALESCE(m.alias2, '')",
-                        "COALESCE(m.alias3, '')",
-                    ];
-
-                    let result;
-                    if (wildcard) {
-                        const ilikePatterns = wildcard.segments.map(
-                            (_, i) => `'%' || $${i + 1} || '%'`
-                        );
-                        result = await client.query(
-                            `SELECT
-                                m.id,
-                                m.code,
-                                m.name,
-                                m.description,
-                                m.long_text,
-                                m.unit_of_measurement,
-                                CASE
-                                    WHEN m.description IS NOT NULL AND TRIM(m.description) <> '' AND m.long_text IS NOT NULL AND TRIM(m.long_text) <> '' THEN CONCAT(m.description, ' - ', m.long_text)
-                                    WHEN m.description IS NOT NULL AND TRIM(m.description) <> '' THEN m.description
-                                    WHEN m.long_text IS NOT NULL AND TRIM(m.long_text) <> '' THEN m.long_text
-                                    ELSE NULL
-                                END AS combined_description,
-                                CASE
-                                    WHEN m.dffromclient IS TRUE THEN 'Inactive'
-                                    ELSE 'Active'
-                                END AS status,
-                                u.fullname AS "user_fullname",
-                                m.alias1,
-                                m.alias2,
-                                m.alias3,
-                                m.filter_code_1,
-                                m.filter_code_2,
-                                m.material_sub_group_id,
-                                m.created_at,
-                                m.updated_at,
-                                m.dfFromClient,
-                                m.created_by,
-                                mis.code AS "subGroupCode",
-                                mis.name AS "subGroupName",
-                                mig.code AS "groupCode",
-                                mig.name AS "groupName"
-                            FROM mat_sap_data m
-                            JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
-                            JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                            LEFT JOIN mst_user u ON m.created_by = u.user_id
-                            WHERE (m.dffromclient IS NULL OR m.dffromclient = false)
-                            AND CONCAT_WS(' ', ${searchableFields.join(", ")}) ILIKE ALL(ARRAY[${ilikePatterns.join(", ")}])
-                            ${groupId ? ` AND mig.id = $${wildcard.segments.length + 1}` : ""}
-                            ORDER BY m.code ASC, m.name ASC`,
-                            groupId
-                                ? [...wildcard.segments, groupId]
-                                : [...wildcard.segments]
-                        );
-                    } else {
-                        const toTsQuery = input =>
-                            input
-                                .trim()
-                                .split(/\s+/)
-                                .map(word => `${word}:*`)
-                                .join(" & ");
-                        const tsQuery = toTsQuery(safeSearchTerm);
-                        result = await client.query(
-                            `SELECT
-                                m.id,
-                                m.code,
-                                m.name,
-                                m.description,
-                                m.long_text,
-                                m.unit_of_measurement,
-                                CASE
-                                    WHEN m.description IS NOT NULL AND TRIM(m.description) <> '' AND m.long_text IS NOT NULL AND TRIM(m.long_text) <> '' THEN CONCAT(m.description, ' - ', m.long_text)
-                                    WHEN m.description IS NOT NULL AND TRIM(m.description) <> '' THEN m.description
-                                    WHEN m.long_text IS NOT NULL AND TRIM(m.long_text) <> '' THEN m.long_text
-                                    ELSE NULL
-                                END AS combined_description,
-                                CASE
-                                    WHEN m.dffromclient IS TRUE THEN 'Inactive'
-                                    ELSE 'Active'
-                                END AS status,
-                                u.fullname AS "user_fullname",
-                                m.alias1,
-                                m.alias2,
-                                m.alias3,
-                                m.filter_code_1,
-                                m.filter_code_2,
-                                m.material_sub_group_id,
-                                m.created_at,
-                                m.updated_at,
-                                m.dfFromClient,
-                                m.created_by,
-                                mis.code AS "subGroupCode",
-                                mis.name AS "subGroupName",
-                                mig.code AS "groupCode",
-                                mig.name AS "groupName"
-                            FROM mat_sap_data m
-                            JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
-                            JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                            LEFT JOIN mst_user u ON m.created_by = u.user_id
-                            WHERE (m.dffromclient IS NULL OR m.dffromclient = false)
-                            AND (
-                                to_tsvector('english', COALESCE(m.name, '') || ' ' || COALESCE(m.description, '') || ' ' || COALESCE(m.long_text, '') || ' ' || COALESCE(m.unit_of_measurement, '') || ' ' || COALESCE(m.alias1, '') || ' ' || COALESCE(m.alias2, '') || ' ' || COALESCE(m.alias3, '') || ' ' || COALESCE(m.code, '')) @@ to_tsquery('english', $1)
-                                OR (
-                                    SELECT bool_and(
-                                        m.code ILIKE '%' || word || '%'
-                                        OR m.name ILIKE '%' || word || '%'
-                                        OR m.description ILIKE '%' || word || '%'
-                                        OR m.long_text ILIKE '%' || word || '%'
-                                        OR COALESCE(m.unit_of_measurement, '') ILIKE '%' || word || '%'
-                                        OR m.alias1 ILIKE '%' || word || '%'
-                                        OR m.alias2 ILIKE '%' || word || '%'
-                                        OR m.alias3 ILIKE '%' || word || '%'
-                                    )
-                                    FROM unnest(string_to_array($2, ' ')) AS word
-                                )
-                            )
-                            ${groupId ? " AND mig.id = $3" : ""}
-                            ORDER BY m.code ASC, m.name ASC`,
-                            groupId
-                                ? [tsQuery, safeSearchTerm, groupId]
-                                : [tsQuery, safeSearchTerm]
-                        );
-                    }
-                    materialsQueryResult = result.rows;
-                } else {
-                    let query = `
-                        SELECT
-                            m.code,
-                            m.name,
-                            m.description,
-                            m.long_text,
-                            m.unit_of_measurement,
-                            mig.code as group_code,
-                            mig.name as group_name,
-                            mis.code as subgroup_code,
-                            mis.name as subgroup_name,
-                            m.alias1,
-                            m.alias2,
-                            m.alias3,
-                            m.created_at,
-                            m.updated_at
-                        FROM mat_sap_data m
-                        JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
-                        JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                        LEFT JOIN mst_user u ON m.created_by = u.user_id
-                    `;
-                    const params = [];
-                    let where = [];
-                    if (subGroupId) {
-                        where.push("mis.id = $" + (params.length + 1));
-                        params.push(subGroupId);
-                        // Fetch subgroup code and its parent group code
-                        const subRes = await client.query(
-                            "SELECT code, item_group_id FROM mat_item_sub_group WHERE id = $1",
-                            [subGroupId]
-                        );
-                        if (subRes.rows.length > 0) {
-                            subGroupCode = subRes.rows[0].code;
-                            const groupIdFromSub = subRes.rows[0].item_group_id;
-                            if (groupIdFromSub) {
-                                const groupRes = await client.query(
-                                    "SELECT code FROM mat_item_group WHERE id = $1",
-                                    [groupIdFromSub]
-                                );
-                                if (groupRes.rows.length > 0)
-                                    groupCode = groupRes.rows[0].code;
-                            }
+                const hasSearch = Boolean(
+                    searchTerm && searchTerm.trim() !== ""
+                );
+                if (!hasSearch && subGroupId) {
+                    // Fetch subgroup code and its parent group code
+                    const subRes = await client.query(
+                        "SELECT code, item_group_id FROM mat_item_sub_group WHERE id = $1",
+                        [subGroupId]
+                    );
+                    if (subRes.rows.length > 0) {
+                        subGroupCode = subRes.rows[0].code;
+                        const groupIdFromSub = subRes.rows[0].item_group_id;
+                        if (groupIdFromSub) {
+                            const groupRes = await client.query(
+                                "SELECT code FROM mat_item_group WHERE id = $1",
+                                [groupIdFromSub]
+                            );
+                            if (groupRes.rows.length > 0)
+                                groupCode = groupRes.rows[0].code;
                         }
-                    } else if (groupId) {
-                        where.push("mig.id = $" + (params.length + 1));
-                        params.push(groupId);
                     }
-                    if (where.length > 0) {
-                        query += " WHERE " + where.join(" AND ");
-                    }
-                    query += " ORDER BY m.code ASC, m.name ASC";
-                    const result = await client.query(query, params);
-                    materialsQueryResult = result.rows;
                 }
-                // Prepare data for Excel
-                const materialsData = materialsQueryResult.map(row => {
-                    let desc =
-                        row.description && row.long_text
-                            ? `${row.description} - ${row.long_text}`
-                            : row.description || row.long_text || "";
-                    // Remove carriage returns and newlines
-                    desc = desc.replace(/\r\n|\r|\n/g, " ");
-                    return {
-                        Code: row.code,
-                        Description: desc,
-                        UOM: row.unit_of_measurement || "",
-                        "Group Code": row.group_code || row.groupCode,
-                        "Group Name": row.group_name || row.groupName,
-                        "Subgroup Code": row.subgroup_code || row.subGroupCode,
-                        "Subgroup Name": row.subgroup_name || row.subGroupName,
-                        "Alias 1": row.alias1,
-                        "Alias 2": row.alias2,
-                        "Alias 3": row.alias3,
-                        "Created At": row.created_at
-                            ? row.created_at
-                                  .toISOString()
-                                  .slice(0, 19)
-                                  .replace("T", " ")
-                            : "",
-                        "Updated At": row.updated_at
-                            ? row.updated_at
-                                  .toISOString()
-                                  .slice(0, 19)
-                                  .replace("T", " ")
-                            : "",
-                    };
-                });
-                const workbook = xlsx.utils.book_new();
-                const worksheet = xlsx.utils.json_to_sheet(materialsData);
-                const wscols = [
-                    { wch: 20 }, // Code
-                    { wch: 35 }, // Name
-                    { wch: 60 }, // Description
-                    { wch: 10 }, // UOM
-                    { wch: 15 }, // Group Code
-                    { wch: 25 }, // Group Name
-                    { wch: 15 }, // Subgroup Code
-                    { wch: 25 }, // Subgroup Name
-                    { wch: 20 }, // Alias 1
-                    { wch: 20 }, // Alias 2
-                    { wch: 20 }, // Alias 3
-                    { wch: 22 }, // Created At
-                    { wch: 22 }, // Updated At
-                ];
-                worksheet["!cols"] = wscols;
-                const rowCount = materialsData.length + 1; // +1 for header
-                worksheet["!rows"] = Array.from({ length: rowCount }, () => ({
-                    hpt: 22,
-                }));
-                xlsx.utils.book_append_sheet(workbook, worksheet, "Materials");
-                const buffer = xlsx.write(workbook, {
-                    type: "buffer",
-                    bookType: "xlsx",
-                });
-                return { buffer, groupCode, subGroupCode };
+                return { groupCode, subGroupCode };
             });
+        } catch (error) {
+            console.error("Error resolving material export filters:", error);
+            throw error;
+        }
+    },
+
+    // Writes the material export straight onto `res` as it is built. Rows are
+    // pulled a page at a time and committed as they arrive, so bytes start
+    // leaving within the first page instead of after the last one, and peak
+    // memory is bound by the page size rather than by the size of the table.
+    // The caller sets the response headers before calling; once the first byte
+    // is out an error can no longer become a JSON body, so the response is
+    // destroyed instead and the client sees a failed transfer.
+    streamMaterialsToExcel: async (res, groupId, subGroupId, searchTerm) => {
+        try {
+            const workbook = new Exceljs.stream.xlsx.WorkbookWriter({
+                stream: res,
+            });
+            const worksheet = workbook.addWorksheet("Materials");
+            worksheet.columns = MATERIAL_EXPORT_COLUMNS;
+            const headerRow = worksheet.getRow(1);
+            headerRow.height = MATERIAL_EXPORT_ROW_HEIGHT;
+            headerRow.commit();
+
+            const aborted = await DBClientWrapper(async client => {
+                let lastCode = null;
+                for (;;) {
+                    const { sql, params } = buildMaterialExportBatchQuery(
+                        groupId,
+                        subGroupId,
+                        searchTerm,
+                        lastCode
+                    );
+                    const result = await client.query(sql, params);
+                    if (result.rows.length === 0) return false;
+                    for (const row of result.rows) {
+                        const sheetRow = worksheet.addRow(
+                            buildMaterialExportRow(row)
+                        );
+                        sheetRow.height = MATERIAL_EXPORT_ROW_HEIGHT;
+                        sheetRow.commit();
+                        lastCode = row.code;
+                    }
+                    // Wait for the socket to drain before pulling the next
+                    // page, so a client slower than the database cannot make
+                    // the rows pile up in memory again. A client that has gone
+                    // away resolves this through "close" instead, and the
+                    // export stops rather than holding the connection open.
+                    if (res.writableNeedDrain) {
+                        await new Promise(resolve => {
+                            const done = () => {
+                                res.off("drain", done);
+                                res.off("close", done);
+                                resolve();
+                            };
+                            res.once("drain", done);
+                            res.once("close", done);
+                        });
+                    }
+                    if (res.destroyed) return true;
+                    if (result.rows.length < MATERIAL_EXPORT_BATCH_SIZE)
+                        return false;
+                }
+            });
+
+            if (aborted) return;
+            await workbook.commit();
         } catch (error) {
             console.error("Error exporting materials to Excel:", error);
             throw error;
