@@ -372,7 +372,12 @@ const assertMassRequestRowsAreCreateOnly = (rows = []) => {
 
 // Each item's running number must be strictly NUMERIC, matching the fixed
 // 3-char suffix segment buildSingleRequestFinalCode composes into GGG.SSS.NNN.
-const MASS_FINAL_CODE_SUFFIX_PATTERN = /^\d{3}$/;
+// Same rule as the single-request suffix (buildSingleRequestFinalCode): three
+// characters, letters and/or digits, e.g. "B80". This was \d{3} — digits only —
+// which rejected a valid running number that Master Data could enter without
+// complaint on a single request, and said "must be exactly 3 digits" while doing
+// it. The frontend has always allowed letters here, so the two disagreed.
+const MASS_FINAL_CODE_SUFFIX_PATTERN = /^[A-Z0-9]{3}$/;
 
 const buildMassFinalCodeError = (message, code, statusCode = 409) =>
     Object.assign(new Error(message), {
@@ -396,13 +401,16 @@ const resolveMassItemFinalCodeSuffixes = ({
 
     return items.map((item, index) => {
         const itemNo = item?.item_no ?? index + 1;
+        // Uppercased before the test and on the way out, so a lowercase entry is
+        // accepted and the composed material code is stored in one casing —
+        // matching what the single-request path does with its own suffix.
         const suffix = normalizeCodeSegment(
             suffixByItemId[String(item?.item_id ?? item?.id ?? "")]
-        );
+        ).toUpperCase();
 
         if (!MASS_FINAL_CODE_SUFFIX_PATTERN.test(suffix)) {
             throw buildMassFinalCodeError(
-                `Item ${itemNo}: running number is required and must be exactly 3 digits.`,
+                `Item ${itemNo}: running number is required and must be exactly 3 letters or digits.`,
                 "MASS_REQUEST_FINAL_CODE_SUFFIX_INVALID",
                 400
             );

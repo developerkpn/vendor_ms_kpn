@@ -13,3 +13,4 @@ public/build
 ssl
 Dockerfilebk.prod
 *.zip
+backend/tmp

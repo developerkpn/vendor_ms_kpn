@@ -1,5 +1,6 @@
 const Material = require("../models/MaterialModel");
 const materialService = require("../services/materialService");
+const materialAiMatchService = require("../services/materialAiMatchService");
 const MaterialTemplate = require("../models/MaterialTemplateModel");
 const formidable = require("formidable");
 const fs = require("fs");
@@ -1823,6 +1824,9 @@ const MaterialController = {
                 createdByUsername: req.cookies?.username ?? null,
             });
 
+            // Advisory AI match runs after the write; never blocks the response.
+            materialAiMatchService.scheduleSingleRequestMatch(createdRequest?.id);
+
             return res.status(201).json({
                 success: true,
                 message: "Single material request created successfully",
@@ -1885,11 +1889,19 @@ const MaterialController = {
                 "uom",
                 "spesifikasiTambahan",
             ];
+            // Optional on a mass row. Named here rather than tested inline so
+            // this list and the requester form's MASS_OPTIONAL_FIELDS stay
+            // readable as the same rule; mat_mass_request_item.material_sub_group
+            // is already nullable, so an omitted sub group needs no schema change.
+            const optionalTextFields = new Set([
+                "poText",
+                "spesifikasiTambahan",
+                "materialSubGroup",
+            ]);
             const requiredFieldMessages = {
                 plant: "Plant wajib diisi.",
                 sloc: "Sloc wajib diisi.",
                 materialGroup: "Material group wajib diisi.",
-                materialSubGroup: "Sub material group wajib diisi.",
                 description: "Material description wajib diisi.",
                 uom: "Base UoM wajib diisi.",
             };
@@ -1964,10 +1976,7 @@ const MaterialController = {
                 filledRowIndexes.push(rowIndex);
 
                 for (const fieldKey of textFields) {
-                    if (
-                        fieldKey === "poText" ||
-                        fieldKey === "spesifikasiTambahan"
-                    ) {
+                    if (optionalTextFields.has(fieldKey)) {
                         continue;
                     }
                     if (String(row?.[fieldKey] || "").trim() === "") {
@@ -2070,6 +2079,11 @@ const MaterialController = {
                 createdByUsername: req.cookies?.username ?? null,
                 massRequestReason,
             });
+            // Advisory AI match runs after the write; never blocks the response.
+            materialAiMatchService.scheduleMassRequestMatch(
+                createdMassRequest?.id
+            );
+
             return res.status(201).json({
                 success: true,
                 message: "Mass material request created successfully",
@@ -2421,6 +2435,86 @@ const MaterialController = {
                 error: error.message,
             });
         }
+    },
+
+    // --- AI material match (advisory) --------------------------------------
+    // Plain reads of the ranking stored after submit/rework, plus a manual
+    // re-queue for the approval dialogs. `enabled` travels with every read so
+    // the panel can hide itself when the feature is off rather than guessing
+    // from an empty result — an empty list means "the AI found nothing", which
+    // is a different thing entirely.
+
+    getSingleRequestAiMatch: async (req, res) => {
+        try {
+            const match = await materialAiMatchService.getSingleRequestMatch(
+                req.params.id
+            );
+
+            return res.status(200).json({
+                success: true,
+                enabled: materialAiMatchService.getConfig().enabled,
+                data: match,
+            });
+        } catch (error) {
+            return res.status(500).json({
+                success: false,
+                message: "Failed to fetch AI material match",
+                error: error.message,
+            });
+        }
+    },
+
+    getMassRequestAiMatch: async (req, res) => {
+        try {
+            const matches = await materialAiMatchService.getMassRequestMatches(
+                req.params.id
+            );
+
+            return res.status(200).json({
+                success: true,
+                enabled: materialAiMatchService.getConfig().enabled,
+                data: matches,
+            });
+        } catch (error) {
+            return res.status(500).json({
+                success: false,
+                message: "Failed to fetch AI material match",
+                error: error.message,
+            });
+        }
+    },
+
+    rerunSingleRequestAiMatch: async (req, res) => {
+        if (!materialAiMatchService.getConfig().enabled) {
+            return res.status(409).json({
+                success: false,
+                message: "AI material match is disabled",
+            });
+        }
+
+        materialAiMatchService.scheduleSingleRequestMatch(req.params.id);
+
+        // 202: the run happens on a later tick, the caller polls for it.
+        return res.status(202).json({
+            success: true,
+            message: "AI material match queued",
+        });
+    },
+
+    rerunMassRequestAiMatch: async (req, res) => {
+        if (!materialAiMatchService.getConfig().enabled) {
+            return res.status(409).json({
+                success: false,
+                message: "AI material match is disabled",
+            });
+        }
+
+        materialAiMatchService.scheduleMassRequestMatch(req.params.id);
+
+        return res.status(202).json({
+            success: true,
+            message: "AI material match queued",
+        });
     },
 
     // --- Rework e-mail thread (chain replacement, notifyVia = EMAIL) --------
@@ -3050,6 +3144,9 @@ const MaterialController = {
                 attachments,
             });
 
+            // Advisory AI match runs after the write; never blocks the response.
+            materialAiMatchService.scheduleSingleRequestMatch(req.params.id);
+
             return res.status(200).json({
                 success: true,
                 message: "Single request rework saved successfully",
@@ -3604,6 +3701,9 @@ const MaterialController = {
                 items: req.body?.items ?? null,
                 comment: req.body?.comment ?? null,
             });
+
+            // Advisory AI match runs after the write; never blocks the response.
+            materialAiMatchService.scheduleMassRequestMatch(req.params.id);
 
             return res.status(200).json({
                 success: true,

@@ -117,8 +117,35 @@ test("resolveMassItemFinalCodeSuffixes rejects a missing entry, naming the item"
     assert.match(error.message, /Item 2/);
 });
 
-test("resolveMassItemFinalCodeSuffixes rejects a non-numeric entry, naming the item", () => {
-    for (const suffix of ["A01", "1", "12", "1234", "", null, undefined, "  "]) {
+test("resolveMassItemFinalCodeSuffixes accepts letters, as the single-request path does", () => {
+    // Reported from Master Data: "B80" is a valid running number and was being
+    // refused here with "must be exactly 3 digits", while the same value is
+    // accepted on a single request. The frontend allowed letters all along.
+    assert.deepEqual(
+        resolveMassItemFinalCodeSuffixes({
+            finalCodeSuffixes: { 11: "B80", 12: "A01", 13: "021" },
+            items: itemStubs,
+        }),
+        ["B80", "A01", "021"]
+    );
+});
+
+test("resolveMassItemFinalCodeSuffixes uppercases what it returns", () => {
+    // The composed material code is stored in one casing, so a lowercase entry
+    // is accepted rather than refused on a technicality.
+    assert.deepEqual(
+        resolveMassItemFinalCodeSuffixes({
+            finalCodeSuffixes: { 11: "b80", 12: " a01 ", 13: "021" },
+            items: itemStubs,
+        }),
+        ["B80", "A01", "021"]
+    );
+});
+
+test("resolveMassItemFinalCodeSuffixes rejects a malformed entry, naming the item", () => {
+    // Wrong length, blank, or anything outside letters and digits. Three
+    // alphanumeric characters is the whole rule.
+    for (const suffix of ["1", "12", "1234", "", null, undefined, "  ", "A-1", "A 1", "A.1"]) {
         const error = captureThrow(
             () =>
                 resolveMassItemFinalCodeSuffixes({
@@ -391,15 +418,31 @@ test("approveMassRequest writes each item's own entered final code and flags the
     assert.equal(pushCalls[0].massRequestId, 5);
 });
 
-test("approveMassRequest requires a numeric running number for every item at the Master Data step", async () => {
+test("approveMassRequest requires a well-formed running number for every item at the Master Data step", async () => {
+    // Too short. Letters are fine — see the test below — so the rejected value
+    // here has to be malformed rather than merely non-numeric.
     const error = await captureReject(() =>
         runMassApprove({
-            finalCodeSuffixes: { ...massFinalCodeSuffixes, 12: "A01" },
+            finalCodeSuffixes: { ...massFinalCodeSuffixes, 12: "12" },
         })
     );
 
     assert.equal(error.statusCode, 400);
     assert.equal(error.code, "MASS_REQUEST_FINAL_CODE_SUFFIX_INVALID");
+});
+
+test("approveMassRequest composes a final code from a running number containing letters", async () => {
+    // The reported case: Master Data enters "B80" and the approve went through
+    // on a single request but failed on a mass one.
+    const { result } = await runMassApprove({
+        finalCodeSuffixes: { ...massFinalCodeSuffixes, 12: "B80" },
+    });
+
+    assert.deepEqual(
+        result.final_codes.map(entry => entry.final_code),
+        ["901.031.005", "901.031.B80", "902.007.007"]
+    );
+    assert.equal(result.status, "DONE");
 });
 
 test("approveMassRequest 409s when a composed code already exists in SAP master data", async () => {

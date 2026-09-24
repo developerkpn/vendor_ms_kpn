@@ -260,6 +260,11 @@ EmailModel.SendManager = async (
             [role_id, bu_id, dept_id]
         );
         let data_mgr = res_data_mgr[0];
+        if (!data_mgr) {
+            throw new Error(
+                `No active manager found for role=${role_id}, bu=${bu_id}, dept=${dept_id}`
+            );
+        }
         let title_mgr = "Bapak";
         if (data_mgr.gender == "F") {
             title_mgr = "Ibu";
@@ -437,6 +442,11 @@ EmailModel.SendCLevel = async (
             [role_id, bu_id, dept_id]
         );
         let data_mgr = res_data_mgr[0];
+        if (!data_mgr) {
+            throw new Error(
+                `No active manager found for role=${role_id}, bu=${bu_id}, dept=${dept_id}`
+            );
+        }
         let title_mgr = "Mr. ";
         if (data_mgr.gender == "F") {
             title_mgr = "Mrs. ";
