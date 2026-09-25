@@ -1,0 +1,774 @@
+const assert = require("node:assert/strict");
+const test = require("node:test");
+const fs = require("fs");
+const path = require("path");
+
+const service = require("../services/materialAiMatchService");
+
+// Nothing in this file may reach a database or the recommender. Every run test
+// replaces the four I/O seams by assignment — which is why the service calls
+// itself through module.exports — and puts them back afterwards.
+const IO_SEAMS = [
+  "loadSingleRequestRow",
+  "loadMassRequestItems",
+  "upsertMatch",
+  "callRecommender",
+  "runSingleRequestMatch",
+  "runMassRequestMatch",
+];
+
+function stubService(stubs) {
+  const original = {};
+  for (const name of IO_SEAMS) {
+    original[name] = service[name];
+  }
+  Object.assign(service, stubs);
+  return () => Object.assign(service, original);
+}
+
+// MATERIAL_AI_MATCH_* is read on every getConfig() call, so a test can flip it
+// as long as it puts the previous value back — including "it was not set".
+function withEnv(values, fn) {
+  const original = {};
+  for (const key of Object.keys(values)) {
+    original[key] = process.env[key];
+  }
+  const restore = () => {
+    for (const key of Object.keys(values)) {
+      if (original[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = original[key];
+      }
+    }
+  };
+
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+
+  // Restore only once the callback is actually finished: an async one is still
+  // running when it hands back its promise, and putting the environment back
+  // underneath it would test the wrong configuration.
+  let result;
+  try {
+    result = fn();
+  } catch (error) {
+    restore();
+    throw error;
+  }
+  if (result && typeof result.then === "function") {
+    return result.then(
+      value => {
+        restore();
+        return value;
+      },
+      error => {
+        restore();
+        throw error;
+      }
+    );
+  }
+  restore();
+  return result;
+}
+
+const tick = () => new Promise(resolve => setImmediate(resolve));
+
+// ---------------------------------------------------------------------------
+// getConfig — the feature switch and the knobs around it. top_k is clamped
+// rather than trusted because it goes straight into a request to the model
+// server, and a typo'd 99 would ask it for a list no approver can read.
+// ---------------------------------------------------------------------------
+
+test("getConfig is disabled and defaulted when nothing is configured", () => {
+  withEnv(
+    {
+      MATERIAL_AI_MATCH_ENABLED: undefined,
+      MATERIAL_AI_MATCH_URL: undefined,
+      MATERIAL_AI_MATCH_TIMEOUT_MS: undefined,
+      MATERIAL_AI_MATCH_TOP_K: undefined,
+    },
+    () => {
+      const config = service.getConfig();
+      assert.equal(config.enabled, false);
+      assert.equal(config.baseUrl, "http://127.0.0.1:8000");
+      assert.equal(config.timeoutMs, 30000);
+      assert.equal(config.topK, 5);
+    }
+  );
+});
+
+test("getConfig only enables on the exact string true", () => {
+  withEnv({ MATERIAL_AI_MATCH_ENABLED: "TRUE" }, () => {
+    assert.equal(service.getConfig().enabled, false);
+  });
+  withEnv({ MATERIAL_AI_MATCH_ENABLED: "1" }, () => {
+    assert.equal(service.getConfig().enabled, false);
+  });
+  withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, () => {
+    assert.equal(service.getConfig().enabled, true);
+  });
+});
+
+test("getConfig strips trailing slashes from the base url", () => {
+  withEnv({ MATERIAL_AI_MATCH_URL: "http://ai-box:8000///" }, () => {
+    assert.equal(service.getConfig().baseUrl, "http://ai-box:8000");
+  });
+});
+
+test("getConfig clamps top_k and falls back on a bad timeout", () => {
+  withEnv({ MATERIAL_AI_MATCH_TOP_K: "99" }, () => {
+    assert.equal(service.getConfig().topK, 10);
+  });
+  withEnv({ MATERIAL_AI_MATCH_TOP_K: "0" }, () => {
+    assert.equal(service.getConfig().topK, 5);
+  });
+  withEnv({ MATERIAL_AI_MATCH_TOP_K: "-3" }, () => {
+    assert.equal(service.getConfig().topK, 1);
+  });
+  withEnv({ MATERIAL_AI_MATCH_TOP_K: "" }, () => {
+    assert.equal(service.getConfig().topK, 5);
+  });
+  withEnv({ MATERIAL_AI_MATCH_TOP_K: "abc" }, () => {
+    assert.equal(service.getConfig().topK, 5);
+  });
+  withEnv({ MATERIAL_AI_MATCH_TIMEOUT_MS: "not-a-number" }, () => {
+    assert.equal(service.getConfig().timeoutMs, 30000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Query building. The long-text columns are one string split across three
+// columns, so they go back together before they are sent — and the whitespace
+// a requester typed must not change the query.
+// ---------------------------------------------------------------------------
+
+test("buildSingleRequestQuery joins the long-text columns with single spaces", () => {
+  const query = service.buildSingleRequestQuery({
+    material_code: "  935.461.472 ",
+    material_description: "PUMP   LIFT\n",
+    long_text_1: "HEAVY DUTY",
+    long_text_2: "  50HZ  ",
+    long_text_3: "",
+  });
+
+  assert.deepEqual(query, {
+    code: "935.461.472",
+    name: "PUMP LIFT",
+    desc: "HEAVY DUTY 50HZ",
+  });
+});
+
+test("buildSingleRequestQuery leaves the description empty when no long text was typed", () => {
+  const query = service.buildSingleRequestQuery({
+    material_code: null,
+    material_description: "BEARING",
+    long_text_1: null,
+    long_text_2: "   ",
+    long_text_3: undefined,
+  });
+
+  assert.deepEqual(query, { code: "", name: "BEARING", desc: "" });
+});
+
+test("buildMassItemQuery joins po_text and spesifikasi and never sends a code", () => {
+  const query = service.buildMassItemQuery({
+    material_description: "  INSERT  EXHAUST ",
+    po_text: "P/N 31755122",
+    spesifikasi_tambahan: "STAINLESS  STEEL",
+  });
+
+  assert.deepEqual(query, {
+    code: "",
+    name: "INSERT EXHAUST",
+    desc: "P/N 31755122 STAINLESS STEEL",
+  });
+});
+
+// ---------------------------------------------------------------------------
+// shouldMatchSingleRequest — Change and Extend already name an existing
+// material, so asking "does this exist?" about them is noise.
+// ---------------------------------------------------------------------------
+
+test("shouldMatchSingleRequest only accepts Create", () => {
+  assert.equal(service.shouldMatchSingleRequest({ ticket_type: "Create" }), true);
+  assert.equal(
+    service.shouldMatchSingleRequest({ ticket_type: " Create " }),
+    true
+  );
+  assert.equal(service.shouldMatchSingleRequest({ ticket_type: "Change" }), false);
+  assert.equal(service.shouldMatchSingleRequest({ ticket_type: "Extend" }), false);
+  assert.equal(service.shouldMatchSingleRequest({}), false);
+  assert.equal(service.shouldMatchSingleRequest(null), false);
+});
+
+// ---------------------------------------------------------------------------
+// normalizeRecommendations — rank is the order the recommender returned, not a
+// re-sort of our own.
+// ---------------------------------------------------------------------------
+
+test("normalizeRecommendations ranks in input order and rounds to four decimals", () => {
+  const recs = service.normalizeRecommendations([
+    {
+      code: " 935.461.472 ",
+      name: "P/N 31755122  INSERT EXHAUST",
+      similarity: 0.97314159,
+      match_type: "EXACT (code + name match)",
+    },
+    { code: "935.461.473", name: "INSERT", similarity: "0.8125" },
+  ]);
+
+  assert.equal(recs.length, 2);
+  assert.deepEqual(recs[0], {
+    rank: 1,
+    code: "935.461.472",
+    name: "P/N 31755122 INSERT EXHAUST",
+    similarity: 0.9731,
+    matchType: "EXACT (code + name match)",
+  });
+  assert.equal(recs[1].rank, 2);
+  assert.equal(recs[1].similarity, 0.8125);
+  assert.equal(recs[1].matchType, "TEXT");
+});
+
+test("normalizeRecommendations scores an unusable similarity as zero", () => {
+  const recs = service.normalizeRecommendations([
+    { code: "A", name: "A", similarity: null },
+    { code: "B", name: "B", similarity: "n/a" },
+  ]);
+
+  assert.equal(recs[0].similarity, 0);
+  assert.equal(recs[1].similarity, 0);
+});
+
+test("normalizeRecommendations answers an empty list for anything that is not an array", () => {
+  assert.deepEqual(service.normalizeRecommendations(null), []);
+  assert.deepEqual(service.normalizeRecommendations(undefined), []);
+  assert.deepEqual(service.normalizeRecommendations("nope"), []);
+  assert.deepEqual(service.normalizeRecommendations({ 0: "x" }), []);
+});
+
+// ---------------------------------------------------------------------------
+// describeAiError — the stored line is what a support ticket reads, so "the AI
+// box is not running" and "it answered and said no" have to be tellable apart.
+// ---------------------------------------------------------------------------
+
+test("describeAiError names a timeout, a refused connection and an HTTP answer", () => {
+  assert.equal(
+    service.describeAiError({ code: "ECONNABORTED", message: "timeout of 30000ms" }),
+    "AI recommender timed out"
+  );
+  assert.equal(
+    service.describeAiError({ code: "ECONNREFUSED", message: "connect ECONNREFUSED" }),
+    "AI recommender unreachable"
+  );
+  assert.equal(
+    service.describeAiError({
+      response: { status: 503, data: { detail: "Models are still loading" } },
+    }),
+    "AI recommender responded 503: Models are still loading"
+  );
+  assert.equal(
+    service.describeAiError({ response: { status: 500, data: {} } }),
+    "AI recommender responded 500"
+  );
+  assert.equal(
+    service.describeAiError({ response: { status: 400, data: { detail: { x: 1 } } } }),
+    "AI recommender responded 400"
+  );
+  assert.equal(service.describeAiError(new Error("boom")), "boom");
+  assert.equal(service.describeAiError({}), "Unknown error");
+  assert.equal(service.describeAiError(null), "Unknown error");
+});
+
+// ---------------------------------------------------------------------------
+// Scheduling. The submit handlers call these and immediately answer the
+// requester, so a disabled feature must cost exactly one env read.
+// ---------------------------------------------------------------------------
+
+test("scheduleSingleRequestMatch does nothing while the feature is off", async () => {
+  let calls = 0;
+  const restore = stubService({
+    runSingleRequestMatch: async () => {
+      calls += 1;
+    },
+  });
+
+  try {
+    const queued = withEnv({ MATERIAL_AI_MATCH_ENABLED: "false" }, () =>
+      service.scheduleSingleRequestMatch(42)
+    );
+    assert.equal(queued, false);
+    await tick();
+    assert.equal(calls, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("scheduleSingleRequestMatch refuses a missing request id", () => {
+  withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, () => {
+    assert.equal(service.scheduleSingleRequestMatch(null), false);
+    assert.equal(service.scheduleSingleRequestMatch(undefined), false);
+  });
+});
+
+test("scheduleSingleRequestMatch queues the run on a later tick", async () => {
+  const seen = [];
+  const restore = stubService({
+    runSingleRequestMatch: async id => {
+      seen.push(id);
+    },
+  });
+
+  try {
+    const queued = withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, () =>
+      service.scheduleSingleRequestMatch(42)
+    );
+    assert.equal(queued, true);
+    // Still nothing: the response has already gone out by now.
+    assert.deepEqual(seen, []);
+    await tick();
+    assert.deepEqual(seen, [42]);
+  } finally {
+    restore();
+  }
+});
+
+test("scheduleMassRequestMatch queues the mass run on a later tick", async () => {
+  const seen = [];
+  const restore = stubService({
+    runMassRequestMatch: async id => {
+      seen.push(id);
+    },
+  });
+
+  try {
+    const queued = withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, () =>
+      service.scheduleMassRequestMatch(7)
+    );
+    assert.equal(queued, true);
+    await tick();
+    assert.deepEqual(seen, [7]);
+  } finally {
+    restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// runSingleRequestMatch — PENDING first so the dialog can say "AI is working",
+// then DONE or FAILED over the top of the same row.
+// ---------------------------------------------------------------------------
+
+const AI_RESPONSE = {
+  success: true,
+  code: "",
+  name: "PUMP LIFT",
+  desc: "",
+  corrected_name: "PUMP LIFT",
+  typo_corrected: false,
+  entities: { category: ["PUMP"], specs: ["50HZ (frequency)"] },
+  recommendations: [
+    {
+      code: "935.461.472",
+      name: "P/N 31755122 INSERT EXHAUST",
+      similarity: 0.9731,
+      match_type: "TEXT",
+    },
+    {
+      code: "935.461.473",
+      name: "INSERT EXHAUST SPARE",
+      similarity: 0.8412,
+      match_type: "TEXT + same group",
+    },
+  ],
+  latencies: { typo: 120.0, ner: 40.0, recommender: 30.0 },
+  total_latency_ms: 190.0,
+  timestamp: "2026-09-22 10:00:00",
+};
+
+const CREATE_ROW = {
+  id: 501,
+  ticket_type: "Create",
+  material_code: "",
+  material_description: "PUMP LIFT",
+  long_text_1: "HEAVY DUTY",
+  long_text_2: null,
+  long_text_3: null,
+};
+
+test("runSingleRequestMatch writes PENDING then DONE with the top similarity", async () => {
+  const upserts = [];
+  let sentQuery = null;
+  const restore = stubService({
+    loadSingleRequestRow: async () => CREATE_ROW,
+    callRecommender: async payload => {
+      sentQuery = payload;
+      return AI_RESPONSE;
+    },
+    upsertMatch: async args => {
+      upserts.push(args);
+      return { id: 9, request_kind: args.requestKind, status: args.status };
+    },
+  });
+
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+      await service.runSingleRequestMatch(501);
+    });
+
+    assert.equal(upserts.length, 2);
+    assert.equal(upserts[0].status, "PENDING");
+    assert.equal(upserts[0].requestKind, "SINGLE");
+    assert.equal(upserts[0].requestId, 501);
+    assert.deepEqual(upserts[0].query, {
+      code: "",
+      name: "PUMP LIFT",
+      desc: "HEAVY DUTY",
+    });
+
+    assert.equal(upserts[1].status, "DONE");
+    assert.equal(upserts[1].topSimilarity, 0.9731);
+    assert.equal(upserts[1].recommendations[0].rank, 1);
+    assert.equal(upserts[1].recommendations[1].rank, 2);
+    assert.equal(upserts[1].correctedName, "PUMP LIFT");
+    assert.equal(upserts[1].typoCorrected, false);
+    assert.equal(upserts[1].latencyMs, 190);
+    assert.deepEqual(upserts[1].entities, AI_RESPONSE.entities);
+
+    assert.equal(sentQuery.name, "PUMP LIFT");
+    assert.equal(sentQuery.topK, 5);
+  } finally {
+    restore();
+  }
+});
+
+test("runSingleRequestMatch stores the described failure instead of throwing", async () => {
+  const upserts = [];
+  const restore = stubService({
+    loadSingleRequestRow: async () => CREATE_ROW,
+    callRecommender: async () => {
+      const error = new Error("timeout of 30000ms exceeded");
+      error.code = "ECONNABORTED";
+      throw error;
+    },
+    upsertMatch: async args => {
+      upserts.push(args);
+      return { id: 9, status: args.status };
+    },
+  });
+
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+      await assert.doesNotReject(() => service.runSingleRequestMatch(501));
+    });
+
+    assert.equal(upserts.length, 2);
+    assert.equal(upserts[1].status, "FAILED");
+    assert.equal(upserts[1].error, "AI recommender timed out");
+  } finally {
+    restore();
+  }
+});
+
+test("runSingleRequestMatch swallows a database failure", async () => {
+  const restore = stubService({
+    loadSingleRequestRow: async () => {
+      throw new Error("connection terminated unexpectedly");
+    },
+  });
+
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+      assert.equal(await service.runSingleRequestMatch(501), null);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("runSingleRequestMatch writes nothing at all for a Change ticket", async () => {
+  const upserts = [];
+  let recommenderCalls = 0;
+  const restore = stubService({
+    loadSingleRequestRow: async () => ({ ...CREATE_ROW, ticket_type: "Change" }),
+    callRecommender: async () => {
+      recommenderCalls += 1;
+      return AI_RESPONSE;
+    },
+    upsertMatch: async args => {
+      upserts.push(args);
+      return { id: 9 };
+    },
+  });
+
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+      assert.equal(await service.runSingleRequestMatch(501), null);
+    });
+    assert.deepEqual(upserts, []);
+    assert.equal(recommenderCalls, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("runSingleRequestMatch does nothing while the feature is off", async () => {
+  let loads = 0;
+  const restore = stubService({
+    loadSingleRequestRow: async () => {
+      loads += 1;
+      return CREATE_ROW;
+    },
+  });
+
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "false" }, async () => {
+      assert.equal(await service.runSingleRequestMatch(501), null);
+    });
+    assert.equal(loads, 0);
+  } finally {
+    restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// runMassRequestMatch — every line PENDING first, then one call at a time. Not
+// Promise.all: a 30-row request would otherwise open 30 simultaneous
+// connections to a single-process model server.
+// ---------------------------------------------------------------------------
+
+test("runMassRequestMatch pends every item, then calls sequentially and survives one failure", async () => {
+  const upserts = [];
+  const events = [];
+  let inFlight = 0;
+
+  const restore = stubService({
+    loadMassRequestItems: async () => [
+      {
+        id: 11,
+        mass_request_id: 7,
+        item_no: 1,
+        material_description: "PUMP LIFT",
+        po_text: "HEAVY DUTY",
+        spesifikasi_tambahan: null,
+      },
+      {
+        id: 12,
+        mass_request_id: 7,
+        item_no: 2,
+        material_description: "INSERT EXHAUST",
+        po_text: null,
+        spesifikasi_tambahan: "STAINLESS STEEL",
+      },
+    ],
+    callRecommender: async payload => {
+      inFlight += 1;
+      // Sequential means the second call cannot start before the first has
+      // settled — overlapping calls would show up here.
+      assert.equal(inFlight, 1);
+      events.push(`start:${payload.name}`);
+      await tick();
+      inFlight -= 1;
+      events.push(`end:${payload.name}`);
+      if (payload.name === "PUMP LIFT") {
+        const error = new Error("connect ECONNREFUSED 127.0.0.1:8000");
+        error.code = "ECONNREFUSED";
+        throw error;
+      }
+      return AI_RESPONSE;
+    },
+    upsertMatch: async args => {
+      upserts.push(args);
+      return { id: args.requestId, status: args.status, item_no: args.requestId - 10 };
+    },
+  });
+
+  try {
+    const results = await withEnv(
+      { MATERIAL_AI_MATCH_ENABLED: "true" },
+      async () => service.runMassRequestMatch(7)
+    );
+
+    assert.deepEqual(
+      upserts.map(u => `${u.requestId}:${u.status}`),
+      ["11:PENDING", "12:PENDING", "11:FAILED", "12:DONE"]
+    );
+    assert.deepEqual(events, [
+      "start:PUMP LIFT",
+      "end:PUMP LIFT",
+      "start:INSERT EXHAUST",
+      "end:INSERT EXHAUST",
+    ]);
+    assert.equal(upserts[2].error, "AI recommender unreachable");
+    assert.equal(upserts[3].topSimilarity, 0.9731);
+    assert.equal(upserts[0].massRequestId, 7);
+    assert.equal(results.length, 2);
+  } finally {
+    restore();
+  }
+});
+
+test("runMassRequestMatch answers null for a request with no items", async () => {
+  const restore = stubService({
+    loadMassRequestItems: async () => [],
+  });
+
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+      assert.equal(await service.runMassRequestMatch(7), null);
+    });
+  } finally {
+    restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// matchRowToDto — jsonb comes back parsed, json-as-text does not, and a row
+// read through the mass join can be either.
+// ---------------------------------------------------------------------------
+
+test("matchRowToDto parses string JSON columns and carries item_no", () => {
+  const dto = service.matchRowToDto({
+    id: "9",
+    request_kind: "MASS",
+    request_id: "12",
+    mass_request_id: "7",
+    item_no: 2,
+    status: "DONE",
+    error: null,
+    query_code: "",
+    query_name: "INSERT EXHAUST",
+    query_desc: "STAINLESS STEEL",
+    corrected_name: "INSERT EXHAUST",
+    typo_corrected: false,
+    entities: '{"category":["PUMP"],"specs":["50HZ (frequency)"]}',
+    recommendations:
+      '[{"rank":1,"code":"935.461.472","name":"INSERT","similarity":0.97314,"matchType":"TEXT"}]',
+    top_similarity: "0.9731",
+    latency_ms: "190.0",
+    created_at: "2026-09-22T10:00:00.000Z",
+    updated_at: "2026-09-22T10:00:01.000Z",
+  });
+
+  assert.equal(dto.itemNo, 2);
+  assert.deepEqual(dto.query, {
+    code: "",
+    name: "INSERT EXHAUST",
+    desc: "STAINLESS STEEL",
+  });
+  assert.deepEqual(dto.entities.category, ["PUMP"]);
+  assert.deepEqual(dto.entities.specs, ["50HZ (frequency)"]);
+  assert.equal(dto.recommendations.length, 1);
+  assert.equal(dto.recommendations[0].rank, 1);
+  assert.equal(dto.recommendations[0].similarity, 0.9731);
+  assert.equal(dto.topSimilarity, 0.9731);
+  assert.equal(dto.latencyMs, 190);
+});
+
+test("matchRowToDto defaults the arrays a PENDING row has not filled yet", () => {
+  const dto = service.matchRowToDto({
+    id: 1,
+    request_kind: "SINGLE",
+    request_id: 501,
+    mass_request_id: null,
+    status: "PENDING",
+    error: null,
+    query_code: null,
+    query_name: "PUMP LIFT",
+    query_desc: null,
+    corrected_name: null,
+    typo_corrected: null,
+    entities: null,
+    recommendations: null,
+    top_similarity: null,
+    latency_ms: null,
+    created_at: null,
+    updated_at: null,
+  });
+
+  assert.equal(dto.itemNo, null);
+  assert.deepEqual(dto.entities, { category: [], specs: [] });
+  assert.deepEqual(dto.recommendations, []);
+  assert.equal(dto.query.code, "");
+  assert.equal(dto.query.desc, "");
+  assert.equal(dto.topSimilarity, null);
+  assert.equal(dto.latencyMs, null);
+});
+
+test("matchRowToDto survives a malformed json column and an absent row", () => {
+  const dto = service.matchRowToDto({
+    id: 1,
+    request_kind: "SINGLE",
+    request_id: 501,
+    status: "DONE",
+    query_name: "PUMP LIFT",
+    entities: "{not json",
+    recommendations: "[not json",
+  });
+
+  assert.deepEqual(dto.entities, { category: [], specs: [] });
+  assert.deepEqual(dto.recommendations, []);
+  assert.equal(service.matchRowToDto(null), null);
+});
+
+// ---------------------------------------------------------------------------
+// Wiring. The routes and the four submit/rework hooks are the only things that
+// make any of the above run, so they are pinned by source rather than left to
+// a manual check.
+// ---------------------------------------------------------------------------
+
+const routeSource = fs.readFileSync(
+  path.join(__dirname, "../routes/MaterialRoute.js"),
+  "utf-8"
+);
+
+test("MaterialRoute exposes the four AI match endpoints", () => {
+  for (const routePath of [
+    '"/requests/single/:id/ai-match"',
+    '"/requests/mass/:id/ai-match"',
+    '"/requests/single/:id/ai-match/rerun"',
+    '"/requests/mass/:id/ai-match/rerun"',
+  ]) {
+    assert.ok(
+      routeSource.includes(routePath),
+      `MaterialRoute.js is missing ${routePath}`
+    );
+  }
+
+  for (const handler of [
+    "MaterialController.getSingleRequestAiMatch",
+    "MaterialController.getMassRequestAiMatch",
+    "MaterialController.rerunSingleRequestAiMatch",
+    "MaterialController.rerunMassRequestAiMatch",
+  ]) {
+    assert.ok(
+      routeSource.includes(handler),
+      `MaterialRoute.js is missing ${handler}`
+    );
+  }
+});
+
+test("submit and rework queue an AI match after the write", () => {
+  const MaterialController = require("../controllers/MaterialController");
+
+  const hooks = [
+    ["createSingleRequest", "scheduleSingleRequestMatch"],
+    ["createMassRequest", "scheduleMassRequestMatch"],
+    ["saveSingleRequestRework", "scheduleSingleRequestMatch"],
+    ["saveMassRequestRework", "scheduleMassRequestMatch"],
+  ];
+
+  for (const [handler, scheduler] of hooks) {
+    const source = MaterialController[handler].toString();
+    assert.ok(
+      source.includes(`materialAiMatchService.${scheduler}`),
+      `${handler} does not queue an AI match`
+    );
+  }
+});

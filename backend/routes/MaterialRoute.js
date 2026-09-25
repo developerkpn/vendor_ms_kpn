@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const MaterialController = require("../controllers/MaterialController");
+const GuideController = require("../controllers/GuideController");
 const AuthToken = require("../middleware/tokenmanager");
 
 // Get all material groups
@@ -138,6 +139,45 @@ router.put(
 // Express 4 path-to-regexp: (*) captures everything including nested path segments.
 router.get("/file(*)", MaterialController.serveFile);
 
+// Material guides — uploaded documents and videos shown on Materials > Dashboard.
+// Registered here, ahead of `GET /:materialId` further down, or "guides" would be
+// read as a material id.
+router.get("/guides", AuthToken.authSession, GuideController.getGuides);
+// Unauthenticated like `/file(*)` above: a <video> or <iframe> src cannot carry
+// the Authorization header. Range-capable, so videos are seekable.
+router.get("/guides/files/:fileId/content", GuideController.streamFile);
+// A gigabyte batch on an ordinary office uplink outlasts Node's 5-minute
+// default request timeout, which would abort the upload mid-stream. Raised for
+// this one route rather than server-wide, so every other endpoint keeps the
+// shorter ceiling.
+router.post(
+    "/guides/upload",
+    AuthToken.authSession,
+    (req, res, next) => {
+        req.setTimeout(30 * 60 * 1000);
+        res.setTimeout(30 * 60 * 1000);
+        next();
+    },
+    GuideController.uploadGuides
+);
+router.post("/guides/folders", AuthToken.authSession, GuideController.createFolder);
+router.put(
+    "/guides/folders/:folderId",
+    AuthToken.authSession,
+    GuideController.updateFolder
+);
+router.delete(
+    "/guides/folders/:folderId",
+    AuthToken.authSession,
+    GuideController.deleteFolder
+);
+router.put("/guides/files/:fileId", AuthToken.authSession, GuideController.updateFile);
+router.delete(
+    "/guides/files/:fileId",
+    AuthToken.authSession,
+    GuideController.deleteFile
+);
+
 // SAP data synchronization endpoint
 
 // Single material request endpoints
@@ -268,6 +308,29 @@ router.put(
     "/requests/mass/:id/rework",
     AuthToken.authSession,
     MaterialController.saveMassRequestRework
+);
+
+// AI material match — advisory "does this already exist?" ranking, stored per
+// material line after submit/rework. Plain reads plus a manual re-queue.
+router.get(
+    "/requests/single/:id/ai-match",
+    AuthToken.authSession,
+    MaterialController.getSingleRequestAiMatch
+);
+router.get(
+    "/requests/mass/:id/ai-match",
+    AuthToken.authSession,
+    MaterialController.getMassRequestAiMatch
+);
+router.post(
+    "/requests/single/:id/ai-match/rerun",
+    AuthToken.authSession,
+    MaterialController.rerunSingleRequestAiMatch
+);
+router.post(
+    "/requests/mass/:id/ai-match/rerun",
+    AuthToken.authSession,
+    MaterialController.rerunMassRequestAiMatch
 );
 
 // Rework e-mail: the draft the Master Data dialog prefills before sending,
