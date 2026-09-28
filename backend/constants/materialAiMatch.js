@@ -24,6 +24,11 @@ const AI_MATCH_MAX_TOP_K = 10;
 // Stored errors are for a support ticket, not a stack trace.
 const AI_MATCH_MAX_ERROR_LENGTH = 500;
 
+// Lines one pre-save preview call may ask about. A mass request is capped at
+// 10 lines, so this is the whole batch; the UI still sends one line per call so
+// no single HTTP request outlives a load balancer's idle timeout.
+const AI_MATCH_MAX_PREVIEW_LINES = 10;
+
 module.exports = {
     AI_MATCH_KIND,
     AI_MATCH_STATUS,
@@ -32,4 +37,5 @@ module.exports = {
     AI_MATCH_DEFAULT_TOP_K,
     AI_MATCH_MAX_TOP_K,
     AI_MATCH_MAX_ERROR_LENGTH,
+    AI_MATCH_MAX_PREVIEW_LINES,
 };

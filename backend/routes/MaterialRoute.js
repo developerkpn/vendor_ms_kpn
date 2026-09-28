@@ -311,7 +311,13 @@ router.put(
 );
 
 // AI material match — advisory "does this already exist?" ranking, stored per
-// material line after submit/rework. Plain reads plus a manual re-queue.
+// material line after submit/rework. Plain reads plus a manual re-queue, and a
+// pre-save preview the request forms call before anything is written.
+router.post(
+    "/ai-match/preview",
+    AuthToken.authSession,
+    MaterialController.previewAiMatch
+);
 router.get(
     "/requests/single/:id/ai-match",
     AuthToken.authSession,

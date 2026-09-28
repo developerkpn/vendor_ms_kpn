@@ -14,6 +14,138 @@ const {
     normalizeSingleRequestTicketType,
 } = require("../services/materialService");
 const { sanitizeUploadName } = require("../utils/uploadName");
+const {
+    AI_MATCH_KIND,
+    AI_MATCH_MAX_PREVIEW_LINES,
+} = require("../constants/materialAiMatch");
+
+// A JSON value sent as a multipart text field (formidable hands back an array
+// of strings) or already parsed from a JSON body. Anything unreadable is null:
+// every caller treats a missing value as "not sent".
+function parseJsonFieldSafely(raw) {
+    if (raw === null || raw === undefined) {
+        return null;
+    }
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    if (value && typeof value === "object") {
+        return value;
+    }
+    try {
+        return JSON.parse(String(value));
+    } catch (error) {
+        return null;
+    }
+}
+
+// The requester's pre-save "this is a new material" answer. Advisory, and the
+// request has already committed by the time this runs, so a failure here is
+// logged and never becomes a submit error.
+async function recordAiMatchReviewSafely({
+    requestKind,
+    requestId,
+    massRequestId = null,
+    rawReview,
+    reviewedBy,
+}) {
+    try {
+        if (!materialAiMatchService.getConfig().enabled || !requestId) {
+            return;
+        }
+        const review = materialAiMatchService.sanitizeRequesterReview(
+            parseJsonFieldSafely(rawReview)
+        );
+        if (!review) {
+            return;
+        }
+        await materialAiMatchService.recordRequesterReview({
+            requestKind,
+            requestId,
+            massRequestId,
+            review,
+            reviewedBy,
+        });
+    } catch (error) {
+        console.error(
+            `[AI-MATCH] recording requester review for ${requestKind} ${requestId} failed:`,
+            error && error.message
+        );
+    }
+}
+
+// Mass reviews arrive keyed by the form's row position; the service pairs them
+// with the items they were saved as.
+async function recordMassAiMatchReviewsSafely({
+    massRequestId,
+    reviewRows,
+    filledRowIndexes,
+    reviewedBy,
+}) {
+    try {
+        if (
+            !massRequestId ||
+            !Array.isArray(reviewRows) ||
+            reviewRows.length === 0 ||
+            !materialAiMatchService.getConfig().enabled
+        ) {
+            return;
+        }
+        const items =
+            await materialAiMatchService.loadMassRequestItems(massRequestId);
+        const pairs = materialAiMatchService.pairMassReviewsWithItems(
+            reviewRows,
+            filledRowIndexes,
+            items
+        );
+        for (const { item, review } of pairs) {
+            await recordAiMatchReviewSafely({
+                requestKind: AI_MATCH_KIND.MASS,
+                requestId: item.id,
+                massRequestId,
+                rawReview: review,
+                reviewedBy,
+            });
+        }
+    } catch (error) {
+        console.error(
+            `[AI-MATCH] recording requester reviews for mass ${massRequestId} failed:`,
+            error && error.message
+        );
+    }
+}
+
+// What a single Create request WILL store as its description, built the same
+// way createSingleRequest builds it (template fields in order, split into the
+// SAP columns), so the pre-save check asks the AI about exactly what gets saved.
+async function buildSinglePreviewQuery({
+    materialGroupCode,
+    requestFields,
+    templateValues,
+}) {
+    const safeRequestFields =
+        requestFields && typeof requestFields === "object" ? requestFields : {};
+    const safeTemplateValues =
+        templateValues && typeof templateValues === "object"
+            ? templateValues
+            : {};
+    const validation = await MaterialTemplate.validateMaterialRequestTemplate({
+        materialGroupCode,
+        requestFields: safeRequestFields,
+        templateValues: safeTemplateValues,
+    });
+    const generated = buildMaterialDescriptionAndLongText(
+        validation.normalizedTemplateValues || safeTemplateValues,
+        validation.template || {}
+    );
+    return materialAiMatchService.buildSingleRequestQuery({
+        material_code: "",
+        material_description:
+            generated.material_description ||
+            safeRequestFields.material_description,
+        long_text_1: generated.long_text_1 || safeRequestFields.long_text_1,
+        long_text_2: generated.long_text_2 || safeRequestFields.long_text_2,
+        long_text_3: generated.long_text_3 || safeRequestFields.long_text_3,
+    });
+}
 
 // User preference store: key is namespaced page.setting (matches mst_user_preference.pref_key).
 const USER_PREFERENCE_KEY_PATTERN = /^[a-z0-9_.-]{1,100}$/;
@@ -1492,6 +1624,7 @@ const MaterialController = {
                 req.body?.change_extend_reason || ""
             ).trim();
             let comment = String(req.body?.comment || "").trim();
+            let aiMatchReviewRaw = req.body?.aiMatchReview ?? null;
             let materialSubGroupId = Number.parseInt(
                 req.body?.materialSubGroupId,
                 10
@@ -1516,6 +1649,7 @@ const MaterialController = {
                     fields.changeExtendReason || ""
                 ).trim();
                 comment = String(fields.comment || "").trim();
+                aiMatchReviewRaw = fields.aiMatchReview ?? null;
                 materialSubGroupId = Number.parseInt(fields.subgroup, 10);
                 requestFields = JSON.parse(fields.requestFields);
                 templateValues = JSON.parse(fields.templateValues);
@@ -1826,6 +1960,14 @@ const MaterialController = {
 
             // Advisory AI match runs after the write; never blocks the response.
             materialAiMatchService.scheduleSingleRequestMatch(createdRequest?.id);
+            if (ticketType === "Create") {
+                await recordAiMatchReviewSafely({
+                    requestKind: AI_MATCH_KIND.SINGLE,
+                    requestId: createdRequest?.id,
+                    rawReview: aiMatchReviewRaw,
+                    reviewedBy: userId,
+                });
+            }
 
             return res.status(201).json({
                 success: true,
@@ -1937,6 +2079,7 @@ const MaterialController = {
             );
             const massRequestReason =
                 String(fields.massRequestReason || "").trim() || null;
+            const aiMatchReview = parseJsonFieldSafely(fields.aiMatchReview);
 
             if (!massRequestReason) {
                 return res.status(400).json({
@@ -2083,6 +2226,12 @@ const MaterialController = {
             materialAiMatchService.scheduleMassRequestMatch(
                 createdMassRequest?.id
             );
+            await recordMassAiMatchReviewsSafely({
+                massRequestId: createdMassRequest?.id,
+                reviewRows: aiMatchReview && aiMatchReview.rows,
+                filledRowIndexes,
+                reviewedBy: userId,
+            });
 
             return res.status(201).json({
                 success: true,
@@ -2443,6 +2592,75 @@ const MaterialController = {
     // the panel can hide itself when the feature is off rather than guessing
     // from an empty result — an empty list means "the AI found nothing", which
     // is a different thing entirely.
+
+    // Pre-save check: rank existing materials for a request that is NOT saved
+    // yet, so the requester can pick one (and save nothing) or confirm it is new.
+    // Answers enabled:false rather than an error when the feature is off, so
+    // the form simply submits as it always did.
+    previewAiMatch: async (req, res) => {
+        try {
+            if (!materialAiMatchService.getConfig().enabled) {
+                return res.json({ success: true, enabled: false, data: [] });
+            }
+
+            const kind = String(req.body?.kind || "").toLowerCase();
+            let lines;
+            if (kind === "single") {
+                const materialGroupCode = String(
+                    req.body?.materialGroupCode || ""
+                ).trim();
+                if (!materialGroupCode) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "materialGroupCode is required",
+                    });
+                }
+                lines = [
+                    {
+                        key: "single",
+                        query: await buildSinglePreviewQuery({
+                            materialGroupCode,
+                            requestFields: req.body?.requestFields,
+                            templateValues: req.body?.templateValues,
+                        }),
+                    },
+                ];
+            } else if (kind === "mass") {
+                const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+                if (
+                    rows.length === 0 ||
+                    rows.length > AI_MATCH_MAX_PREVIEW_LINES
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        message: `rows must hold 1 to ${AI_MATCH_MAX_PREVIEW_LINES} lines`,
+                    });
+                }
+                lines = rows.map(row => ({
+                    key: row?.rowIndex ?? null,
+                    query: materialAiMatchService.buildMassItemQuery({
+                        material_description: row?.description,
+                        po_text: row?.poText,
+                        spesifikasi_tambahan: row?.spesifikasiTambahan,
+                    }),
+                }));
+            } else {
+                return res.status(400).json({
+                    success: false,
+                    message: 'kind must be "single" or "mass"',
+                });
+            }
+
+            const data = await materialAiMatchService.previewMatches(lines);
+            return res.json({ success: true, enabled: true, data });
+        } catch (error) {
+            console.error("[AI-MATCH] preview failed:", error && error.message);
+            return res.status(500).json({
+                success: false,
+                message: "Failed to check for similar materials",
+            });
+        }
+    },
 
     getSingleRequestAiMatch: async (req, res) => {
         try {

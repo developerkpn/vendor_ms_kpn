@@ -36,6 +36,7 @@ const {
     AI_MATCH_DEFAULT_TOP_K,
     AI_MATCH_MAX_TOP_K,
     AI_MATCH_MAX_ERROR_LENGTH,
+    AI_MATCH_MAX_PREVIEW_LINES,
 } = require("../constants/materialAiMatch");
 const { SINGLE_REQUEST_TICKET_TYPES } = require("../constants/material");
 
@@ -200,6 +201,197 @@ function describeAiError(error) {
         );
     }
     return error.message || "Unknown error";
+}
+
+/**
+ * The pre-save check: rank existing materials for lines that are NOT saved
+ * yet, so the requester can say "that one" or "none of these" before anything
+ * is written. Nothing here touches the database.
+ *
+ * Same shape per line as a stored match, minus the ids, so the UI renders it
+ * with the same table. One line failing is reported against that line and the
+ * rest carry on; lines are called one after another for the same reason the
+ * mass run is (a single-process model server).
+ *
+ * @param {Array<{key: string|number, query: {code?: string, name: string, desc?: string}}>} lines
+ */
+async function previewMatches(lines) {
+    const config = module.exports.getConfig();
+    const list = Array.isArray(lines)
+        ? lines.slice(0, AI_MATCH_MAX_PREVIEW_LINES)
+        : [];
+
+    const results = [];
+    for (const line of list) {
+        const query = {
+            code: normalizeText(line && line.query && line.query.code),
+            name: normalizeText(line && line.query && line.query.name),
+            desc: normalizeText(line && line.query && line.query.desc),
+        };
+        const base = {
+            key: line ? line.key : null,
+            query,
+            correctedName: null,
+            typoCorrected: null,
+            entities: { category: [], specs: [] },
+            recommendations: [],
+            topSimilarity: null,
+        };
+
+        if (!query.name) {
+            results.push({
+                ...base,
+                status: AI_MATCH_STATUS.FAILED,
+                error: "Material description is empty",
+            });
+            continue;
+        }
+
+        try {
+            const data = await module.exports.callRecommender({
+                ...query,
+                topK: config.topK,
+            });
+            const recommendations = module.exports.normalizeRecommendations(
+                data && data.recommendations
+            );
+            const entities = (data && data.entities) || {};
+            results.push({
+                ...base,
+                status: AI_MATCH_STATUS.DONE,
+                error: null,
+                correctedName: (data && data.corrected_name) || null,
+                typoCorrected: Boolean(data && data.typo_corrected),
+                entities: {
+                    category: Array.isArray(entities.category)
+                        ? entities.category
+                        : [],
+                    specs: Array.isArray(entities.specs) ? entities.specs : [],
+                },
+                recommendations,
+                topSimilarity: recommendations.length
+                    ? recommendations[0].similarity
+                    : null,
+            });
+        } catch (error) {
+            const described = module.exports.describeAiError(error);
+            console.error(`[AI-MATCH] preview line ${base.key} failed:`, described);
+            results.push({
+                ...base,
+                status: AI_MATCH_STATUS.FAILED,
+                error: described,
+            });
+        }
+    }
+    return results;
+}
+
+/**
+ * The requester's "brand new" confirmation as it arrives with a submit, made
+ * safe to store. The list is what the browser says it showed, so it is
+ * re-normalised and capped rather than trusted: it is display-only, but it
+ * must not be able to put anything but a short ranked list in the column.
+ *
+ * Anything other than an explicit confirmation answers null — no pre-save check
+ * ran, so there is nothing to record.
+ */
+function sanitizeRequesterReview(raw) {
+    if (!raw || typeof raw !== "object" || raw.confirmedNew !== true) {
+        return null;
+    }
+    const list = Array.isArray(raw.recommendations)
+        ? raw.recommendations.slice(0, AI_MATCH_MAX_TOP_K)
+        : [];
+    return {
+        confirmedNew: true,
+        recommendations: list.map((item, index) => ({
+            rank: index + 1,
+            code: normalizeText(item && item.code).slice(0, 50),
+            name: normalizeText(item && item.name).slice(0, 300),
+            similarity: roundSimilarity(item && item.similarity),
+            matchType: normalizeText(item && item.matchType).slice(0, 60) || "TEXT",
+        })),
+    };
+}
+
+/**
+ * Pairs each mass review with the item it was saved as. Reviews arrive keyed by
+ * the form's row position; createMassRequest saves only the filled rows and
+ * numbers them by their position among those (item_no = index + 1). A review
+ * for a row that was not saved is dropped.
+ */
+function pairMassReviewsWithItems(reviewRows, filledRowIndexes, items) {
+    if (!Array.isArray(reviewRows) || !Array.isArray(filledRowIndexes)) {
+        return [];
+    }
+    const itemByNo = new Map(
+        (Array.isArray(items) ? items : []).map(item => [
+            Number(item.item_no),
+            item,
+        ])
+    );
+    const pairs = [];
+    for (const reviewRow of reviewRows) {
+        const position = filledRowIndexes.indexOf(
+            Number(reviewRow && reviewRow.rowIndex)
+        );
+        const item = position >= 0 ? itemByNo.get(position + 1) : null;
+        if (item) {
+            pairs.push({ item, review: reviewRow });
+        }
+    }
+    return pairs;
+}
+
+/**
+ * Stores the requester's confirmation against one saved line.
+ *
+ * Touches only the requester_* columns on conflict, so it can land before or
+ * after the post-save run's own upsert without either clobbering the other.
+ * When it lands first, it creates the row as PENDING — the run that was queued
+ * for the same line fills in the ranking a moment later.
+ */
+async function recordRequesterReview({
+    requestKind,
+    requestId,
+    massRequestId = null,
+    review,
+    reviewedBy = null,
+}) {
+    if (!review || !requestId) {
+        return null;
+    }
+    return DBClientWrapper(async client => {
+        const { rows } = await client.query(
+            `INSERT INTO mat_request_ai_match (
+                request_kind,
+                request_id,
+                mass_request_id,
+                status,
+                query_name,
+                requester_confirmed_new,
+                requester_reviewed_at,
+                requester_reviewed_by,
+                requester_review
+            ) VALUES ($1, $2, $3, $4, '', $5, NOW(), $6, $7)
+            ON CONFLICT (request_kind, request_id) DO UPDATE SET
+                requester_confirmed_new = EXCLUDED.requester_confirmed_new,
+                requester_reviewed_at = EXCLUDED.requester_reviewed_at,
+                requester_reviewed_by = EXCLUDED.requester_reviewed_by,
+                requester_review = EXCLUDED.requester_review
+            RETURNING *`,
+            [
+                requestKind,
+                requestId,
+                massRequestId,
+                AI_MATCH_STATUS.PENDING,
+                review.confirmedNew === true,
+                reviewedBy ? String(reviewedBy).slice(0, 100) : null,
+                JSON.stringify(review.recommendations || []),
+            ]
+        );
+        return rows[0] || null;
+    });
 }
 
 async function loadSingleRequestRow(requestId) {
@@ -392,6 +584,19 @@ function matchRowToDto(row) {
         })),
         topSimilarity: toNumberOrNull(row.top_similarity),
         latencyMs: toNumberOrNull(row.latency_ms),
+        // What the requester answered before saving. null when no pre-save
+        // check ran, which the dialog must not read as "confirmed".
+        requesterReview:
+            row.requester_confirmed_new === true
+                ? {
+                      confirmedNew: true,
+                      reviewedAt: row.requester_reviewed_at ?? null,
+                      reviewedBy: row.requester_reviewed_by ?? null,
+                      shownCount: (
+                          parseJsonColumn(row.requester_review, []) || []
+                      ).length,
+                  }
+                : null,
         createdAt: row.created_at ?? null,
         updatedAt: row.updated_at ?? null,
     };
@@ -649,6 +854,10 @@ module.exports = {
     normalizeRecommendations,
     callRecommender,
     describeAiError,
+    previewMatches,
+    sanitizeRequesterReview,
+    pairMassReviewsWithItems,
+    recordRequesterReview,
     loadSingleRequestRow,
     loadMassRequestItems,
     upsertMatch,

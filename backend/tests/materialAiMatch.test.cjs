@@ -772,3 +772,287 @@ test("submit and rework queue an AI match after the write", () => {
     );
   }
 });
+
+// --- Pre-save check -------------------------------------------------------
+
+test("previewMatches ranks each line, fails an empty one and survives a failing call", async () => {
+  const calls = [];
+  const restore = stubService({
+    callRecommender: async query => {
+      calls.push(query);
+      if (query.name === "BROKEN") {
+        const error = new Error("refused");
+        error.code = "ECONNREFUSED";
+        throw error;
+      }
+      return {
+        corrected_name: query.name,
+        typo_corrected: false,
+        entities: { category: ["PUMP"], specs: [] },
+        recommendations: [
+          { code: "910.016.169", name: "PUMP,DOSING", similarity: 0.744377, match_type: "TEXT" },
+        ],
+      };
+    },
+  });
+  try {
+    const results = await withEnv({ MATERIAL_AI_MATCH_TOP_K: "3" }, () =>
+      service.previewMatches([
+        { key: 0, query: { name: "  PUMP   LIFT ", desc: "50HZ" } },
+        { key: 1, query: { name: "" } },
+        { key: 2, query: { name: "BROKEN" } },
+      ])
+    );
+
+    assert.equal(results.length, 3);
+    assert.equal(results[0].key, 0);
+    assert.equal(results[0].status, "DONE");
+    assert.equal(results[0].query.name, "PUMP LIFT");
+    assert.equal(results[0].topSimilarity, 0.7444);
+    assert.deepEqual(results[0].entities, { category: ["PUMP"], specs: [] });
+    assert.equal(results[0].recommendations[0].rank, 1);
+
+    assert.equal(results[1].status, "FAILED");
+    assert.match(results[1].error, /empty/i);
+
+    assert.equal(results[2].status, "FAILED");
+    assert.equal(results[2].error, "AI recommender unreachable");
+
+    // The empty line never reaches the recommender; top_k comes from config.
+    assert.deepEqual(calls.map(call => call.name), ["PUMP LIFT", "BROKEN"]);
+    assert.equal(calls[0].topK, 3);
+  } finally {
+    restore();
+  }
+});
+
+test("previewMatches asks about at most ten lines", async () => {
+  let count = 0;
+  const restore = stubService({
+    callRecommender: async () => {
+      count += 1;
+      return { recommendations: [] };
+    },
+  });
+  try {
+    const lines = Array.from({ length: 12 }, (_, key) => ({ key, query: { name: `ITEM ${key}` } }));
+    const results = await service.previewMatches(lines);
+    assert.equal(results.length, 10);
+    assert.equal(count, 10);
+  } finally {
+    restore();
+  }
+});
+
+test("sanitizeRequesterReview only accepts an explicit confirmation and caps the list", () => {
+  assert.equal(service.sanitizeRequesterReview(null), null);
+  assert.equal(service.sanitizeRequesterReview({ confirmedNew: "true" }), null);
+  assert.equal(service.sanitizeRequesterReview({ confirmedNew: false }), null);
+
+  const review = service.sanitizeRequesterReview({
+    confirmedNew: true,
+    recommendations: Array.from({ length: 15 }, (_, index) => ({
+      rank: 99,
+      code: ` 9${index} `,
+      name: "X".repeat(400),
+      similarity: "0.123456",
+      matchType: "",
+      extra: "dropped",
+    })),
+  });
+  assert.equal(review.confirmedNew, true);
+  assert.equal(review.recommendations.length, 10);
+  assert.deepEqual(review.recommendations[0], {
+    rank: 1,
+    code: "90",
+    name: "X".repeat(300),
+    similarity: 0.1235,
+    matchType: "TEXT",
+  });
+});
+
+test("sanitizeRequesterReview records a confirmation with no matches shown", () => {
+  assert.deepEqual(service.sanitizeRequesterReview({ confirmedNew: true }), {
+    confirmedNew: true,
+    recommendations: [],
+  });
+});
+
+test("pairMassReviewsWithItems maps form rows to saved items by filled position", () => {
+  // Form rows 0, 2 and 5 were filled, so they were saved as items 1, 2 and 3.
+  const items = [
+    { id: 501, item_no: 1 },
+    { id: 502, item_no: 2 },
+    { id: 503, item_no: 3 },
+  ];
+  const pairs = service.pairMassReviewsWithItems(
+    [
+      { rowIndex: 5, confirmedNew: true },
+      { rowIndex: 0, confirmedNew: true },
+      { rowIndex: 3, confirmedNew: true }, // not a filled row: dropped
+      { rowIndex: "2", confirmedNew: true },
+    ],
+    [0, 2, 5],
+    items
+  );
+  assert.deepEqual(
+    pairs.map(pair => [pair.review.rowIndex, pair.item.id]),
+    [
+      [5, 503],
+      [0, 501],
+      ["2", 502],
+    ]
+  );
+  assert.deepEqual(service.pairMassReviewsWithItems(null, [0], items), []);
+});
+
+test("matchRowToDto reports the requester review only when it was confirmed", () => {
+  const confirmed = service.matchRowToDto({
+    id: 1,
+    request_kind: "SINGLE",
+    request_id: 7,
+    status: "DONE",
+    recommendations: [],
+    requester_confirmed_new: true,
+    requester_reviewed_at: "2026-09-28T03:00:00Z",
+    requester_reviewed_by: "u-1",
+    requester_review: '[{"code":"1"},{"code":"2"}]',
+  });
+  assert.deepEqual(confirmed.requesterReview, {
+    confirmedNew: true,
+    reviewedAt: "2026-09-28T03:00:00Z",
+    reviewedBy: "u-1",
+    shownCount: 2,
+  });
+
+  const none = service.matchRowToDto({ id: 2, status: "DONE", requester_confirmed_new: null });
+  assert.equal(none.requesterReview, null);
+});
+
+function fakeResponse() {
+  return {
+    statusCode: 200,
+    body: null,
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(body) {
+      this.body = body;
+      return this;
+    },
+  };
+}
+
+test("previewAiMatch answers enabled:false and calls nothing while the feature is off", async () => {
+  const MaterialController = require("../controllers/MaterialController");
+  let called = false;
+  const original = service.previewMatches;
+  service.previewMatches = async () => {
+    called = true;
+    return [];
+  };
+  try {
+    const res = fakeResponse();
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: undefined }, () =>
+      MaterialController.previewAiMatch({ body: { kind: "mass", rows: [{ description: "X" }] } }, res)
+    );
+    assert.deepEqual(res.body, { success: true, enabled: false, data: [] });
+    assert.equal(called, false);
+  } finally {
+    service.previewMatches = original;
+  }
+});
+
+test("previewAiMatch builds mass queries the same way the stored run does", async () => {
+  const MaterialController = require("../controllers/MaterialController");
+  let received;
+  const original = service.previewMatches;
+  service.previewMatches = async lines => {
+    received = lines;
+    return [{ key: 4, status: "DONE" }];
+  };
+  try {
+    const res = fakeResponse();
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, () =>
+      MaterialController.previewAiMatch(
+        {
+          body: {
+            kind: "mass",
+            rows: [{ rowIndex: 4, description: "PUMP LIFT", poText: "50HZ", spesifikasiTambahan: "3 PHASE" }],
+          },
+        },
+        res
+      )
+    );
+    assert.deepEqual(received, [{ key: 4, query: { code: "", name: "PUMP LIFT", desc: "50HZ 3 PHASE" } }]);
+    assert.deepEqual(res.body, { success: true, enabled: true, data: [{ key: 4, status: "DONE" }] });
+  } finally {
+    service.previewMatches = original;
+  }
+});
+
+test("previewAiMatch composes a single description from the template like the save does", async () => {
+  const MaterialController = require("../controllers/MaterialController");
+  const MaterialTemplate = require("../models/MaterialTemplateModel");
+  const originalValidate = MaterialTemplate.validateMaterialRequestTemplate;
+  const originalPreview = service.previewMatches;
+  let received;
+  MaterialTemplate.validateMaterialRequestTemplate = async () => ({
+    template: {
+      fields: [
+        { fieldKey: "size", fieldOrder: 2 },
+        { fieldKey: "noun", fieldOrder: 1 },
+      ],
+    },
+    normalizedTemplateValues: { noun: "PUMP,LIFT", size: "50HZ" },
+  });
+  service.previewMatches = async lines => {
+    received = lines;
+    return [];
+  };
+  try {
+    const res = fakeResponse();
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, () =>
+      MaterialController.previewAiMatch(
+        { body: { kind: "single", materialGroupCode: "910", requestFields: {}, templateValues: {} } },
+        res
+      )
+    );
+    assert.deepEqual(received, [{ key: "single", query: { code: "", name: "PUMP,LIFT 50HZ", desc: "" } }]);
+  } finally {
+    MaterialTemplate.validateMaterialRequestTemplate = originalValidate;
+    service.previewMatches = originalPreview;
+  }
+});
+
+test("previewAiMatch rejects an unknown kind and an oversized batch", async () => {
+  const MaterialController = require("../controllers/MaterialController");
+  await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+    const unknown = fakeResponse();
+    await MaterialController.previewAiMatch({ body: { kind: "other" } }, unknown);
+    assert.equal(unknown.statusCode, 400);
+
+    const tooMany = fakeResponse();
+    await MaterialController.previewAiMatch(
+      { body: { kind: "mass", rows: Array.from({ length: 11 }, () => ({ description: "X" })) } },
+      tooMany
+    );
+    assert.equal(tooMany.statusCode, 400);
+
+    const noGroup = fakeResponse();
+    await MaterialController.previewAiMatch({ body: { kind: "single" } }, noGroup);
+    assert.equal(noGroup.statusCode, 400);
+  });
+});
+
+test("MaterialRoute exposes the pre-save preview", () => {
+  assert.ok(routeSource.includes('"/ai-match/preview"'));
+  assert.ok(routeSource.includes("MaterialController.previewAiMatch"));
+});
+
+test("single and mass submit record the requester's confirmation after the write", () => {
+  const MaterialController = require("../controllers/MaterialController");
+  assert.ok(MaterialController.createSingleRequest.toString().includes("recordAiMatchReviewSafely"));
+  assert.ok(MaterialController.createMassRequest.toString().includes("recordMassAiMatchReviewsSafely"));
+});
