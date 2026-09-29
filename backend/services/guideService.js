@@ -321,6 +321,15 @@ const GuideService = {
             uploadDir: GUIDE_TMP_DIR,
         });
 
+        // formidable lists files in the order their writes FINISH, so a small
+        // file sent after a large one can come first. meta is matched to files
+        // by position, so keep the order the parts were sent: fileBegin fires in
+        // stream order, with the same file objects parse() hands back.
+        const sentOrder = [];
+        form.on("fileBegin", (_name, file) => {
+            sentOrder.push(file);
+        });
+
         let fields;
         let incoming;
         try {
@@ -354,7 +363,9 @@ const GuideService = {
             throw badRequest(error.message || "Upload failed", "GUIDE_UPLOAD_FAILED");
         }
 
-        const uploaded = [].concat(incoming.files || incoming.file || []);
+        const uploaded = [].concat(incoming.files || incoming.file || []).sort(
+            (left, right) => sentOrder.indexOf(left) - sentOrder.indexOf(right)
+        );
         if (uploaded.length === 0) {
             throw badRequest("No files uploaded", "GUIDE_NO_FILES");
         }
