@@ -5,6 +5,7 @@ const Ticket = require("../models/TicketModel");
 const EmailModel = require("../models/EmailModelv2");
 const CoupaModel = require("../models/CoupaModel");
 const db = require("../config/connection");
+const { limitVendorName } = require("../utils/vendor");
 const Coupa = require("../models/CoupaModel");
 
 exports.getData = async (req, res) => {
@@ -149,7 +150,7 @@ exports.getDetail = async (req, res) => {
                     local_ovs: item["custom-fields"]?.["local-foreign"] || null,
                     country: address?.["country"]?.name || null,
                     country_code: address?.["country"]?.code || null,
-                    name_1: item.name || null,
+                    name_1: limitVendorName(item.name),
                     name_2: item["display-name"] || null,
                     phone:
                         [
