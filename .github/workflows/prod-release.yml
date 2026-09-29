@@ -1,0 +1,211 @@
+name: Production release (image to ECR)
+
+# Tests both repos, builds the production image (this backend plus the ui_vms
+# frontend it serves from public/build) for arm64, and pushes it to ECR as
+# bwbimdm/vms-prod:prod-X.Y.Z.
+#
+# Runs on:
+#   - a merge to this repo's `production` branch
+#   - a merge to ui_vms's `prod` branch (its workflow sends a repository_dispatch)
+#   - by hand (Actions > Run workflow), optionally with an explicit version
+#
+# It only publishes the image. Pointing the ECS service at the new tag stays a
+# deliberate, manual step.
+#
+# Needs, in this repo's settings:
+#   secrets.AWS_ACCESS_KEY_ID / secrets.AWS_SECRET_ACCESS_KEY
+#     an IAM user in account 862989604357 allowed to push to bwbimdm/vms-prod
+#   secrets.CUSTOM_GITHUB_TOKEN
+#     a token that can read developerkpn/ui_vms
+#   vars.VITE_* (optional) to override the frontend build values below
+
+on:
+  push:
+    branches: [production]
+  repository_dispatch:
+    types: [frontend-prod-updated]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. 1.2.0 (empty = next patch)"
+        required: false
+        default: ""
+
+# One release at a time, so two merges can never pick the same version.
+concurrency:
+  group: prod-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  EXPECTED_AWS_ACCOUNT: "862989604357"
+  ECR_REPOSITORY: bwbimdm/vms-prod
+  FRONTEND_REPO: developerkpn/ui_vms
+  FRONTEND_REF: prod
+  NODE_VERSION: "22"
+
+jobs:
+  release:
+    name: Test, build and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      # The frontend's vite config writes to ../vendor_ms_kpn/public/build, so
+      # the two repos are checked out side by side under those names.
+      - name: Checkout backend
+        uses: actions/checkout@v4
+        with:
+          path: vendor_ms_kpn
+          ref: ${{ github.event_name == 'push' && github.sha || 'production' }}
+
+      - name: Checkout frontend
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FRONTEND_REPO }}
+          ref: ${{ github.event.client_payload.frontend_sha || env.FRONTEND_REF }}
+          token: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
+          path: ui_vms
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            vendor_ms_kpn/package-lock.json
+            ui_vms/package-lock.json
+
+      - name: Backend tests
+        working-directory: vendor_ms_kpn
+        run: |
+          npm ci
+          npm test
+
+      - name: Frontend tests
+        working-directory: ui_vms
+        run: |
+          npm ci
+          npm test
+
+      # .env.production is gitignored in ui_vms. Nothing in it is secret (it
+      # ends up in the public bundle), so it is written here, overridable per
+      # value with repository variables.
+      - name: Build frontend into backend public/build
+        working-directory: ui_vms
+        env:
+          VITE_URL_LOC: ${{ vars.VITE_URL_LOC || '/api' }}
+          VITE_URL: ${{ vars.VITE_URL || '/' }}
+          VITE_URL_BE: ${{ vars.VITE_URL_BE || '/' }}
+          VITE_ETENDER: ${{ vars.VITE_ETENDER || 'https://etender.gamasap.com' }}
+        run: |
+          {
+            echo "VITE_URL_LOC=$VITE_URL_LOC"
+            echo "VITE_URL=$VITE_URL"
+            echo "VITE_URL_BE=$VITE_URL_BE"
+            echo "VITE_ETENDER=$VITE_ETENDER"
+          } > .env.production
+          npx vite build --mode production
+          test -f ../vendor_ms_kpn/public/build/index.html
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The other workflows in this repo may use keys for a different account;
+      # fail here rather than push the production image somewhere unexpected.
+      - name: Check AWS account
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$account" != "$EXPECTED_AWS_ACCOUNT" ]; then
+            echo "::error::AWS credentials are for account $account, expected $EXPECTED_AWS_ACCOUNT"
+            exit 1
+          fi
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # prod-1.0.0 first, then the next patch after the highest prod-X.Y.Z in
+      # the repository, unless a version was given by hand. Tags are immutable
+      # in ECR, so an existing version is refused up front.
+      - name: Pick version
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${REQUESTED_VERSION:-}" ]; then
+            if ! [[ "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::version must look like 1.2.3, got '$REQUESTED_VERSION'"
+              exit 1
+            fi
+            version="$REQUESTED_VERSION"
+          else
+            latest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+                       --query 'imageDetails[].imageTags[]' --output text \
+                     | tr '\t' '\n' \
+                     | sed -n 's/^prod-\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' \
+                     | sort -V | tail -n 1)
+            if [ -z "$latest" ]; then
+              version="1.0.0"
+            else
+              IFS=. read -r major minor patch <<< "$latest"
+              version="$major.$minor.$((patch + 1))"
+            fi
+          fi
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+               --image-ids imageTag="prod-$version" >/dev/null 2>&1; then
+            echo "::error::prod-$version already exists in $ECR_REPOSITORY"
+            exit 1
+          fi
+          {
+            echo "tag=prod-$version"
+            echo "backend_sha=$(git rev-parse HEAD)"
+            echo "frontend_sha=$(git -C ../ui_vms rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+        working-directory: vendor_ms_kpn
+
+      # ECS runs on Graviton (arm64); GitHub's runner is x86, hence QEMU.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push arm64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: vendor_ms_kpn
+          file: vendor_ms_kpn/Dockerfile.prod
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.tag }}
+          labels: |
+            org.opencontainers.image.title=vms
+            org.opencontainers.image.version=${{ steps.version.outputs.tag }}
+            org.opencontainers.image.revision=${{ steps.version.outputs.backend_sha }}
+            vms.backend.revision=${{ steps.version.outputs.backend_sha }}
+            vms.frontend.revision=${{ steps.version.outputs.frontend_sha }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published ${{ steps.version.outputs.tag }}"
+            echo ""
+            echo "- Image: \`${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.tag }}\` (linux/arm64)"
+            echo "- Backend: \`${{ steps.version.outputs.backend_sha }}\`"
+            echo "- Frontend: \`${{ steps.version.outputs.frontend_sha }}\`"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo ""
+            echo "Not deployed: point the ECS service at this tag to release it."
+          } >> "$GITHUB_STEP_SUMMARY"
