@@ -35,39 +35,30 @@ test("getMassRequestApprovalInbox returns data via controller", () => {
     assert.match(source, /cookies/i);
 });
 
-test("getMassRequestApprovalInbox SQL formats first-item approval timestamps", () => {
-    // Approval timestamps must be returned as friendly YYYY-MM-DD HH:MM strings,
-    // matching the single-request inbox format. Without this, the UI surfaces
-    // raw ISO 8601 strings (e.g. "2026-06-05T03:44:39.139Z") that are hard to read.
+test("getMassRequestApprovalInbox SQL returns the first item's approval steps", () => {
     const query = materialService.__private.GET_MASS_REQUEST_APPROVAL_INBOX_QUERY;
-    assert.match(
-        query,
-        /TO_CHAR\(first_item\.approval_1_at, 'YYYY-MM-DD HH24:MI'\) AS first_item_approval_1_at/i
-    );
-    assert.match(
-        query,
-        /TO_CHAR\(first_item\.approval_2_at, 'YYYY-MM-DD HH24:MI'\) AS first_item_approval_2_at/i
-    );
-    assert.match(
-        query,
-        /TO_CHAR\(first_item\.approval_3_at, 'YYYY-MM-DD HH24:MI'\) AS first_item_approval_3_at/i
-    );
+    // Since the dynamic-approver flow approvals are step rows: the first item's
+    // steps come back as approval_steps (acted_at / claimed_at), which the UI
+    // formats (MassApprovalStatusDialog -> formatDateTime). The header time is
+    // still formatted here.
+    assert.match(query, /FROM mat_mass_request_item_approval_step/i);
+    assert.match(query, /'acted_at', s\.acted_at/i);
+    assert.match(query, /'claimed_at', s\.claimed_at/i);
+    assert.match(query, /COALESCE\(first_item\.approval_steps, '\[\]'::jsonb\) AS approval_steps/i);
+    assert.match(query, /TO_CHAR\(m\.created_at, 'YYYY-MM-DD HH24:MI'\) AS created_at/i);
 });
 
-test("getMassRequestsByUser SQL formats first-item approval timestamps", () => {
+test("getMassRequestsByUser SQL returns the first item's approval steps", () => {
     const query = materialService.__private.GET_MASS_REQUESTS_BY_USER_QUERY;
-    assert.match(
-        query,
-        /TO_CHAR\(first_item\.approval_1_at, 'YYYY-MM-DD HH24:MI'\) AS first_item_approval_1_at/i
-    );
-    assert.match(
-        query,
-        /TO_CHAR\(first_item\.approval_2_at, 'YYYY-MM-DD HH24:MI'\) AS first_item_approval_2_at/i
-    );
-    assert.match(
-        query,
-        /TO_CHAR\(first_item\.approval_3_at, 'YYYY-MM-DD HH24:MI'\) AS first_item_approval_3_at/i
-    );
+    // Since the dynamic-approver flow approvals are step rows: the first item's
+    // steps come back as approval_steps (acted_at / claimed_at), which the UI
+    // formats (MassApprovalStatusDialog -> formatDateTime). The header time is
+    // still formatted here.
+    assert.match(query, /FROM mat_mass_request_item_approval_step/i);
+    assert.match(query, /'acted_at', s\.acted_at/i);
+    assert.match(query, /'claimed_at', s\.claimed_at/i);
+    assert.match(query, /COALESCE\(first_item\.approval_steps, '\[\]'::jsonb\) AS approval_steps/i);
+    assert.match(query, /TO_CHAR\(m\.created_at, 'YYYY-MM-DD HH24:MI'\) AS created_at/i);
 });
 
 test("approveMassRequest controller reads params and body", () => {
@@ -89,14 +80,16 @@ test("rejectMassRequest controller reads params and body", () => {
     assert.match(source, /req\.body/);
 });
 
-test("saveMassRequestRework detects REWORK on approval stage 3", () => {
+test("saveMassRequestRework finds the reworked step at any level", () => {
     const source = materialService.saveMassRequestRework.toString();
-    // Pins fix for the bug where rework requested by the third approval stage
-    // returned "Mass request rework stage is missing" because the resolver
-    // only checked approval_1_status and approval_2_status.
+    // Pins the fix for "Mass request rework stage is missing" when the rework
+    // came from a later stage: the old resolver only checked approval_1/2.
+    // With step rows the reworked step is whichever one is in REWORK status,
+    // not a fixed column.
     assert.match(
         source,
-        /approval_3_status[\s\S]*=== ?["']REWORK["']/,
-        "saveMassRequestRework must inspect approval_3_status for REWORK"
+        /firstItemSteps\.find\([\s\S]*normalizeStepStatus\(step\.status\) === "REWORK"/,
+        "saveMassRequestRework must pick the step in REWORK status from all steps"
     );
+    assert.doesNotMatch(source, /approval_[123]_status/);
 });

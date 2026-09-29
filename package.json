@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test 'backend/tests/*.test.cjs'",
     "server_dev": "cross-env NODE_ENV=development nodemon server.js",
     "server_prod": "cross-env NODE_ENV=production nodemon server.js",
     "server": "cross-env NODE_ENV=development node server.js"

@@ -16,6 +16,86 @@ const {
   assertRequiredActionReason,
   buildSingleRequestFinalCode,
 } = require("../services/materialService");
+const materialSapStagingService = require("../services/materialSapStagingService");
+
+// --- Step-model fixtures ----------------------------------------------------
+// Since the dynamic-approver flow (65efb1e) approvals are rows in
+// mat_single_request_approval_step, not fixed approval_1/2/3 columns, and the
+// last step is the Master Data (MDM) step. These answer the step queries the
+// approve flow issues, so each test only stubs what it is actually about.
+
+/** Two manual steps already approved, Master Data step claimed by mdmUserId and waiting. */
+function stepsWaitingOnMasterData(requestId, mdmUserId) {
+  return [
+    { id: 901, request_id: requestId, level: 1, kind: "MANUAL", approver_user_id: "APP-01", status: "APPROVED" },
+    { id: 902, request_id: requestId, level: 2, kind: "MANUAL", approver_user_id: "APP-02", status: "APPROVED" },
+    { id: 903, request_id: requestId, level: 3, kind: "MDM", approver_user_id: mdmUserId, status: "WAITING" },
+  ];
+}
+
+/** Approval 1 waiting on approverUserId, then Approval 2 (APP-02), then an open Master Data step. */
+function stepsWaitingOnFirstApprover(requestId, approverUserId) {
+  return [
+    { id: 901, request_id: requestId, level: 1, kind: "MANUAL", approver_user_id: approverUserId, status: "WAITING" },
+    { id: 902, request_id: requestId, level: 2, kind: "MANUAL", approver_user_id: "APP-02", status: "WAITING" },
+    { id: 903, request_id: requestId, level: 3, kind: "MDM", approver_user_id: null, status: "WAITING" },
+  ];
+}
+
+/**
+ * The step-model queries of the approve flow: the step rows, the step update,
+ * and the final-code uniqueness checks (no collisions). undefined for any other
+ * query, so the caller's own stub decides.
+ */
+function answerStepModelQuery(queryText, steps) {
+  if (/FROM mat_single_request_approval_step s/.test(queryText)) {
+    return { rows: steps, rowCount: steps.length };
+  }
+  if (/UPDATE mat_single_request_approval_step/.test(queryText)) {
+    return { rows: [], rowCount: 1 };
+  }
+  if (/SELECT 1 FROM mat_sap_data WHERE code = \$1/.test(queryText)) {
+    return { rows: [], rowCount: 0 };
+  }
+  if (/FROM mat_single_request\s+WHERE final_code = \$1 AND id <> \$2/.test(queryText)) {
+    return { rows: [], rowCount: 0 };
+  }
+  return undefined;
+}
+
+/**
+ * Approving the last step pushes the request to the Oracle SAP staging bridge
+ * right away. A test must never reach that bridge, so the push is replaced for
+ * the duration of fn.
+ */
+async function withSapPushStubbed(fn) {
+  const original = materialSapStagingService.pushPendingMaterialsToSapStaging;
+  const calls = [];
+  materialSapStagingService.pushPendingMaterialsToSapStaging = async args => {
+    calls.push(args);
+    return { pushed: [], errors: [] };
+  };
+  try {
+    return await fn(calls);
+  } finally {
+    materialSapStagingService.pushPendingMaterialsToSapStaging = original;
+  }
+}
+
+// The approval inbox reads its rows, then asks whether the actor is a Master
+// Data (MDM) material user, and keeps only rows whose active step the actor may
+// act on (applyStepInboxVisibility).
+const MDM_MEMBERSHIP_QUERY = /FROM mst_user mu[\s\S]*JOIN mst_page_access/i;
+const NOT_MDM_MEMBER = { rows: [], rowCount: 0 };
+
+/** Inbox row fields that put the request on approverUserId's active step. */
+function activeStepFor(approverUserId) {
+  return {
+    approval_steps: [
+      { id: 1, level: 1, kind: "MANUAL", approver_user_id: approverUserId, status: "WAITING" },
+    ],
+  };
+}
 
 test("assertRequiredActionReason rejects blank reason values", () => {
   assert.throws(
@@ -95,12 +175,18 @@ test("canActorReviseSingleRequest allows requester and admin only", () => {
   );
 });
 
-test("createSingleRequest query includes approval columns on mat_single_request", () => {
-  assert.match(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /approval_1_user_id/i);
-  assert.match(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /approval_2_user_id/i);
-  assert.match(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /ticket_type/i);
-  assert.doesNotMatch(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /material_code/i);
-  assert.match(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /change_extend_reason/i);
+test("createSingleRequest insert carries ticket fields and no approval columns", () => {
+  // Approvals are written as mat_single_request_approval_step rows right after
+  // this insert (dynamic-approver flow), so the insert has no approval_N columns.
+  const query = materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY;
+  assert.match(query, /ticket_type/i);
+  assert.match(query, /change_extend_reason/i);
+  assert.doesNotMatch(query, /material_code/i);
+  assert.doesNotMatch(query, /approval_[123]_(user_id|status)/i);
+  assert.match(
+    materialService.createSingleRequest.toString(),
+    /CREATE_SINGLE_REQUEST_INSERT_QUERY/
+  );
 });
 
 test("createSingleRequest query stores material_group_id instead of material_group_code", () => {
@@ -108,9 +194,16 @@ test("createSingleRequest query stores material_group_id instead of material_gro
   assert.doesNotMatch(materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY, /material_group_code/i);
 });
 
-test("getAdministratorApproverMasters query includes master join and lock metadata", () => {
-  assert.match(materialService.__private.GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY, /LEFT JOIN mat_single_request_approval/i);
-  assert.match(materialService.__private.GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY, /active_request_count/i);
+test("getAdministratorApproverMasters query aggregates each requester's manual approver chain", () => {
+  // Since the dynamic-approver flow the masters are one row per requester with
+  // an ordered manual chain (mat_approvers_matrix_level). The old per-master
+  // lock (active_request_count) is gone: the chain is frozen onto each request
+  // at submit, so editing it never touches requests already in flight.
+  const query = materialService.__private.GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY;
+  assert.match(query, /FROM mat_approvers_matrix_level l/i);
+  assert.match(query, /WHERE l\.requester_user_id = u\.user_id/i);
+  assert.match(query, /ORDER BY l\.level/i);
+  assert.match(query, /AS manual_approvers/i);
 });
 
 test("getSingleRequestApprovalInbox query no longer joins mat_single_request_approval", () => {
@@ -161,13 +254,15 @@ test("getSingleRequestApprovalInbox query includes subgroup fields for approval 
     materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
     /rework_by\.username AS rework_by_username/i
   );
+  // Approver names now come with each step (mat_single_request_approval_step),
+  // not from fixed approval_1/2 user joins.
   assert.match(
     materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
-    /approval_1_user\.fullname.*AS approval_1_user_name/is
+    /FROM mat_single_request_approval_step/i
   );
   assert.match(
     materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
-    /LEFT JOIN mst_user approval_2_user ON approval_2_user\.user_id = r\.approval_2_user_id/i
+    /approval_steps/i
   );
 });
 
@@ -185,26 +280,17 @@ test("single request read queries expose final_code for approval and request vie
   );
 });
 
-test("getSingleRequests list query reads approval snapshot from mat_single_request", () => {
-  assert.doesNotMatch(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /LEFT JOIN mat_single_request_approval a/i);
-  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.approval_1_user_id/i);
-  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.approval_2_status/i);
-  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.approval_3_status/i);
-  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.rework_stage/i);
-  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /r\.rework_reason/i);
-  assert.match(
-    materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
-    /TO_CHAR\(r\.rework_at, 'YYYY-MM-DD HH24:MI'\) AS rework_at/i
-  );
-  assert.match(materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY, /rework_by\.username AS rework_by_username/i);
-  assert.match(
-    materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
-    /approval_1_user\.fullname.*AS approval_1_user_name/is
-  );
-  assert.match(
-    materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY,
-    /LEFT JOIN mst_user approval_3_user ON approval_3_user\.user_id = r\.approval_3_user_id/i
-  );
+test("getSingleRequests list query reads approval steps and rework snapshot", () => {
+  const query = materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY;
+  assert.doesNotMatch(query, /LEFT JOIN mat_single_request_approval a/i);
+  // Approvals are step rows since the dynamic-approver flow.
+  assert.match(query, /FROM mat_single_request_approval_step/i);
+  assert.match(query, /approval_steps/i);
+  assert.match(query, /active_step/i);
+  assert.match(query, /r\.rework_stage/i);
+  assert.match(query, /r\.rework_reason/i);
+  assert.match(query, /TO_CHAR\(r\.rework_at, 'YYYY-MM-DD HH24:MI'\) AS rework_at/i);
+  assert.match(query, /rework_by\.username AS rework_by_username/i);
 });
 
 test("legacy single request read queries omit rework columns and joins", () => {
@@ -226,41 +312,56 @@ test("legacy single request read queries omit rework columns and joins", () => {
   );
 });
 
-test("migration adds rework fields, check constraint, and comments", () => {
+test("single request table has rework fields, a stage check for any approval level, and comments", () => {
+  // The 20260522 ALTER was folded into the create script (db293aa); the stage
+  // check was widened for N-step chains (20260929).
   const migrationSource = require("fs").readFileSync(
-    require("path").join(
-      __dirname,
-      "../migration/20260522_add_mat_single_request_rework_fields.sql"
-    ),
+    require("path").join(__dirname, "../migration/20260506_create_mat_single_request_tables.sql"),
     "utf8"
   );
 
-  assert.match(migrationSource, /ADD COLUMN IF NOT EXISTS rework_stage VARCHAR\(32\)/i);
-  assert.match(migrationSource, /ADD COLUMN IF NOT EXISTS rework_by_user_id VARCHAR\(64\)/i);
-  assert.match(migrationSource, /ADD COLUMN IF NOT EXISTS rework_at TIMESTAMPTZ NULL/i);
-  assert.match(migrationSource, /ADD COLUMN IF NOT EXISTS rework_reason TEXT/i);
+  assert.match(migrationSource, /rework_stage varchar\(32\) NULL/i);
+  assert.match(migrationSource, /rework_by_user_id varchar\(64\) NULL/i);
+  assert.match(migrationSource, /rework_at timestamptz NULL/i);
+  assert.match(migrationSource, /rework_reason text NULL/i);
   assert.match(migrationSource, /chk_mat_single_request_rework_stage/i);
   assert.match(
     migrationSource,
-    /CHECK\s*\(\s*rework_stage IS NULL OR\s*rework_stage IN \('Approval 1', 'Approval 2', 'Approval 3'\)\s*\)/i
+    /CHECK \(rework_stage IS NULL OR rework_stage = 'Master Data' OR rework_stage ~ '\^Approval \[1-9\]\[0-9\]\*\$'\)/i
   );
-  assert.match(migrationSource, /COMMENT ON COLUMN mat_single_request\.rework_stage/i);
-  assert.match(migrationSource, /COMMENT ON COLUMN mat_single_request\.rework_by_user_id/i);
-  assert.match(migrationSource, /COMMENT ON COLUMN mat_single_request\.rework_at/i);
-  assert.match(migrationSource, /COMMENT ON COLUMN mat_single_request\.rework_reason/i);
+  assert.match(migrationSource, /COMMENT ON COLUMN public\.mat_single_request\.rework_stage/i);
+  assert.match(migrationSource, /COMMENT ON COLUMN public\.mat_single_request\.rework_by_user_id/i);
+  assert.match(migrationSource, /COMMENT ON COLUMN public\.mat_single_request\.rework_at/i);
+  assert.match(migrationSource, /COMMENT ON COLUMN public\.mat_single_request\.rework_reason/i);
 });
 
-test("migration adds nullable final_code to mat_single_request", () => {
+test("rework stage migration accepts every approval level", () => {
   const migrationSource = require("fs").readFileSync(
-    require("path").join(
-      __dirname,
-      "../migration/20260608_add_mat_single_request_final_code.sql"
-    ),
+    require("path").join(__dirname, "../migration/20260929_mat_single_request_rework_stage_any_level.sql"),
+    "utf8"
+  );
+  assert.match(migrationSource, /DROP CONSTRAINT IF EXISTS chk_mat_single_request_rework_stage/i);
+  assert.match(migrationSource, /rework_stage ~ '\^Approval \[1-9\]\[0-9\]\*\$'/);
+
+  // The rule itself: what stepLabel() can produce is allowed, anything else is not.
+  const allowed = /^Approval [1-9][0-9]*$/;
+  for (const label of ["Approval 1", "Approval 4", "Approval 12"]) {
+    assert.match(label, allowed);
+  }
+  for (const label of ["Approval 0", "Approval", "approval 2", "Approval 2 "]) {
+    assert.doesNotMatch(label, allowed);
+  }
+});
+
+test("single request table has a nullable final_code", () => {
+  // The 20260608 ALTER was folded into the create script (db293aa).
+  const migrationSource = require("fs").readFileSync(
+    require("path").join(__dirname, "../migration/20260506_create_mat_single_request_tables.sql"),
     "utf8"
   );
 
-  assert.match(migrationSource, /ALTER TABLE public\.mat_single_request/i);
-  assert.match(migrationSource, /ADD COLUMN IF NOT EXISTS final_code varchar\(11\) NULL/i);
+  assert.match(migrationSource, /CREATE TABLE IF NOT EXISTS public\.mat_single_request/i);
+  assert.match(migrationSource, /final_code varchar\(11\) NULL/i);
   assert.match(migrationSource, /COMMENT ON COLUMN public\.mat_single_request\.final_code/i);
 });
 
@@ -313,9 +414,10 @@ test("final_code duplicate guard skips cancelled requests", () => {
   );
 });
 
-test("approveSingleRequestByAdmin stores composed final_code on Approval 3", async () => {
+test("approveSingleRequestByAdmin stores composed final_code on the Master Data step", async () => {
   const originalConnect = db.connect;
   let finalUpdateParams = null;
+  const steps = stepsWaitingOnMasterData(77, "APP-03");
 
   db.connect = async () => ({
     query: async (queryText, params = []) => {
@@ -329,7 +431,7 @@ test("approveSingleRequestByAdmin stores composed final_code on Approval 3", asy
             {
               request_id: 77,
               request_no: "1000000077",
-              assigned_to: "Approval 3",
+              assigned_to: "Master Data",
               created_by: "REQ-01",
               created_at: new Date("2026-05-01T08:00:00.000Z"),
               status: "Submit",
@@ -337,18 +439,6 @@ test("approveSingleRequestByAdmin stores composed final_code on Approval 3", asy
               material_group_code: "901",
               material_sub_group_code: "031",
               requester_user_id: "REQ-01",
-              approval_1_user_id: "APP-01",
-              approval_1_at: new Date("2026-05-01T09:00:00.000Z"),
-              approval_1_status: "APPROVED",
-              approval_1_remark: "ok",
-              approval_2_user_id: "APP-02",
-              approval_2_at: new Date("2026-05-01T10:00:00.000Z"),
-              approval_2_status: "APPROVED",
-              approval_2_remark: "ok",
-              approval_3_user_id: "APP-03",
-              approval_3_at: null,
-              approval_3_status: "WAITING",
-              approval_3_remark: null,
               material_group_id: 12,
               material_sub_group_id: 110,
               plant_code: "P1",
@@ -362,6 +452,12 @@ test("approveSingleRequestByAdmin stores composed final_code on Approval 3", asy
         };
       }
 
+      const stepAnswer = answerStepModelQuery(queryText, steps);
+      if (stepAnswer) {
+        return stepAnswer;
+      }
+
+      // The actor is a Master Data (MDM) material user.
       if (/FROM mst_user mu[\s\S]*JOIN mst_page_access/i.test(queryText)) {
         return { rows: [{ "?column?": 1 }], rowCount: 1 };
       }
@@ -383,17 +479,22 @@ test("approveSingleRequestByAdmin stores composed final_code on Approval 3", asy
   });
 
   try {
-    const result = await materialService.approveSingleRequestByAdmin({
-      requestId: 77,
-      actorUserId: "APP-03",
-      actorUsername: "mdm.user",
-      remark: "approved",
-      finalCodeSuffix: "123",
-    });
+    await withSapPushStubbed(async pushCalls => {
+      const result = await materialService.approveSingleRequestByAdmin({
+        requestId: 77,
+        actorUserId: "APP-03",
+        actorUsername: "mdm.user",
+        remark: "approved",
+        finalCodeSuffix: "123",
+      });
 
-    assert.ok(finalUpdateParams);
-    assert.equal(finalUpdateParams.includes("901.031.123"), true);
-    assert.equal(result.final_code, "901.031.123");
+      assert.ok(finalUpdateParams);
+      assert.equal(finalUpdateParams.includes("901.031.123"), true);
+      assert.equal(result.final_code, "901.031.123");
+      // The last step completes the request, which queues it for SAP.
+      assert.equal(result.status, "DONE");
+      assert.deepEqual(pushCalls, [{ requestId: 77, limit: 1 }]);
+    });
   } finally {
     db.connect = originalConnect;
   }
@@ -445,11 +546,13 @@ test("locked approval snapshot query reads runtime approval data from mat_single
   );
 });
 
-test("controller preserves partial approver-master payload fields", () => {
-  assert.match(
-    MaterialController.assignSingleRequestApproverMaster.toString(),
-    /hasOwnProperty/
-  );
+test("approver-master controller saves the whole ordered approver chain", () => {
+  // Replaces the partial approval_1/2/3 update (hasOwnProperty): since the
+  // dynamic-approver flow the administrator saves the full ordered list.
+  const source = MaterialController.assignSingleRequestApproverMaster.toString();
+  assert.match(source, /req\.body\?\.manualApprovers \?\? req\.body\?\.manualApproverIds/);
+  assert.match(source, /materialService\.saveRequesterApproverChain\(/);
+  assert.match(source, /isAdminMaterialApprover/);
 });
 
 test("approve controller forwards editedRequest payload", () => {
@@ -1266,10 +1369,13 @@ test("approval edit validation rejects invalid required-field outcome from long 
   );
 });
 
-test("getSingleRequestApprovalInbox query includes Approval 3 waiting rows", () => {
+test("getSingleRequestApprovalInbox query includes rows waiting at any step", () => {
+  // Replaces the fixed "Approval 3 waiting" predicate: a request is listed
+  // while it has an active step at any level, Master Data included; who may
+  // see it is decided per actor by applyStepInboxVisibility.
   assert.match(
     materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
-    /approval_2_status = 'APPROVED'[\s\S]*COALESCE\(r\.approval_3_status, 'WAITING'\) = 'WAITING'/i
+    /WHERE \(\s*step_rows\.active_step IS NOT NULL/i
   );
 });
 
@@ -1287,17 +1393,15 @@ test("getSingleRequestApprovalInbox returns aggregated edit_history rows", async
   db.connect = async () => ({
     query: async queryText => {
       queryCalls.push(queryText);
+      if (MDM_MEMBERSHIP_QUERY.test(queryText)) {
+        return NOT_MDM_MEMBER;
+      }
       return {
         rows: [
           {
             id: 77,
             status: "Submit",
-            approval_1_status: "WAITING",
-            approval_2_status: null,
-            approval_3_status: null,
-            approval_1_user_id: "APP-01",
-            approval_2_user_id: null,
-            approval_3_user_id: null,
+            ...activeStepFor("APP-01"),
             edit_history: [
               {
                 id: 5,
@@ -1354,7 +1458,9 @@ test("getSingleRequestApprovalInbox returns aggregated edit_history rows", async
   try {
     const rows = await materialService.getSingleRequestApprovalInbox("APP-01", "user.one");
 
-    assert.equal(queryCalls.length, 1);
+    // The inbox query, then the Master Data membership check.
+    assert.equal(queryCalls.length, 2);
+    assert.match(queryCalls[1], MDM_MEMBERSHIP_QUERY);
     assert.equal(rows.length, 1);
     assert.deepEqual(rows[0].edit_history, [
       {
@@ -1421,6 +1527,10 @@ test("getSingleRequestApprovalInbox falls back when edit history table is missin
         throw error;
       }
 
+      if (MDM_MEMBERSHIP_QUERY.test(queryText)) {
+        return NOT_MDM_MEMBER;
+      }
+
       assert.equal(
         queryText,
         materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_LEGACY_QUERY
@@ -1431,12 +1541,7 @@ test("getSingleRequestApprovalInbox falls back when edit history table is missin
           {
             id: 88,
             status: "Submit",
-            approval_1_status: "WAITING",
-            approval_2_status: null,
-            approval_3_status: null,
-            approval_1_user_id: "APP-01",
-            approval_2_user_id: null,
-            approval_3_user_id: null,
+            ...activeStepFor("APP-01"),
             edit_history: [],
           },
         ],
@@ -1448,10 +1553,14 @@ test("getSingleRequestApprovalInbox falls back when edit history table is missin
   try {
     const rows = await materialService.getSingleRequestApprovalInbox("APP-01", "user.one");
 
-    assert.deepEqual(queryCalls, [
+    // Full query fails, the fallback query answers, then the Master Data
+    // membership check runs.
+    assert.equal(queryCalls.length, 3);
+    assert.deepEqual(queryCalls.slice(0, 2), [
       materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
       materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_LEGACY_QUERY,
     ]);
+    assert.match(queryCalls[2], MDM_MEMBERSHIP_QUERY);
     assert.equal(rows.length, 1);
     assert.deepEqual(rows[0].edit_history, []);
   } finally {
@@ -1473,6 +1582,10 @@ test("getSingleRequestApprovalInbox falls back when rework columns are missing",
         throw error;
       }
 
+      if (MDM_MEMBERSHIP_QUERY.test(queryText)) {
+        return NOT_MDM_MEMBER;
+      }
+
       assert.equal(
         queryText,
         materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY
@@ -1483,12 +1596,7 @@ test("getSingleRequestApprovalInbox falls back when rework columns are missing",
           {
             id: 99,
             status: "Submit",
-            approval_1_status: "WAITING",
-            approval_2_status: null,
-            approval_3_status: null,
-            approval_1_user_id: "APP-01",
-            approval_2_user_id: null,
-            approval_3_user_id: null,
+            ...activeStepFor("APP-01"),
             rework_stage: null,
             rework_by_user_id: null,
             rework_at: null,
@@ -1505,10 +1613,14 @@ test("getSingleRequestApprovalInbox falls back when rework columns are missing",
   try {
     const rows = await materialService.getSingleRequestApprovalInbox("APP-01", "user.one");
 
-    assert.deepEqual(queryCalls, [
+    // Full query fails, the fallback query answers, then the Master Data
+    // membership check runs.
+    assert.equal(queryCalls.length, 3);
+    assert.deepEqual(queryCalls.slice(0, 2), [
       materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_QUERY,
       materialService.__private.GET_SINGLE_REQUEST_APPROVAL_INBOX_PRE_REWORK_QUERY,
     ]);
+    assert.match(queryCalls[2], MDM_MEMBERSHIP_QUERY);
     assert.equal(rows.length, 1);
     assert.equal(rows[0].rework_stage, null);
   } finally {
@@ -1565,91 +1677,6 @@ test("getSingleRequestsByUser falls back when rework columns are missing", async
     );
     assert.equal(rows.length, 1);
     assert.equal(rows[0].id, 71);
-  } finally {
-    db.connect = originalConnect;
-  }
-});
-
-test("getSingleRequestsByUser falls back when final_code column is missing", async () => {
-  const originalConnect = db.connect;
-  const queryCalls = [];
-
-  db.connect = async () => ({
-    query: async (queryText, params = []) => {
-      queryCalls.push({ queryText, params });
-
-      if (/r\.final_code/i.test(queryText)) {
-        const error = new Error("column r.final_code does not exist");
-        error.code = "42703";
-        throw error;
-      }
-
-      assert.doesNotMatch(queryText, /r\.final_code/i);
-      assert.match(queryText, /NULL::varchar AS final_code/i);
-      assert.deepEqual(params, ["REQ-01"]);
-
-      return {
-        rows: [
-          {
-            id: 72,
-            requester_user_id: "REQ-01",
-            final_code: null,
-          },
-        ],
-      };
-    },
-    release: () => {},
-  });
-
-  try {
-    const rows = await materialService.getSingleRequestsByUser("REQ-01");
-
-    assert.equal(queryCalls.length, 2);
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].final_code, null);
-  } finally {
-    db.connect = originalConnect;
-  }
-});
-
-test("getSingleRequestApprovalInbox falls back when final_code column is missing", async () => {
-  const originalConnect = db.connect;
-  const queryCalls = [];
-
-  db.connect = async () => ({
-    query: async queryText => {
-      queryCalls.push(queryText);
-
-      if (/r\.final_code/i.test(queryText)) {
-        const error = new Error("column r.final_code does not exist");
-        error.code = "42703";
-        throw error;
-      }
-
-      assert.doesNotMatch(queryText, /r\.final_code/i);
-      assert.match(queryText, /NULL::varchar AS final_code/i);
-
-      return {
-        rows: [
-          {
-            id: 73,
-            requester_user_id: "REQ-01",
-            final_code: null,
-            approval_1_status: "WAITING",
-            approval_1_user_id: "APP-01",
-          },
-        ],
-      };
-    },
-    release: () => {},
-  });
-
-  try {
-    const rows = await materialService.getSingleRequestApprovalInbox("APP-01", "user.one");
-
-    assert.equal(queryCalls.length, 2);
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].final_code, null);
   } finally {
     db.connect = originalConnect;
   }
@@ -2078,27 +2105,9 @@ test("approveSingleRequestByAdmin stores original request creator metadata in ed
         return { rows: [], rowCount: 1 };
       }
 
-      if (/SET approval_1_user_id = COALESCE\(approval_1_user_id, \$2\),[\s\S]*COALESCE\(approval_1_status, 'WAITING'\) = 'WAITING'/i.test(queryText)) {
-        return {
-          rows: [
-            {
-              request_id: 77,
-              approval_1_user_id: "APP-01",
-              approval_1_status: "APPROVED",
-              approval_1_at: "2026-05-20 12:00",
-              approval_1_remark: "approved with edit",
-              approval_2_user_id: "APP-02",
-              approval_2_status: "WAITING",
-              approval_2_at: null,
-              approval_2_remark: null,
-              approval_3_user_id: null,
-              approval_3_status: null,
-              approval_3_at: null,
-              approval_3_remark: null,
-            },
-          ],
-          rowCount: 1,
-        };
+      const stepAnswer = answerStepModelQuery(queryText, stepsWaitingOnFirstApprover(77, "APP-01"));
+      if (stepAnswer) {
+        return stepAnswer;
       }
 
       if (/SET assigned_to = \$2,/i.test(queryText)) {
@@ -2194,11 +2203,16 @@ test("approveSingleRequestByAdmin stores original request creator metadata in ed
   }
 });
 
-test("approveSingleRequestByAdmin auto-assigns Approval 3 for Change when MDM user is available", async () => {
+test("approveSingleRequestByAdmin hands the last manual approval to the open Master Data queue", async () => {
+  // Replaces the old "auto-assigns Approval 3 to an MDM user" behaviour: since
+  // the dynamic-approver flow the Master Data step stays unclaimed
+  // (approver_user_id NULL) and any Master Data user grabs it from the queue.
   const originalConnect = db.connect;
-  const originalGetSubGroupById = materialService.getSubGroupById;
-  const originalValidateMaterialRequestTemplate =
-    MaterialTemplate.validateMaterialRequestTemplate;
+  const steps = [
+    { id: 901, request_id: 77, level: 1, kind: "MANUAL", approver_user_id: "APP-01", status: "WAITING" },
+    { id: 902, request_id: 77, level: 2, kind: "MDM", approver_user_id: null, status: "WAITING" },
+  ];
+  const stepUpdates = [];
 
   db.connect = async () => ({
     query: async (queryText, params = []) => {
@@ -2221,27 +2235,12 @@ test("approveSingleRequestByAdmin auto-assigns Approval 3 for Change when MDM us
               change_extend_reason: "Need update",
               material_group_code: "CHEM",
               requester_user_id: "REQ-01",
-              approval_1_user_id: "APP-01",
-              approval_1_at: null,
-              approval_1_status: "WAITING",
-              approval_1_remark: null,
-              approval_2_user_id: null,
-              approval_2_at: null,
-              approval_2_status: "APPROVED",
-              approval_2_remark: null,
-              approval_3_user_id: null,
-              approval_3_at: null,
-              approval_3_status: "WAITING",
-              approval_3_remark: null,
               material_group_id: 12,
               material_sub_group_id: 110,
               plant_code: "P1",
               sloc_code: "S1",
               material_description: "Original desc",
               base_uom: "EA",
-              long_text_1: null,
-              long_text_2: null,
-              long_text_3: null,
               template_payload: {
                 requestFields: { material_description: "Original desc" },
                 templateValues: {},
@@ -2252,47 +2251,20 @@ test("approveSingleRequestByAdmin auto-assigns Approval 3 for Change when MDM us
         };
       }
 
-      if (/SELECT approval_3_user_id\s+FROM mat_single_request_approval/i.test(queryText)) {
-        return { rows: [{ approval_3_user_id: "MDM-01" }], rowCount: 1 };
+      if (/UPDATE mat_single_request_approval_step/.test(queryText)) {
+        stepUpdates.push(params);
+        return { rows: [], rowCount: 1 };
       }
 
-      if (/FROM mst_user mu[\s\S]*JOIN mst_page_access/i.test(queryText)) {
-        return {
-          rows: [{ user_id: "MDM-01" }],
-          rowCount: 1,
-        };
-      }
-
-      if (/UPDATE mat_single_request\s+SET approval_1_user_id = COALESCE\(approval_1_user_id, \$2\),[\s\S]*approval_3_user_id = \$4,[\s\S]*approval_3_status = 'WAITING'/i.test(queryText)) {
-        assert.deepEqual(params, [77, "APP-01", "approved", "MDM-01"]);
-        return {
-          rows: [
-            {
-              request_id: 77,
-              approval_1_user_id: "APP-01",
-              approval_1_status: "APPROVED",
-              approval_1_at: "2026-05-20 12:00",
-              approval_1_remark: "approved",
-              approval_2_user_id: null,
-              approval_2_status: "APPROVED",
-              approval_2_at: null,
-              approval_2_remark: null,
-              approval_3_user_id: "MDM-01",
-              approval_3_status: "WAITING",
-              approval_3_at: null,
-              approval_3_remark: null,
-            },
-          ],
-          rowCount: 1,
-        };
+      const stepAnswer = answerStepModelQuery(queryText, steps);
+      if (stepAnswer) {
+        return stepAnswer;
       }
 
       if (/SET assigned_to = \$2,/i.test(queryText)) {
         return { rows: [], rowCount: 1 };
       }
 
-      // Every request action also appends to the request comment history; the
-      // stub answers that write the way the database would.
       if (/mat_request_comment/.test(queryText)) {
         return { rows: [], rowCount: 1 };
       }
@@ -2302,37 +2274,31 @@ test("approveSingleRequestByAdmin auto-assigns Approval 3 for Change when MDM us
     release: () => {},
   });
 
-  materialService.getSubGroupById = async () => ({ id: 110, item_group_id: 12, deleted_at: null });
-  MaterialTemplate.validateMaterialRequestTemplate = async ({ requestFields, templateValues }) => ({
-    errors: [],
-    materialDescription: requestFields.material_description,
-    normalizedRequestFields: {
-      material_description: requestFields.material_description,
-      base_unit_of_measure: requestFields.base_unit_of_measure,
-    },
-    normalizedTemplateValues: templateValues,
-  });
-
   try {
-    const result = await materialService.approveSingleRequestByAdmin({
-      requestId: 77,
-      actorUserId: "APP-01",
-      actorUsername: "approver.user",
-      remark: "approved",
-      editedRequest: null,
-    });
+    await withSapPushStubbed(async pushCalls => {
+      const result = await materialService.approveSingleRequestByAdmin({
+        requestId: 77,
+        actorUserId: "APP-01",
+        actorUsername: "approver.user",
+        remark: "approved",
+        editedRequest: null,
+      });
 
-  assert.deepEqual(result, {
-    request_id: 77,
-    stage: "Approval 1",
-    next_stage: "Approval 3",
-    approval_3_user_id: "MDM-01",
-    approval_3_status: "WAITING",
-  });
+      assert.deepEqual(result, {
+        request_id: 77,
+        stage: "Approval 1",
+        status: "Submit",
+        assigned_to: "Master Data",
+        final_code: null,
+      });
+      // Only the manual step is written; the Master Data step is left unclaimed.
+      assert.equal(stepUpdates.length, 1);
+      assert.equal(stepUpdates[0][0], 901);
+      // Not the last step, so nothing goes to SAP yet.
+      assert.deepEqual(pushCalls, []);
+    });
   } finally {
     db.connect = originalConnect;
-    materialService.getSubGroupById = originalGetSubGroupById;
-    MaterialTemplate.validateMaterialRequestTemplate = originalValidateMaterialRequestTemplate;
   }
 });
 
@@ -2408,27 +2374,9 @@ test("approveSingleRequestByAdmin skips history insert when edit-history table i
         return { rows: [], rowCount: 1 };
       }
 
-      if (/SET approval_1_user_id = COALESCE\(approval_1_user_id, \$2\),[\s\S]*COALESCE\(approval_1_status, 'WAITING'\) = 'WAITING'/i.test(queryText)) {
-        return {
-          rows: [
-            {
-              request_id: 77,
-              approval_1_user_id: "APP-01",
-              approval_1_status: "APPROVED",
-              approval_1_at: "2026-05-20 12:00",
-              approval_1_remark: "approved with edit",
-              approval_2_user_id: "APP-02",
-              approval_2_status: "WAITING",
-              approval_2_at: null,
-              approval_2_remark: null,
-              approval_3_user_id: null,
-              approval_3_status: null,
-              approval_3_at: null,
-              approval_3_remark: null,
-            },
-          ],
-          rowCount: 1,
-        };
+      const stepAnswer = answerStepModelQuery(queryText, stepsWaitingOnFirstApprover(77, "APP-01"));
+      if (stepAnswer) {
+        return stepAnswer;
       }
 
       if (/SET assigned_to = \$2,/i.test(queryText)) {
@@ -2486,7 +2434,9 @@ test("approveSingleRequestByAdmin skips history insert when edit-history table i
     assert.deepEqual(result, {
       request_id: 77,
       stage: "Approval 1",
-      next_stage: "Approval 2",
+      status: "Submit",
+      assigned_to: "Approval 2",
+      final_code: null,
     });
     assert.equal(
       queryLog.some(entry =>
@@ -2517,13 +2467,17 @@ test("approveSingleRequestByAdmin skips history insert when edit-history table i
   }
 });
 
-test("createSingleRequest stores aligned insert values for Extend and auto-assigns MDM approval 3 when available", async () => {
+test("createSingleRequest stores aligned insert values for Extend and opens only the Master Data step", async () => {
+  // Extend skips the manual approvers and goes straight to Master Data. Since
+  // the dynamic-approver flow that step is written unclaimed for the Master
+  // Data queue rather than auto-assigned to an MDM user.
   const originalConnect = db.connect;
   const originalExistsSync = require("fs").existsSync;
   const originalMkdirSync = require("fs").mkdirSync;
   const originalReadFileSync = require("fs").readFileSync;
   const originalWriteFileSync = require("fs").writeFileSync;
   let insertParams = null;
+  const stepInserts = [];
 
   require("fs").existsSync = () => true;
   require("fs").mkdirSync = () => {};
@@ -2540,18 +2494,12 @@ test("createSingleRequest stores aligned insert values for Extend and auto-assig
         return { rows: [{ next_id: 77 }], rowCount: 1 };
       }
 
-      if (/SELECT approval_1_user_id, approval_2_user_id(?:,\s*approval_3_user_id)?\s+FROM mat_single_request_approval/i.test(queryText)) {
-        return { rows: [{ approval_1_user_id: null, approval_2_user_id: null, approval_3_user_id: "MDM-01" }], rowCount: 1 };
+      // The requester has a manual approver; Extend must not use it.
+      if (/FROM mat_approvers_matrix_level/i.test(queryText)) {
+        return { rows: [{ level: 1, approver_user_id: "APP-01" }], rowCount: 1 };
       }
 
-      if (/FROM mst_user mu[\s\S]*JOIN mst_page_access/i.test(queryText)) {
-        return {
-          rows: [{ user_id: "MDM-01" }],
-          rowCount: 1,
-        };
-      }
-
-      if (/INSERT INTO mat_single_request\s*\(/i.test(queryText)) {
+      if (queryText === materialService.__private.CREATE_SINGLE_REQUEST_INSERT_QUERY) {
         insertParams = params;
         return {
           rows: [
@@ -2559,18 +2507,22 @@ test("createSingleRequest stores aligned insert values for Extend and auto-assig
               id: 77,
               request_no: "1000000077",
               ticket_type: "Extend",
-              material_code: "MAT-001",
               change_extend_reason: "Open new storage",
               material_description: null,
               base_uom: null,
               status: "Submit",
-               assigned_to: "Approval 3",
-               created_by: "REQ-01",
-               created_at: new Date("2026-05-26T00:00:00.000Z"),
+              assigned_to: "Master Data",
+              created_by: "REQ-01",
+              created_at: new Date("2026-05-26T00:00:00.000Z"),
             },
           ],
           rowCount: 1,
         };
+      }
+
+      if (/INSERT INTO mat_single_request_approval_step/i.test(queryText)) {
+        stepInserts.push(params);
+        return { rows: [], rowCount: 1 };
       }
 
       // Every request action also appends to the request comment history; the
@@ -2603,8 +2555,7 @@ test("createSingleRequest stores aligned insert values for Extend and auto-assig
 
     assert.equal(result.ticket_type, "Extend");
     assert.ok(insertParams);
-      assert.equal(insertParams.length, 22);
-      assert.deepEqual(insertParams, [
+    assert.deepEqual(insertParams, [
       77,
       "1000000077",
       "Extend",
@@ -2613,6 +2564,7 @@ test("createSingleRequest stores aligned insert values for Extend and auto-assig
       210,
       "P1",
       "S1",
+      // Extend carries no description or UoM of its own (pg stores undefined as NULL).
       undefined,
       undefined,
       null,
@@ -2626,15 +2578,11 @@ test("createSingleRequest stores aligned insert values for Extend and auto-assig
         },
         templateValues: {},
       }),
-      "Approval 3",
+      "Master Data",
       "REQ-01",
-      null,
-      "APPROVED",
-      null,
-      "APPROVED",
-      "MDM-01",
-      "WAITING",
     ]);
+    // One step: Master Data, unclaimed, waiting.
+    assert.deepEqual(stepInserts, [[77, 1, "MDM", null, "WAITING"]]);
   } finally {
     db.connect = originalConnect;
     require("fs").existsSync = originalExistsSync;

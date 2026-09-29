@@ -4279,6 +4279,34 @@ const hasGrabbedMdmStep = steps =>
 
 // Spread the step payload onto every row and (for non-admins) filter by
 // per-step visibility. Always returns the payload-enriched rows.
+// The single-request insert. Approvals are not columns here: the approver chain
+// is written as mat_single_request_approval_step rows right after this insert.
+// Exported through __private so tests assert the SQL that actually runs.
+const CREATE_SINGLE_REQUEST_INSERT_QUERY = `INSERT INTO mat_single_request (
+                            id,
+                            request_no,
+                            ticket_type,
+                            change_extend_reason,
+                            material_group_id,
+                            material_sub_group_id,
+                            plant_code,
+                            sloc_code,
+                            material_description,
+                            base_uom,
+                            long_text_1,
+                            long_text_2,
+                            long_text_3,
+                            template_payload,
+                            status,
+                            assigned_to,
+                            created_by,
+                            created_at,
+                            updated_at
+                        ) VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'Submit', $15, $16, NOW(), NOW()
+                        )
+                        RETURNING id, request_no, ticket_type, change_extend_reason, material_description, base_uom, status, assigned_to, created_by, created_at`;
+
 const applyStepInboxVisibility = (
     rows = [],
     { actorUserId, actorUsername, actorIsMdmMaterial, scope } = {}
@@ -5316,30 +5344,7 @@ const MaterialRequests = {
                     });
 
                     const insertResult = await client.query(
-                        `INSERT INTO mat_single_request (
-                            id,
-                            request_no,
-                            ticket_type,
-                            change_extend_reason,
-                            material_group_id,
-                            material_sub_group_id,
-                            plant_code,
-                            sloc_code,
-                            material_description,
-                            base_uom,
-                            long_text_1,
-                            long_text_2,
-                            long_text_3,
-                            template_payload,
-                            status,
-                            assigned_to,
-                            created_by,
-                            created_at,
-                            updated_at
-                        ) VALUES (
-                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'Submit', $15, $16, NOW(), NOW()
-                        )
-                        RETURNING id, request_no, ticket_type, change_extend_reason, material_description, base_uom, status, assigned_to, created_by, created_at`,
+                        CREATE_SINGLE_REQUEST_INSERT_QUERY,
                         [
                             nextId,
                             requestNo,
@@ -8307,33 +8312,7 @@ const MaterialRequests = {
 // Test-only export surface (was MaterialModel's Material.__private). The same
 // SQL strings + helpers the .cjs tests assert against, now read from the service.
 const __private = {
-    CREATE_SINGLE_REQUEST_INSERT_QUERY: `INSERT INTO mat_single_request (
-                            id,
-                            request_no,
-                            ticket_type,
-                            change_extend_reason,
-                            material_group_id,
-                            material_sub_group_id,
-                            plant_code,
-                            sloc_code,
-                            material_description,
-                            base_uom,
-                            long_text_1,
-                            long_text_2,
-                            long_text_3,
-                            template_payload,
-                            status,
-                            assigned_to,
-                            created_by,
-                            created_at,
-                            updated_at,
-                            approval_1_user_id,
-                            approval_1_status,
-                            approval_2_user_id,
-                            approval_2_status,
-                            approval_3_user_id,
-                            approval_3_status
-                        )`,
+    CREATE_SINGLE_REQUEST_INSERT_QUERY,
     GET_SINGLE_REQUEST_LIST_QUERY: buildSingleRequestListQuery("r.created_by = $1"),
     GET_SINGLE_REQUEST_LIST_PRE_REWORK_QUERY,
     GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY,
