@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS public.mat_single_request (
     CONSTRAINT chk_mat_single_request_approval_3_status
         CHECK (approval_3_status IS NULL OR approval_3_status IN ('WAITING', 'APPROVED', 'REWORK', 'REJECTED')),
     CONSTRAINT chk_mat_single_request_rework_stage
-        CHECK (rework_stage IS NULL OR rework_stage IN ('Approval 1', 'Approval 2', 'Approval 3', 'Master Data'))
+        -- Any approval level: the dynamic-approver chain has no fixed length.
+        CHECK (rework_stage IS NULL OR rework_stage = 'Master Data' OR rework_stage ~ '^Approval [1-9][0-9]*$')
 );
 
 CREATE INDEX IF NOT EXISTS idx_mat_single_request_status
