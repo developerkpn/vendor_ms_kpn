@@ -16,6 +16,20 @@ COPY . .
 # code writes into it without creating it first.
 RUN mkdir -p backend/public
 
+# server.js serves HTTPS and reads ./ssl/cert.pem and ./ssl/key.pem at startup.
+# The public certificate (*.gamasap.com, ACM) sits on the load balancer, which
+# does not validate the certificate of this internal hop, so a self-signed pair
+# is enough. ssl/ is gitignored: a clean checkout (CI) has none, so one is
+# generated here; an ssl/ present in the build context is used as-is.
+RUN if [ ! -f ssl/cert.pem ] || [ ! -f ssl/key.pem ]; then \
+        apk add --no-cache --virtual .ssl-gen openssl && \
+        mkdir -p ssl && \
+        openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+            -subj "/CN=vms-backend" \
+            -keyout ssl/key.pem -out ssl/cert.pem && \
+        apk del .ssl-gen; \
+    fi
+
 EXPOSE 5000
 EXPOSE 80
 EXPOSE 443
