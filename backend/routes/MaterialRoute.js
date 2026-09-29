@@ -3,6 +3,7 @@ const router = express.Router();
 const MaterialController = require("../controllers/MaterialController");
 const GuideController = require("../controllers/GuideController");
 const AuthToken = require("../middleware/tokenmanager");
+const requireMaterialAdmin = require("../middleware/requireMaterialAdmin");
 
 // Get all material groups
 router.get("/groups", MaterialController.getMaterialGroups);
@@ -153,6 +154,7 @@ router.get("/guides/files/:fileId/content", GuideController.streamFile);
 router.post(
     "/guides/upload",
     AuthToken.authSession,
+    requireMaterialAdmin,
     (req, res, next) => {
         req.setTimeout(30 * 60 * 1000);
         res.setTimeout(30 * 60 * 1000);
@@ -160,21 +162,35 @@ router.post(
     },
     GuideController.uploadGuides
 );
-router.post("/guides/folders", AuthToken.authSession, GuideController.createFolder);
+// Managing guides is the Administrator section's; reading them (above) is open.
+router.post(
+    "/guides/folders",
+    AuthToken.authSession,
+    requireMaterialAdmin,
+    GuideController.createFolder
+);
 router.put(
     "/guides/folders/:folderId",
     AuthToken.authSession,
+    requireMaterialAdmin,
     GuideController.updateFolder
 );
 router.delete(
     "/guides/folders/:folderId",
     AuthToken.authSession,
+    requireMaterialAdmin,
     GuideController.deleteFolder
 );
-router.put("/guides/files/:fileId", AuthToken.authSession, GuideController.updateFile);
+router.put(
+    "/guides/files/:fileId",
+    AuthToken.authSession,
+    requireMaterialAdmin,
+    GuideController.updateFile
+);
 router.delete(
     "/guides/files/:fileId",
     AuthToken.authSession,
+    requireMaterialAdmin,
     GuideController.deleteFile
 );
 

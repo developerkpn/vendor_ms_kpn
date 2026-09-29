@@ -3417,6 +3417,96 @@ const isActorMdmMaterialUser = async (client, actorUserId) => {
     return result.rowCount > 0;
 };
 
+// Materials menu entries whose access is decided per user, not per user group
+// (mst_page_access). Keys are mst_page.page, the names the permission map and
+// the sidebar use.
+const MATERIAL_APPROVAL_PAGE = "My Approval";
+const MATERIAL_ADMINISTRATOR_PAGE = "Administrator";
+
+// An approver is someone in a requester's manual chain, or someone a request is
+// still waiting on (a chain can be edited after requests were submitted with
+// the old one frozen onto them).
+const MATERIAL_APPROVER_ACCESS_QUERY = `SELECT
+        EXISTS (
+            SELECT 1 FROM mat_approvers_matrix_level
+            WHERE approver_user_id = $1
+        )
+        OR EXISTS (
+            SELECT 1 FROM mat_single_request_approval_step
+            WHERE approver_user_id = $1
+              AND COALESCE(status, 'WAITING') = 'WAITING'
+        )
+        OR EXISTS (
+            SELECT 1 FROM mat_mass_request_item_approval_step
+            WHERE approver_user_id = $1
+              AND COALESCE(status, 'WAITING') = 'WAITING'
+        ) AS is_approver`;
+
+/**
+ * Who may open My Approval and the Materials Administrator section.
+ *
+ * - Administrator: the ADMIN user only.
+ * - My Approval: ADMIN, anyone assigned as an approver (see the query above),
+ *   and Master Data (MDM_MATERIAL) users, who act on the final step of every
+ *   request.
+ *
+ * Both come on top of the user group's page access, never instead of it.
+ *
+ * Runs on the pool, never on a caller's transaction: a failure here must not
+ * abort a login. canApprove is null when it could not be decided, and the
+ * user group's setting for My Approval then stands.
+ */
+const resolveMaterialMenuAccess = async ({ userId, username } = {}) => {
+    if (isAdminMaterialApprover(username)) {
+        return { isAdmin: true, canApprove: true };
+    }
+    if (!userId) {
+        return { isAdmin: false, canApprove: false };
+    }
+    try {
+        const { rows } = await pool.query(MATERIAL_APPROVER_ACCESS_QUERY, [
+            userId,
+        ]);
+        if (rows[0]?.is_approver === true) {
+            return { isAdmin: false, canApprove: true };
+        }
+        const isMdm = await isActorMdmMaterialUser(pool, userId);
+        return { isAdmin: false, canApprove: isMdm };
+    } catch (error) {
+        console.error(
+            `[MATERIAL-ACCESS] could not resolve approver access for ${userId}:`,
+            error && error.message
+        );
+        return { isAdmin: false, canApprove: null };
+    }
+};
+
+/**
+ * Narrows a group permission map (page -> {create, read, update, delete}) with
+ * resolveMaterialMenuAccess, in place. It only ever closes a page: the sidebar
+ * is built from the group's readable pages (PageModel.showAll), so the group
+ * still has to grant the page, and the per-user rule decides on top of that.
+ */
+const applyMaterialMenuAccess = (permission, { isAdmin, canApprove } = {}) => {
+    const close = page => {
+        if (permission[page]) {
+            permission[page] = {
+                create: false,
+                read: false,
+                update: false,
+                delete: false,
+            };
+        }
+    };
+    if (isAdmin !== true) {
+        close(MATERIAL_ADMINISTRATOR_PAGE);
+    }
+    if (canApprove === false) {
+        close(MATERIAL_APPROVAL_PAGE);
+    }
+    return permission;
+};
+
 /**
  * The one DB-backed half of chain-replacement validation: every replacement
  * approver must be a real, ACTIVE mst_user.
@@ -8312,6 +8402,7 @@ const MaterialRequests = {
 // Test-only export surface (was MaterialModel's Material.__private). The same
 // SQL strings + helpers the .cjs tests assert against, now read from the service.
 const __private = {
+    MATERIAL_APPROVER_ACCESS_QUERY,
     CREATE_SINGLE_REQUEST_INSERT_QUERY,
     GET_SINGLE_REQUEST_LIST_QUERY: buildSingleRequestListQuery("r.created_by = $1"),
     GET_SINGLE_REQUEST_LIST_PRE_REWORK_QUERY,
@@ -8376,6 +8467,8 @@ module.exports = {
     applyMassItemFinalCodes,
     canActorReviseSingleRequest,
     buildLoginUserGroupInfo,
+    resolveMaterialMenuAccess,
+    applyMaterialMenuAccess,
     buildStepApprovePatch,
     buildStepReworkPatch,
     normalizeReworkToLevel,

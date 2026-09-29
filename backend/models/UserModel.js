@@ -7,7 +7,11 @@ const crud = require("../helper/crudquery.js");
 const moment = require("moment");
 const PageModel = require("../models/PageModel.js");
 const { param } = require("../routes/UserRoute.js");
-const { buildLoginUserGroupInfo } = require("../services/materialService.js");
+const {
+    buildLoginUserGroupInfo,
+    resolveMaterialMenuAccess,
+    applyMaterialMenuAccess,
+} = require("../services/materialService.js");
 
 const User = {
     showAll: async ({ page, limit, search } = {}) => {
@@ -563,6 +567,15 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
             }
             await client.query(TRANS.COMMIT);
             transactionStarted = false;
+            // My Approval and the Materials Administrator section are per user,
+            // on top of the group's page access.
+            applyMaterialMenuAccess(
+                authPerm,
+                await resolveMaterialMenuAccess({
+                    userId: resdata.user_id,
+                    username: resdata.username,
+                })
+            );
             return {
                 fullname: resdata.fullname,
                 username: resdata.username,
@@ -729,6 +742,14 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
                 const { jsonMenu: menu } = await PageModel.showAll(
                     user.user_group,
                     user.username
+                );
+                // Same per-user Materials access as at login.
+                applyMaterialMenuAccess(
+                    authPerm,
+                    await resolveMaterialMenuAccess({
+                        userId: user.user_id,
+                        username: user.username,
+                    })
                 );
                 return {
                     fullname: user.fullname,
