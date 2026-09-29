@@ -11,6 +11,11 @@ RUN npm install -g pm2
 
 COPY . .
 
+# Uploads land in backend/public (usually an EFS mount over this path). It is
+# gitignored, so a clean checkout has no such folder, and the vendor upload
+# code writes into it without creating it first.
+RUN mkdir -p backend/public
+
 EXPOSE 5000
 EXPOSE 80
 EXPOSE 443
