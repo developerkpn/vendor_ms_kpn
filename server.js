@@ -22,6 +22,7 @@ const VerifyLogin = require("./backend/middleware/VerifyLogin");
 const { SchedulerSyncStaged } = require("./backend/helper/Scheduler");
 const Material = require("./backend/models/MaterialModel");
 const materialSapStagingService = require("./backend/services/materialSapStagingService");
+const materialService = require("./backend/services/materialService");
 const reworkEmailInboundService = require("./backend/services/reworkEmailInboundService");
 const aiValidationService = require("./backend/services/aiValidationService");
 const cron = require("node-cron");
@@ -232,6 +233,8 @@ cron.schedule(
 
 async function startServer() {
     await ensureSingleRequestSchema(db);
+    // Materials admins besides ADMIN (MATERIAL_ADMIN group), kept in a cache.
+    materialService.startMaterialAdminRefresh();
 
     https.createServer(servOption, app).listen(port, "0.0.0.0", () => {
         console.log(`App running on ${port}`);

@@ -17,6 +17,12 @@ const MDM_MATERIAL_GROUP_NAME = "MDM_MATERIAL";
 // Temporary material-approval fallback: normalized username ADMIN.
 const ADMIN_APPROVER_USERNAME = "ADMIN";
 
+// Materials administrators besides the ADMIN account: members of this user
+// group get ADMIN's powers inside the Materials module only (all requests,
+// approver chains, guides). Their group's page access keeps them out of the
+// rest of VMS.
+const MATERIAL_ADMIN_GROUP_NAME = "MATERIAL_ADMIN";
+
 // Raw-SQL sentinel: patch values shaped like this are inlined verbatim (NOW())
 // by the model writer instead of being bound as a string literal.
 const SQL_NOW_EXPRESSION = Object.freeze({ __sql: "NOW()" });
@@ -127,6 +133,7 @@ module.exports = {
     STEP_INITIAL_STATUS,
     MDM_MATERIAL_GROUP_NAME,
     ADMIN_APPROVER_USERNAME,
+    MATERIAL_ADMIN_GROUP_NAME,
     SQL_NOW_EXPRESSION,
     SINGLE_REQUEST_TICKET_TYPES,
     MAX_MATERIAL_DESCRIPTION_LENGTH,

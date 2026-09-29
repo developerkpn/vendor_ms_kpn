@@ -569,14 +569,15 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
             transactionStarted = false;
             // My Approval and the Materials Administrator section are per user,
             // on top of the group's page access.
-            applyMaterialMenuAccess(
-                authPerm,
-                await resolveMaterialMenuAccess({
-                    userId: resdata.user_id,
-                    username: resdata.username,
-                })
-            );
+            const materialAccess = await resolveMaterialMenuAccess({
+                userId: resdata.user_id,
+                username: resdata.username,
+            });
+            applyMaterialMenuAccess(authPerm, materialAccess);
             return {
+                // Materials admin powers (ADMIN or MATERIAL_ADMIN group), for
+                // the approval dialogs' admin override.
+                is_material_admin: materialAccess.isAdmin === true,
                 fullname: resdata.fullname,
                 username: resdata.username,
                 user_id: resdata.user_id,
@@ -744,14 +745,13 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
                     user.username
                 );
                 // Same per-user Materials access as at login.
-                applyMaterialMenuAccess(
-                    authPerm,
-                    await resolveMaterialMenuAccess({
-                        userId: user.user_id,
-                        username: user.username,
-                    })
-                );
+                const materialAccess = await resolveMaterialMenuAccess({
+                    userId: user.user_id,
+                    username: user.username,
+                });
+                applyMaterialMenuAccess(authPerm, materialAccess);
                 return {
+                    is_material_admin: materialAccess.isAdmin === true,
                     fullname: user.fullname,
                     username: user.username,
                     user_id: user.user_id,

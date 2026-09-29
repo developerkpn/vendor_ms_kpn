@@ -18,6 +18,7 @@ const {
     STEP_INITIAL_STATUS,
     MDM_MATERIAL_GROUP_NAME,
     ADMIN_APPROVER_USERNAME,
+    MATERIAL_ADMIN_GROUP_NAME,
     SQL_NOW_EXPRESSION,
     SINGLE_REQUEST_TICKET_TYPES,
     MAX_MATERIAL_DESCRIPTION_LENGTH,
@@ -221,9 +222,69 @@ const normalizeSingleRequestTicketType = value => {
     return SINGLE_REQUEST_TICKET_TYPES.CREATE;
 };
 
-// Temporary material-approval fallback: normalized username ADMIN, not a generic admin-role check.
-const isAdminMaterialApprover = username =>
-    normalizeUsername(username) === ADMIN_APPROVER_USERNAME;
+// Materials administrators: the ADMIN account, plus active members of the
+// MATERIAL_ADMIN group. Group membership lives in the database, but this check
+// is called synchronously all over the module, so members are kept in a cache
+// (normalized usernames) that refreshMaterialAdminUsernames() fills: at server
+// start, every MATERIAL_ADMIN_REFRESH_MS, at each login, and when the admin
+// guard sees an unknown user. Adding someone to the group therefore takes
+// effect at their next login.
+const MATERIAL_ADMIN_REFRESH_MS = 60 * 1000;
+const MATERIAL_ADMIN_USERNAMES_QUERY = `SELECT DISTINCT u.username
+    FROM mst_user u
+    JOIN mst_page_access a ON a.user_group_id = u.user_group
+    WHERE a.user_group_name = $1
+      AND u.is_active = true`;
+let materialAdminUsernames = new Set();
+let materialAdminRefreshedAt = 0;
+
+const isAdminMaterialApprover = username => {
+    const normalized = normalizeUsername(username);
+    return (
+        normalized === ADMIN_APPROVER_USERNAME ||
+        (normalized !== "" && materialAdminUsernames.has(normalized))
+    );
+};
+
+/**
+ * Reloads the MATERIAL_ADMIN members. Never throws: on a database error the
+ * previous list stays (ADMIN keeps working regardless). `minAgeMs` skips the
+ * query when the list is fresher than that, so request paths can call it
+ * without hammering the database.
+ */
+const refreshMaterialAdminUsernames = async ({ minAgeMs = 0 } = {}) => {
+    if (minAgeMs > 0 && Date.now() - materialAdminRefreshedAt < minAgeMs) {
+        return materialAdminUsernames;
+    }
+    try {
+        const { rows } = await pool.query(MATERIAL_ADMIN_USERNAMES_QUERY, [
+            MATERIAL_ADMIN_GROUP_NAME,
+        ]);
+        materialAdminUsernames = new Set(
+            rows.map(row => normalizeUsername(row.username)).filter(Boolean)
+        );
+        materialAdminRefreshedAt = Date.now();
+    } catch (error) {
+        console.error(
+            "[MATERIAL-ACCESS] could not load MATERIAL_ADMIN members:",
+            error && error.message
+        );
+    }
+    return materialAdminUsernames;
+};
+
+/** Called once from server.js; tests never start it, so they never touch the DB. */
+const startMaterialAdminRefresh = () => {
+    refreshMaterialAdminUsernames();
+    const timer = setInterval(
+        () => refreshMaterialAdminUsernames(),
+        MATERIAL_ADMIN_REFRESH_MS
+    );
+    if (typeof timer.unref === "function") {
+        timer.unref();
+    }
+    return timer;
+};
 
 const matchesActorUserId = (assigneeUserId, actorUserId) =>
     assigneeUserId != null &&
@@ -541,6 +602,7 @@ const buildLoginUserGroupInfo = (pageAccessRows = [], userGroupId = null) => {
             id: userGroupId,
             names: groupNames,
             is_mdm_material: groupNames.includes(MDM_MATERIAL_GROUP_NAME),
+            is_material_admin: groupNames.includes(MATERIAL_ADMIN_GROUP_NAME),
         },
     };
 };
@@ -3445,7 +3507,7 @@ const MATERIAL_APPROVER_ACCESS_QUERY = `SELECT
 /**
  * Who may open My Approval and the Materials Administrator section.
  *
- * - Administrator: the ADMIN user only.
+ * - Administrator: the ADMIN user and MATERIAL_ADMIN group members.
  * - My Approval: ADMIN, anyone assigned as an approver (see the query above),
  *   and Master Data (MDM_MATERIAL) users, who act on the final step of every
  *   request.
@@ -3457,6 +3519,9 @@ const MATERIAL_APPROVER_ACCESS_QUERY = `SELECT
  * user group's setting for My Approval then stands.
  */
 const resolveMaterialMenuAccess = async ({ userId, username } = {}) => {
+    // Fresh at login, so a user just added to (or removed from) MATERIAL_ADMIN
+    // gets the right menu and API access straight away.
+    await refreshMaterialAdminUsernames();
     if (isAdminMaterialApprover(username)) {
         return { isAdmin: true, canApprove: true };
     }
@@ -8402,6 +8467,7 @@ const MaterialRequests = {
 // Test-only export surface (was MaterialModel's Material.__private). The same
 // SQL strings + helpers the .cjs tests assert against, now read from the service.
 const __private = {
+    MATERIAL_ADMIN_USERNAMES_QUERY,
     MATERIAL_APPROVER_ACCESS_QUERY,
     CREATE_SINGLE_REQUEST_INSERT_QUERY,
     GET_SINGLE_REQUEST_LIST_QUERY: buildSingleRequestListQuery("r.created_by = $1"),
@@ -8468,6 +8534,8 @@ module.exports = {
     canActorReviseSingleRequest,
     buildLoginUserGroupInfo,
     resolveMaterialMenuAccess,
+    refreshMaterialAdminUsernames,
+    startMaterialAdminRefresh,
     applyMaterialMenuAccess,
     buildStepApprovePatch,
     buildStepReworkPatch,
