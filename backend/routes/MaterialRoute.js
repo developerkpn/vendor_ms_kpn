@@ -4,6 +4,7 @@ const MaterialController = require("../controllers/MaterialController");
 const GuideController = require("../controllers/GuideController");
 const AuthToken = require("../middleware/tokenmanager");
 const requireMaterialAdmin = require("../middleware/requireMaterialAdmin");
+const requireMaterialMasterData = require("../middleware/requireMaterialMasterData");
 
 // Get all material groups
 router.get("/groups", MaterialController.getMaterialGroups);
@@ -121,10 +122,11 @@ router.post(
     MaterialController.uploadAttachment
 );
 
-// Delete attachment
+// Delete attachment: Master Data and Materials administrators only
 router.delete(
     "/attachments/:attachmentId",
     AuthToken.authSession,
+    requireMaterialMasterData,
     MaterialController.deleteAttachment
 );
 
