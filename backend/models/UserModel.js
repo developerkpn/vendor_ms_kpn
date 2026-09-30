@@ -833,11 +833,15 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
     showExistSecGrp: async () => {
         const client = await db.connect();
         try {
-            const q = `select distinct 
-                        user_group_name, 
-                        user_group_id, 
-                        TO_CHAR(created_at, 'mm/dd/yyyy') as createddate
-                        from mst_page_access`;
+            // One row per group. mst_page_access has one row per page, and a
+            // page added to a group on a later day must not list the group
+            // twice, so the date is the group's first (its creation).
+            const q = `select
+                        user_group_name,
+                        user_group_id,
+                        TO_CHAR(min(created_at), 'mm/dd/yyyy') as createddate
+                        from mst_page_access
+                        group by user_group_name, user_group_id`;
             const userGroups = await client.query(q);
             return {
                 count: userGroups.rowCount,
