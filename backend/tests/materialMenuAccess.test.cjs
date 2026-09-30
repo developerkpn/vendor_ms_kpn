@@ -6,6 +6,7 @@ const test = require("node:test");
 const pool = require("../config/connection");
 const materialService = require("../services/materialService");
 const requireMaterialAdmin = require("../middleware/requireMaterialAdmin");
+const requireMaterialMasterData = require("../middleware/requireMaterialMasterData");
 
 const {
   resolveMaterialMenuAccess,
@@ -338,4 +339,86 @@ test("guide management routes are Materials-admin only; reading guides stays ope
     assert.match(source, pattern);
   }
   assert.match(source, /router\.get\("\/guides", AuthToken\.authSession, GuideController\.getGuides\);/);
+});
+
+async function runMasterDataMiddleware(cookies) {
+  let nextCalled = false;
+  const res = {
+    statusCode: 200,
+    body: null,
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(body) {
+      this.body = body;
+      return this;
+    },
+  };
+  await requireMaterialMasterData({ cookies }, res, () => {
+    nextCalled = true;
+  });
+  return { nextCalled, res };
+}
+
+// Answers the admin list and the MDM_MATERIAL membership check.
+function answerAdminAndMdm(text, params, { admins = [], mdmUserIds = [] } = {}) {
+  if (text === MATERIAL_ADMIN_USERNAMES_QUERY) {
+    return answerAdminList(text, admins);
+  }
+  if (/mpa\.user_group_name = \$2/.test(text) && params[1] === "MDM_MATERIAL") {
+    const isMdm = mdmUserIds.includes(params[0]);
+    return { rows: isMdm ? [{ "?column?": 1 }] : [], rowCount: isMdm ? 1 : 0 };
+  }
+  return undefined;
+}
+
+test("requireMaterialMasterData lets Master Data and Materials admins through, 403 to anyone else", async () => {
+  await withPoolQuery(
+    (text, params) => answerAdminAndMdm(text, params, { admins: ["matadmin1"], mdmUserIds: ["U-MDM"] }),
+    async () => {
+      await refreshMaterialAdminUsernames();
+      assert.equal((await runMasterDataMiddleware({ username: "ADMIN", user_id: "U-1" })).nextCalled, true);
+      assert.equal((await runMasterDataMiddleware({ username: "matadmin1", user_id: "U-2" })).nextCalled, true);
+      assert.equal((await runMasterDataMiddleware({ username: "mdmuser", user_id: "U-MDM" })).nextCalled, true);
+
+      for (const cookies of [{ username: "requester", user_id: "U-REQ" }, { username: "" }, undefined]) {
+        const { nextCalled, res } = await runMasterDataMiddleware(cookies);
+        assert.equal(nextCalled, false);
+        assert.equal(res.statusCode, 403);
+        assert.deepEqual(res.body, { success: false, message: "Forbidden" });
+      }
+    }
+  );
+  await withPoolQuery(text => answerAdminList(text, []), () => refreshMaterialAdminUsernames());
+});
+
+test("requireMaterialMasterData answers 500, not next(), when the Master Data check fails", async () => {
+  await withPoolQuery(
+    text => {
+      if (text === MATERIAL_ADMIN_USERNAMES_QUERY) {
+        return answerAdminList(text, []);
+      }
+      throw new Error("db down");
+    },
+    async () => {
+      const originalError = console.error;
+      console.error = () => {};
+      try {
+        const { nextCalled, res } = await runMasterDataMiddleware({ username: "mdmuser", user_id: "U-MDM" });
+        assert.equal(nextCalled, false);
+        assert.equal(res.statusCode, 500);
+      } finally {
+        console.error = originalError;
+      }
+    }
+  );
+});
+
+test("deleting a material attachment is guarded by requireMaterialMasterData", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../routes/MaterialRoute.js"), "utf8");
+  assert.match(
+    source,
+    /router\.delete\(\s*"\/attachments\/:attachmentId",\s*AuthToken\.authSession,\s*requireMaterialMasterData,\s*MaterialController\.deleteAttachment/
+  );
 });
