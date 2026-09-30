@@ -28,6 +28,7 @@ const {
     SINGLE_REQUEST_MATERIAL_CODE_SQL,
     MASS_ITEM_GROUP_CODE_LATERAL_SQL,
     MASS_ITEM_SUB_GROUP_CODE_LATERAL_SQL,
+    MATERIAL_PEOPLE_SQL,
 } = require("../constants/material");
 const { normalizeWhitespace } = require("../utils/material");
 const {
@@ -231,7 +232,7 @@ const normalizeSingleRequestTicketType = value => {
 // effect at their next login.
 const MATERIAL_ADMIN_REFRESH_MS = 60 * 1000;
 const MATERIAL_ADMIN_USERNAMES_QUERY = `SELECT DISTINCT u.username
-    FROM mst_user u
+    FROM ${MATERIAL_PEOPLE_SQL} u
     JOIN mst_page_access a ON a.user_group_id = u.user_group
     WHERE a.user_group_name = $1
       AND u.is_active = true`;
@@ -1991,7 +1992,7 @@ const loadSingleRequestSteps = async (
             COALESCE(au.fullname, au.username, s.approver_user_id) AS approver_name,
             au.email AS approver_email
          FROM mat_single_request_approval_step s
-         LEFT JOIN mst_user au ON au.user_id = s.approver_user_id
+         LEFT JOIN ${MATERIAL_PEOPLE_SQL} au ON au.user_id = s.approver_user_id
          WHERE s.request_id = $1
          ORDER BY s.level${forUpdate ? "\n         FOR UPDATE OF s" : ""}`,
         [requestId]
@@ -2243,7 +2244,7 @@ const loadMassItemSteps = async (
             au.email AS approver_email
          FROM mat_mass_request_item_approval_step s
          JOIN mat_mass_request_item i ON i.id = s.item_id
-         LEFT JOIN mst_user au ON au.user_id = s.approver_user_id
+         LEFT JOIN ${MATERIAL_PEOPLE_SQL} au ON au.user_id = s.approver_user_id
          WHERE i.mass_request_id = $1
            AND i.item_no = (
                SELECT MIN(ii.item_no)
@@ -3421,7 +3422,7 @@ const queryUsersWithPageAccessByIds = async (client, userIds) => {
             MIN(mpa.user_group_name) AS user_group_name,
             ARRAY_AGG(DISTINCT mpa.user_group_name)
                 FILTER (WHERE mpa.user_group_name IS NOT NULL) AS group_names
-        FROM mst_user mu
+        FROM ${MATERIAL_PEOPLE_SQL} mu
         LEFT JOIN mst_page_access mpa
             ON mpa.user_group_id = mu.user_group
         WHERE mu.user_id = ANY($1)
@@ -3450,7 +3451,7 @@ const queryActiveMdmMaterialUsers = async client => {
             mu.is_active,
             mpa.user_group_name,
             ARRAY[$1] AS group_names
-        FROM mst_user mu
+        FROM ${MATERIAL_PEOPLE_SQL} mu
         JOIN mst_page_access mpa
             ON mpa.user_group_id = mu.user_group
         WHERE mpa.user_group_name = $1
@@ -3468,7 +3469,7 @@ const isActorMdmMaterialUser = async (client, actorUserId) => {
     }
     const result = await client.query(
         `SELECT 1
-         FROM mst_user mu
+         FROM ${MATERIAL_PEOPLE_SQL} mu
          JOIN mst_page_access mpa
            ON mpa.user_group_id = mu.user_group
          WHERE mu.user_id = $1
@@ -3606,7 +3607,7 @@ const assertActiveApproverUsersExist = async (
 
     const result = await client.query(
         `SELECT mu.user_id, mu.email
-           FROM mst_user mu
+           FROM ${MATERIAL_PEOPLE_SQL} mu
           WHERE mu.user_id = ANY($1)
             AND mu.is_active = true`,
         [ids]
@@ -3656,7 +3657,7 @@ const loadReworkApproverFullname = async (client, approverUserId) => {
 
     const result = await client.query(
         `SELECT mu.fullname
-           FROM mst_user mu
+           FROM ${MATERIAL_PEOPLE_SQL} mu
           WHERE mu.user_id = $1
             AND mu.is_active = true`,
         [userId]
@@ -3710,7 +3711,7 @@ const buildSingleRequestStepLateral = (alias = "r") => `LEFT JOIN LATERAL (
                                 ) active
                             ) AS active_step
                         FROM mat_single_request_approval_step s
-                        LEFT JOIN mst_user sau ON sau.user_id = s.approver_user_id
+                        LEFT JOIN ${MATERIAL_PEOPLE_SQL} sau ON sau.user_id = s.approver_user_id
                         WHERE s.request_id = ${alias}.id
                     ) step_rows ON TRUE`;
 
@@ -3888,11 +3889,11 @@ const buildSingleRequestListQuery = (
 ) => `SELECT
                         ${buildSingleRequestSelectFields({ includeReworkFields, includeEmailReplyCount })}
                       FROM mat_single_request r
-                      LEFT JOIN mst_user u ON u.user_id = r.created_by
+                      LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON u.user_id = r.created_by
                       ${buildSingleRequestStepLateral("r")}
                       ${
                           includeReworkFields
-                              ? "LEFT JOIN mst_user rework_by ON rework_by.user_id = r.rework_by_user_id"
+                              ? `LEFT JOIN ${MATERIAL_PEOPLE_SQL} rework_by ON rework_by.user_id = r.rework_by_user_id`
                               : ""
                       }
                       LEFT JOIN mat_item_group mig ON mig.id = r.material_group_id
@@ -3968,11 +3969,11 @@ const buildSingleRequestApprovalInboxQuery = ({
                       FROM mat_single_request r
                       LEFT JOIN mat_item_group mig ON mig.id = r.material_group_id
                       LEFT JOIN mat_item_sub_group mis ON mis.id = r.material_sub_group_id
-                      LEFT JOIN mst_user u ON u.user_id = r.created_by
+                      LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON u.user_id = r.created_by
                       ${buildSingleRequestStepLateral("r")}
                       ${
                           includeReworkFields
-                              ? "LEFT JOIN mst_user rework_by ON rework_by.user_id = r.rework_by_user_id"
+                              ? `LEFT JOIN ${MATERIAL_PEOPLE_SQL} rework_by ON rework_by.user_id = r.rework_by_user_id`
                               : ""
                       }
                       ${
@@ -4005,7 +4006,7 @@ const buildSingleRequestApprovalInboxQuery = ({
                                 ORDER BY eh.approved_at DESC
                             ) AS edit_history
                         FROM mat_single_request_edit_history eh
-                        LEFT JOIN mst_user au ON au.user_id = eh.approved_by_user_id
+                        LEFT JOIN ${MATERIAL_PEOPLE_SQL} au ON au.user_id = eh.approved_by_user_id
                         WHERE eh.request_id = r.id
                     ) edit_history_rows ON TRUE`
                             : ""
@@ -4072,7 +4073,7 @@ const MASS_REQUEST_FIRST_ITEM_STEP_LATERAL = `LEFT JOIN LATERAL (
                     ORDER BY s.level
                 )
                 FROM mat_mass_request_item_approval_step s
-                LEFT JOIN mst_user sau ON sau.user_id = s.approver_user_id
+                LEFT JOIN ${MATERIAL_PEOPLE_SQL} sau ON sau.user_id = s.approver_user_id
                 WHERE s.item_id = i.id
             ),
             '[]'::jsonb
@@ -4145,7 +4146,7 @@ const buildMassRequestsByUserQuery = ({
     first_item.active_step,
     ${MASS_REQUEST_SAP_PUSH_STATUS_SQL}
 FROM mat_mass_request m
-LEFT JOIN mst_user u ON u.user_id = m.created_by
+LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON u.user_id = m.created_by
 ${MASS_REQUEST_FIRST_ITEM_STEP_LATERAL}
 WHERE m.created_by = $1
 ORDER BY m.created_at DESC, m.id DESC`;
@@ -4168,7 +4169,7 @@ const buildMassRequestApprovalInboxQuery = ({
     first_item.active_step,
     ${MASS_REQUEST_SAP_PUSH_STATUS_SQL}
 FROM mat_mass_request m
-LEFT JOIN mst_user u ON u.user_id = m.created_by
+LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON u.user_id = m.created_by
 ${MASS_REQUEST_FIRST_ITEM_STEP_LATERAL}
 WHERE (
     first_item.active_step IS NOT NULL
@@ -4502,7 +4503,7 @@ const GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY = `SELECT
         u.fullname AS requester_fullname,
         u.email AS requester_email,
         COALESCE(levels.manual_approvers, '[]'::jsonb) AS manual_approvers
-    FROM mst_user u
+    FROM ${MATERIAL_PEOPLE_SQL} u
     LEFT JOIN LATERAL (
         SELECT jsonb_agg(
             jsonb_build_object(
@@ -4515,7 +4516,7 @@ const GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY = `SELECT
             ORDER BY l.level
         ) AS manual_approvers
         FROM mat_approvers_matrix_level l
-        LEFT JOIN mst_user au ON au.user_id = l.approver_user_id
+        LEFT JOIN ${MATERIAL_PEOPLE_SQL} au ON au.user_id = l.approver_user_id
         WHERE l.requester_user_id = u.user_id
     ) levels ON TRUE`;
 
@@ -6881,7 +6882,7 @@ const MaterialRequests = {
                         au.username AS approver_username,
                         au.email AS approver_email
                    FROM mat_approvers_matrix_level l
-                   LEFT JOIN mst_user au ON au.user_id = l.approver_user_id
+                   LEFT JOIN ${MATERIAL_PEOPLE_SQL} au ON au.user_id = l.approver_user_id
                   WHERE l.requester_user_id = $1
                   ORDER BY l.level`,
                 [requesterUserId]
@@ -8040,7 +8041,7 @@ const MaterialRequests = {
                                 ) active
                             ) AS active_step
                         FROM mat_mass_request_item_approval_step s
-                        LEFT JOIN mst_user sau ON sau.user_id = s.approver_user_id
+                        LEFT JOIN ${MATERIAL_PEOPLE_SQL} sau ON sau.user_id = s.approver_user_id
                         WHERE s.item_id = i.id
                     ) item_steps ON TRUE
                     LEFT JOIN LATERAL (
@@ -8270,7 +8271,7 @@ const MaterialRequests = {
                          c.comment,
                          c.created_at
                      FROM mat_request_comment c
-                     LEFT JOIN mst_user au ON au.user_id = c.actor_user_id
+                     LEFT JOIN ${MATERIAL_PEOPLE_SQL} au ON au.user_id = c.actor_user_id
                      WHERE c.request_kind = $1
                        AND c.request_id = $2
                      ORDER BY c.created_at ASC, c.id ASC`,

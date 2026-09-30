@@ -215,7 +215,7 @@ const templateConnectStub = ({ fullname } = {}) => {
                 };
             }
 
-            if (/FROM mst_user mu\s+WHERE mu\.user_id = \$1/.test(queryText)) {
+            if (/FROM mst_mgr\)\s+mu\s+WHERE mu\.user_id = \$1/.test(queryText)) {
                 // fullname undefined => the id names no ACTIVE row at all.
                 return fullname === undefined
                     ? { rows: [], rowCount: 0 }
@@ -238,7 +238,7 @@ const templateConnectStub = ({ fullname } = {}) => {
 
 const approverLookups = state =>
     state.queries.filter(({ queryText }) =>
-        /FROM mst_user mu\s+WHERE mu\.user_id = \$1/.test(queryText)
+        /FROM mst_mgr\)\s+mu\s+WHERE mu\.user_id = \$1/.test(queryText)
     );
 
 test("getSingleRequestReworkEmailTemplate greets the approver the dialog picked", async () => {
@@ -739,7 +739,7 @@ const connectSingleChainStub = queryLog => async () => ({
         }
 
         // The validation query now also carries the address the mail needs.
-        if (/FROM mst_user mu\s+WHERE mu\.user_id = ANY/.test(queryText)) {
+        if (/FROM mst_mgr\)\s+mu\s+WHERE mu\.user_id = ANY/.test(queryText)) {
             const rows = (params[0] || []).map(id => ({
                 user_id: id,
                 email: `${String(id).toLowerCase()}@kpn-corp.com`,

@@ -55,6 +55,19 @@ const SECTION_ORDER = [
     "specification",
 ];
 
+// --- People ----------------------------------------------------------------
+// Materials users live in two tables: staff in mst_user and managers in mst_mgr,
+// whose mgr_id plays the part of user_id (the two id sets never overlap; login
+// and the vendor side already read both). Every Materials lookup of a person
+// goes through this fragment instead of mst_user, so a manager can request and
+// approve like anyone else. Drop-in for `mst_user` in a FROM / JOIN, alias
+// after it; only these columns exist on it.
+const MATERIAL_PEOPLE_SQL = `(SELECT user_id, username, fullname, email, is_active, user_group
+            FROM mst_user
+        UNION ALL
+        SELECT mgr_id AS user_id, username, fullname, email, is_active, user_group
+            FROM mst_mgr)`;
+
 // --- SAP Oracle staging ----------------------------------------------------
 const MATERIAL_SAP_STAGING_TABLE = "VMS_MATERIALDATA";
 
@@ -140,6 +153,7 @@ module.exports = {
     MAX_LONG_TEXT_COLUMN_LENGTH,
     SECTION_TITLES,
     SECTION_ORDER,
+    MATERIAL_PEOPLE_SQL,
     MATERIAL_SAP_STAGING_TABLE,
     SINGLE_REQUEST_MATERIAL_CODE_SQL,
     MASS_ITEM_GROUP_CODE_LATERAL_SQL,

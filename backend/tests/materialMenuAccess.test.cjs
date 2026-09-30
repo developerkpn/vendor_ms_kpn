@@ -44,7 +44,7 @@ async function withPoolQuery(answer, fn) {
   }
 }
 
-const MDM_QUERY = /FROM mst_user mu[\s\S]*JOIN mst_page_access/;
+const MDM_QUERY = /FROM mst_mgr\)\s+mu[\s\S]*JOIN mst_page_access/;
 
 // Every login re-reads the MATERIAL_ADMIN members first. `admins` are the
 // usernames the group holds for the test.

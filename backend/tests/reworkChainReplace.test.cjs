@@ -383,7 +383,7 @@ const connectChainStub = (
             return { rows: [{ exists: 1 }], rowCount: 1 };
         }
 
-        if (/FROM mst_user mu\s+WHERE mu\.user_id = ANY/.test(queryText)) {
+        if (/FROM mst_mgr\)\s+mu\s+WHERE mu\.user_id = ANY/.test(queryText)) {
             const requested = params[0] || [];
             const rows = requested
                 .filter(id => activeUserIds.includes(id))
@@ -824,7 +824,7 @@ const connectMassChainStub = ({
                 return { rows: [{ exists: 1 }], rowCount: 1 };
             }
 
-            if (/FROM mst_user mu\s+WHERE mu\.user_id = ANY/.test(queryText)) {
+            if (/FROM mst_mgr\)\s+mu\s+WHERE mu\.user_id = ANY/.test(queryText)) {
                 const rows = (params[0] || []).map(id => ({
                     user_id: id,
                     email: `${String(id).toLowerCase()}@kpn-corp.com`,

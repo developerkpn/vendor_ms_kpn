@@ -85,7 +85,7 @@ async function withSapPushStubbed(fn) {
 // The approval inbox reads its rows, then asks whether the actor is a Master
 // Data (MDM) material user, and keeps only rows whose active step the actor may
 // act on (applyStepInboxVisibility).
-const MDM_MEMBERSHIP_QUERY = /FROM mst_user mu[\s\S]*JOIN mst_page_access/i;
+const MDM_MEMBERSHIP_QUERY = /FROM mst_mgr\)\s+mu[\s\S]*JOIN mst_page_access/i;
 const NOT_MDM_MEMBER = { rows: [], rowCount: 0 };
 
 /** Inbox row fields that put the request on approverUserId's active step. */
@@ -376,10 +376,10 @@ test("getSingleRequests list query reads group code through the id join", () => 
   );
 });
 
-test("getSingleRequests list query joins mst_user only once", () => {
+test("getSingleRequests list query joins the requester only once", () => {
   const joinMatches =
     materialService.__private.GET_SINGLE_REQUEST_LIST_QUERY.match(
-      /LEFT JOIN mst_user u ON u\.user_id = r\.created_by/gi
+      /FROM mst_mgr\)\s+u ON u\.user_id = r\.created_by/gi
     ) || [];
 
   assert.equal(joinMatches.length, 1);
@@ -458,7 +458,7 @@ test("approveSingleRequestByAdmin stores composed final_code on the Master Data 
       }
 
       // The actor is a Master Data (MDM) material user.
-      if (/FROM mst_user mu[\s\S]*JOIN mst_page_access/i.test(queryText)) {
+      if (/FROM mst_mgr\)\s+mu[\s\S]*JOIN mst_page_access/i.test(queryText)) {
         return { rows: [{ "?column?": 1 }], rowCount: 1 };
       }
 

@@ -10,6 +10,7 @@ const axios = require("axios");
 const pool = require("../config/connection");
 const saveToDatabase = require("../helper/sap_seeding");
 const TRANS = require("../config/transaction.js");
+const { MATERIAL_PEOPLE_SQL } = require("../constants/material");
 
 
 function parseWildcardSearch(term) {
@@ -118,7 +119,7 @@ function buildMaterialExportBatchQuery(
                 FROM mat_sap_data m
                 JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                 JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                LEFT JOIN mst_user u ON m.created_by = u.user_id
+                LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                 WHERE (m.dffromclient IS NULL OR m.dffromclient = false)
                 AND CONCAT_WS(' ', ${searchableFields.join(", ")}) ILIKE ALL(ARRAY[${ilikePatterns.join(", ")}])
                 ${groupClause}
@@ -181,7 +182,7 @@ function buildMaterialExportBatchQuery(
             FROM mat_sap_data m
             JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
             JOIN mat_item_group mig ON mis.item_group_id = mig.id
-            LEFT JOIN mst_user u ON m.created_by = u.user_id
+            LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
             WHERE (m.dffromclient IS NULL OR m.dffromclient = false)
             AND (
                 to_tsvector('english', COALESCE(m.name, '') || ' ' || COALESCE(m.description, '') || ' ' || COALESCE(m.long_text, '') || ' ' || COALESCE(m.unit_of_measurement, '') || ' ' || COALESCE(m.alias1, '') || ' ' || COALESCE(m.alias2, '') || ' ' || COALESCE(m.alias3, '') || ' ' || COALESCE(m.code, '')) @@ to_tsquery('english', $1)
@@ -239,7 +240,7 @@ function buildMaterialExportBatchQuery(
         FROM mat_sap_data m
         JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
         JOIN mat_item_group mig ON mis.item_group_id = mig.id
-        LEFT JOIN mst_user u ON m.created_by = u.user_id
+        LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
         ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
         ORDER BY m.code ASC, m.name ASC
         LIMIT $${params.length}`;
@@ -852,7 +853,7 @@ const Material = {
                     FROM mat_sap_data m
                     JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                     JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                        LEFT JOIN mst_user u ON m.created_by = u.user_id
+                        LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                     WHERE mig.id = $1
                     `,
                     [groupId]
@@ -893,7 +894,7 @@ const Material = {
                     FROM mat_sap_data m
                     JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                     JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                        LEFT JOIN mst_user u ON m.created_by = u.user_id
+                        LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                     WHERE mig.id = $1
                     ORDER BY ${sortClause}
                     LIMIT $2 OFFSET $3
@@ -1107,7 +1108,7 @@ const Material = {
                     FROM mat_sap_data m
                     JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                     JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                        LEFT JOIN mst_user u ON m.created_by = u.user_id
+                        LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                     WHERE ${materialWhereClause}
                     ORDER BY ${sortClause}
                     LIMIT $2 OFFSET $3
@@ -1285,7 +1286,7 @@ const Material = {
                             FROM mat_sap_data m
                             JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                             JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                            LEFT JOIN mst_user u ON m.created_by = u.user_id
+                            LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                             WHERE CONCAT_WS(' ', ${searchableFields.join(", ")}) ILIKE ALL(ARRAY[${ilikePatterns.join(", ")}])
                             ORDER BY ${sorting_q}m.code ASC, m.name ASC
                             LIMIT $${wildcardParams.length + 1} OFFSET $${wildcardParams.length + 2}`,
@@ -1374,7 +1375,7 @@ const Material = {
                             FROM mat_sap_data m
                             JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                             JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                            LEFT JOIN mst_user u ON m.created_by = u.user_id
+                            LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                             WHERE (
                                 to_tsvector('english', COALESCE(m.name, '') || ' ' || COALESCE(m.description, '') || ' ' || COALESCE(m.long_text, '') || ' ' || COALESCE(m.unit_of_measurement, '') || ' ' || COALESCE(m.alias1, '') || ' ' || COALESCE(m.alias2, '') || ' ' || COALESCE(m.alias3, '') || ' ' || COALESCE(m.code, '')) @@ to_tsquery('english', $1)
                                 OR (
@@ -1439,7 +1440,7 @@ const Material = {
                         FROM mat_sap_data m
                         JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                         JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                        LEFT JOIN mst_user u ON m.created_by = u.user_id
+                        LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                         ORDER BY ${sorting_q}m.code ASC, m.name ASC
                         LIMIT $1 OFFSET $2`,
                         [pageSize, offset]
@@ -1592,7 +1593,7 @@ const Material = {
                             FROM mat_sap_data m
                             JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                             JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                            LEFT JOIN mst_user u ON m.created_by = u.user_id
+                            LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                             WHERE (m.dffromclient IS NULL OR m.dffromclient = false)
                             AND CONCAT_WS(' ', ${searchableFields.join(", ")}) ILIKE ALL(ARRAY[${ilikePatterns.join(", ")}])
                             ${groupId ? ` AND mig.id = $${wildcardParams.length + 1}` : ""}
@@ -1692,7 +1693,7 @@ const Material = {
                             FROM mat_sap_data m
                             JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                             JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                            LEFT JOIN mst_user u ON m.created_by = u.user_id
+                            LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                             WHERE (m.dffromclient IS NULL OR m.dffromclient = false)
                             AND (
                                 to_tsvector('english', COALESCE(m.name, '') || ' ' || COALESCE(m.description, '') || ' ' || COALESCE(m.long_text, '') || ' ' || COALESCE(m.unit_of_measurement, '') || ' ' || COALESCE(m.alias1, '') || ' ' || COALESCE(m.alias2, '') || ' ' || COALESCE(m.alias3, '') || ' ' || COALESCE(m.code, '')) @@ to_tsquery('english', $1)
@@ -1785,7 +1786,7 @@ const Material = {
                         FROM mat_sap_data m
                         JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                         JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                        LEFT JOIN mst_user u ON m.created_by = u.user_id
+                        LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                         WHERE (m.dffromclient IS NULL OR dffromclient = false) 
                         ${groupId ? " AND mig.id = $3" : ""}
                         ORDER BY ${sorting_q}m.code ASC, m.name ASC
@@ -2009,7 +2010,7 @@ const Material = {
                     FROM mat_sap_data m
                     JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                     JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                    LEFT JOIN mst_user u ON m.created_by = u.user_id
+                    LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                     WHERE m.id = $1
                 `,
                     [materialId]
@@ -2827,7 +2828,7 @@ const Material = {
                     FROM mat_sap_data m
                     JOIN mat_item_sub_group mis ON m.material_sub_group_id = mis.id
                     JOIN mat_item_group mig ON mis.item_group_id = mig.id
-                        LEFT JOIN mst_user u ON m.created_by = u.user_id
+                        LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON m.created_by = u.user_id
                     WHERE m.code = ANY($1)`,
                     [codes]
                 );

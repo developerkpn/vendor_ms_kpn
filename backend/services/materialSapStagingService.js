@@ -16,6 +16,7 @@ const {
     SINGLE_REQUEST_MATERIAL_CODE_SQL,
     MASS_ITEM_GROUP_CODE_LATERAL_SQL,
     MAX_MATERIAL_DESCRIPTION_LENGTH,
+    MATERIAL_PEOPLE_SQL,
 } = require("../constants/material");
 
 // "C - CHEMICAL INDUSTRY" -> "C";  "1 - FULL TAX" -> "1";  "PC" -> "PC".
@@ -289,7 +290,7 @@ const pushPendingMaterialsToSapStaging = async function ({
                 -- MDM approver email (one MDM step per request) -> APPROVED_BY:
                 (SELECT mu.email
                    FROM mat_single_request_approval_step s
-                   JOIN mst_user mu ON mu.user_id = s.approver_user_id
+                   JOIN ${MATERIAL_PEOPLE_SQL} mu ON mu.user_id = s.approver_user_id
                   WHERE s.request_id = r.id AND s.kind = 'MDM') AS approved_by_email
              FROM mat_single_request r
              LEFT JOIN mat_item_group mig ON mig.id = r.material_group_id
@@ -326,7 +327,7 @@ const pushPendingMaterialsToSapStaging = async function ({
                 -- MDM approver email (one MDM step per item) -> APPROVED_BY:
                 (SELECT mu.email
                    FROM mat_mass_request_item_approval_step s
-                   JOIN mst_user mu ON mu.user_id = s.approver_user_id
+                   JOIN ${MATERIAL_PEOPLE_SQL} mu ON mu.user_id = s.approver_user_id
                   WHERE s.item_id = i.id AND s.kind = 'MDM'
                   LIMIT 1) AS approved_by_email
              FROM mat_mass_request_item i
