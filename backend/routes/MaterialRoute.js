@@ -249,6 +249,11 @@ router.post(
     AuthToken.authSession,
     MaterialController.rejectMassRequest
 );
+router.post(
+    "/requests/mass/:id/decide",
+    AuthToken.authSession,
+    MaterialController.decideMassRequest
+);
 router.get(
     "/requests/mass/:id/items",
     AuthToken.authSession,

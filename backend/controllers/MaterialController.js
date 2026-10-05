@@ -2542,6 +2542,108 @@ const MaterialController = {
         }
     },
 
+    // Master Data's per-item decisions on a batch (see
+    // materialService.decideMassRequest). Multipart when the decisions carry
+    // staged attachment files, JSON otherwise — same split as approve/rework.
+    decideMassRequest: async (req, res) => {
+        let tempFilePaths = [];
+
+        try {
+            let body;
+            let items;
+
+            if (isMultipartFormRequest(req)) {
+                const form = new formidable.IncomingForm();
+                form.options.multiples = true;
+                form.options.maxFileSize = ATTACHMENT_MAX_FILE_SIZE;
+
+                const [fields, filesResult] = await form.parse(req);
+                const files = filesResult.files
+                    ? filesResult.files.filter(Boolean)
+                    : [];
+                tempFilePaths = files.map(file => file.filepath).filter(Boolean);
+
+                const text = key =>
+                    fields[key] ? String(fields[key]).trim() || null : null;
+                const json = key => (fields[key] ? JSON.parse(fields[key]) : null);
+
+                body = {
+                    decisions: json("decisions"),
+                    remark: text("remark"),
+                    finalCodeSuffixes: json("finalCodeSuffixes"),
+                    reworkReason: text("reworkReason"),
+                    newApprovers: json("newApprovers"),
+                    notifyVia: text("notifyVia"),
+                    emailSubject: fields.emailSubject
+                        ? String(fields.emailSubject)
+                        : null,
+                    emailBody: fields.emailBody ? String(fields.emailBody) : null,
+                    rejectReason: text("rejectReason"),
+                };
+                items = buildMassRequestItemsWithAttachments(fields, files);
+            } else {
+                body = {
+                    decisions: req.body?.decisions ?? null,
+                    remark: req.body?.remark ?? null,
+                    finalCodeSuffixes: req.body?.finalCodeSuffixes ?? null,
+                    reworkReason: req.body?.reworkReason ?? null,
+                    newApprovers:
+                        req.body?.newApprovers ?? req.body?.newApproverIds ?? null,
+                    notifyVia: req.body?.notifyVia ?? null,
+                    emailSubject: req.body?.emailSubject ?? null,
+                    emailBody: req.body?.emailBody ?? null,
+                    rejectReason: req.body?.rejectReason ?? null,
+                };
+                items = stripAttachmentInstructions(req.body?.items ?? null);
+            }
+
+            const result = await materialService.decideMassRequest({
+                massRequestId: req.params.id,
+                actorUserId: req.cookies.user_id,
+                actorUsername: req.cookies.username,
+                ...body,
+                items,
+            });
+
+            return res.status(200).json({
+                success: true,
+                message: "Mass request decisions saved successfully",
+                data: result,
+            });
+        } catch (error) {
+            const statusCode = error.statusCode || 500;
+            const payload = {
+                success: false,
+                message:
+                    statusCode === 500
+                        ? "Failed to save mass request decisions"
+                        : error.message,
+                error: statusCode === 500 ? error.message : undefined,
+                code: error.code,
+            };
+
+            if (Array.isArray(error.errors) && error.errors.length > 0) {
+                payload.errors = error.errors;
+            }
+
+            return res.status(statusCode).json(payload);
+        } finally {
+            for (const filepath of tempFilePaths) {
+                if (!filepath) {
+                    continue;
+                }
+
+                try {
+                    if (fs.existsSync(filepath)) {
+                        fs.unlinkSync(filepath);
+                    }
+                } catch (error) {
+                    console.error("Failed to clean up temp upload:", error);
+                }
+            }
+        }
+    },
+
     rejectMassRequest: async (req, res) => {
         try {
             const result = await materialService.rejectMassRequestByAdmin({
@@ -2776,6 +2878,11 @@ const MaterialController = {
                     // Optional: the approver the dialog has already picked, so
                     // the greeting can name him instead of saying "Approver".
                     approverUserId: req.query.approverUserId,
+                    // Optional, comma-separated: only these items are being
+                    // reworked, so only these are listed in the mail.
+                    itemIds: req.query.itemIds
+                        ? String(req.query.itemIds).split(",")
+                        : null,
                 });
 
             return res.status(200).json({

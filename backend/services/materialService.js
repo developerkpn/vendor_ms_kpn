@@ -1239,9 +1239,10 @@ const syncMassRequestItemApprovalSnapshot = async (
     );
 };
 
-// Mass requests are always CREATE; all items share one step plan. The `step`
-// block is applied to the matching step row of EVERY item; the `header` block
-// to EVERY mat_mass_request_item row by the caller.
+// Mass requests are always CREATE; every item starts on the same step plan. The
+// `step` block is applied to the active step row of each item the action moves
+// (its cohort, see resolveMassActionCohort); the `header` block to those items'
+// mat_mass_request_item rows by the caller.
 
 const buildMassStepApprovePatch = ({ remark } = {}) => ({
     step: {
@@ -2224,12 +2225,110 @@ const insertMassItemApprovalStepsBatch = async (
 };
 
 // Load the step rows for the FIRST item of a batch (all items share the plan).
-const loadMassItemSteps = async (
+// Atomic single-winner grab of the open MDM step across ALL items of a batch.
+// Only succeeds when none of the batch's MDM steps have been claimed yet. Not
+// keyed on the level: a per-item replaced chain moves an item's MDM step to its
+// own level, and one grab still covers the whole batch.
+const claimMdmMassItemStep = async (client, massRequestId, actorUserId) => {
+    const result = await client.query(
+        `UPDATE mat_mass_request_item_approval_step s
+         SET approver_user_id = $2,
+             claimed_at = NOW(),
+             updated_at = NOW()
+         FROM mat_mass_request_item i
+         WHERE s.item_id = i.id
+           AND i.mass_request_id = $1
+           AND s.kind = 'MDM'
+           AND s.approver_user_id IS NULL
+         RETURNING s.id`,
+        [massRequestId, actorUserId]
+    );
+
+    return result.rowCount > 0;
+};
+
+// --- Per-item mass engine ----------------------------------------------------
+// Every item of a batch carries its own step rows. Through the manual stages the
+// items move together; at Master Data each item gets its own decision (approve /
+// rework / reject), so from there a batch can hold items at different points:
+// some DONE, some back with the requester, some re-climbing a replaced chain,
+// some still waiting. Every action therefore resolves the ITEMS it applies to
+// (its cohort) from the per-item state, rather than reading the first item and
+// fanning its change out over the whole batch.
+
+const MASS_ITEM_STATUS = Object.freeze({
+    SUBMIT: "SUBMIT",
+    REWORK: "REWORK",
+    DONE: "DONE",
+    CANCEL: "CANCEL",
+});
+
+const normalizeMassItemStatus = value =>
+    String(value ?? "").trim().toUpperCase();
+
+const buildMassActionError = (message, code, statusCode) =>
+    Object.assign(new Error(message), { statusCode, code });
+
+// The batch's lock anchor: its first item, FOR UPDATE. Every mass action takes
+// this same row lock before reading the batch, so two actions on one batch
+// serialize here. Its request_no is the batch's rework-mail thread identity
+// (see the [VMS#...] token note in migration/20260807_rework_email_thread.sql),
+// and every item shares created_by.
+const lockMassRequestAnchor = async (client, massRequestId) => {
+    const lockResult = await client.query(
+        `SELECT i.id, i.request_no, i.created_by
+         FROM mat_mass_request_item i
+         WHERE i.mass_request_id = $1
+         ORDER BY i.item_no ASC
+         LIMIT 1
+         FOR UPDATE OF i`,
+        [massRequestId]
+    );
+
+    if (lockResult.rows.length === 0) {
+        throw buildMassActionError(
+            "Mass request not found",
+            "MASS_REQUEST_NOT_FOUND",
+            404
+        );
+    }
+
+    return lockResult.rows[0];
+};
+
+// Pure: pair every item row with its own sorted step rows and active step.
+const buildMassBatchState = (itemRows = [], stepRows = []) => {
+    const stepsByItemId = new Map();
+
+    for (const step of Array.isArray(stepRows) ? stepRows : []) {
+        const key = String(step.item_id);
+        if (!stepsByItemId.has(key)) {
+            stepsByItemId.set(key, []);
+        }
+        stepsByItemId.get(key).push(step);
+    }
+
+    return (Array.isArray(itemRows) ? itemRows : []).map(item => {
+        const steps = sortSteps(stepsByItemId.get(String(item.id)) || []);
+        return { ...item, steps, activeStep: resolveActiveStep(steps) };
+    });
+};
+
+// Every item of a batch in item_no order, each with its steps. Read after
+// lockMassRequestAnchor; `forUpdate` also locks the step rows being moved.
+const loadMassBatchState = async (
     client,
     massRequestId,
     { forUpdate = false } = {}
 ) => {
-    const result = await client.query(
+    const itemsResult = await client.query(
+        `SELECT i.id, i.item_no, i.request_no, i.status, i.assigned_to, i.sap_push_status
+         FROM mat_mass_request_item i
+         WHERE i.mass_request_id = $1
+         ORDER BY i.item_no ASC`,
+        [massRequestId]
+    );
+    const stepsResult = await client.query(
         `SELECT
             s.id,
             s.item_id,
@@ -2246,29 +2345,189 @@ const loadMassItemSteps = async (
          JOIN mat_mass_request_item i ON i.id = s.item_id
          LEFT JOIN ${MATERIAL_PEOPLE_SQL} au ON au.user_id = s.approver_user_id
          WHERE i.mass_request_id = $1
-           AND i.item_no = (
-               SELECT MIN(ii.item_no)
-               FROM mat_mass_request_item ii
-               WHERE ii.mass_request_id = $1
-           )
-         ORDER BY s.level${forUpdate ? "\n         FOR UPDATE OF s" : ""}`,
+         ORDER BY i.item_no, s.level${forUpdate ? "\n         FOR UPDATE OF s" : ""}`,
         [massRequestId]
     );
 
-    return result.rows;
+    return buildMassBatchState(itemsResult.rows, stepsResult.rows);
 };
 
-// Apply a step-status patch to the matching LEVEL step row of EVERY item in a
-// batch. Patch values may include raw-SQL sentinels (e.g. NOW()).
-const updateMassItemStepRowsByLevel = async (
+const isMassItemInFlight = item =>
+    normalizeMassItemStatus(item?.status) === MASS_ITEM_STATUS.SUBMIT &&
+    Boolean(item?.activeStep);
+
+// Two in-flight items share a lane when one action can move both: the Master
+// Data step (one grab covers the whole batch, whatever level a replaced chain
+// left it on), or the same manual level held by the same approver.
+const massStepLaneKey = step => {
+    if (!step) {
+        return null;
+    }
+
+    return stepKindOf(step) === STEP_KINDS.MDM
+        ? STEP_KINDS.MDM
+        : `${STEP_KINDS.MANUAL}:${Number(step.level)}:${stepApproverUserId(step) ?? ""}`;
+};
+
+// Only an in-flight item with an MDM active step needs the DB-backed MDM flag,
+// so a manual-stage action never pays for the lookup.
+const resolveMassActor = async (
     client,
-    massRequestId,
-    level,
-    patch = {}
+    batchItems,
+    { actorUserId, actorUsername }
 ) => {
+    const needsMdmFlag = batchItems.some(
+        item =>
+            isMassItemInFlight(item) &&
+            stepKindOf(item.activeStep) === STEP_KINDS.MDM
+    );
+
+    return {
+        actorUserId,
+        actorUsername,
+        actorIsMdmMaterial: needsMdmFlag
+            ? await isActorMdmMaterialUser(client, actorUserId)
+            : false,
+    };
+};
+
+const MASS_ACTION_ERRORS = Object.freeze({
+    approve: {
+        conflictCode: "MASS_REQUEST_APPROVAL_STATUS_CONFLICT",
+        conflictMessage:
+            "Mass request can only be approved while status is Submit",
+        forbiddenCode: "MASS_REQUEST_APPROVAL_FORBIDDEN",
+        forbiddenMessage:
+            "Forbidden: only the assigned approver or ADMIN can approve this mass request",
+    },
+    rework: {
+        conflictCode: "MASS_REQUEST_REWORK_STATUS_CONFLICT",
+        conflictMessage:
+            "Mass request rework can only be requested while status is Submit",
+        forbiddenCode: "MASS_REQUEST_REWORK_FORBIDDEN",
+        forbiddenMessage:
+            "Forbidden: only the assigned approver or ADMIN can request rework on this mass request",
+    },
+    reject: {
+        conflictCode: "MASS_REQUEST_REJECT_STATUS_CONFLICT",
+        conflictMessage:
+            "Mass request can only be rejected while status is Submit",
+        forbiddenCode: "MASS_REQUEST_REJECT_FORBIDDEN",
+        forbiddenMessage:
+            "Forbidden: only the assigned approver or ADMIN can reject this mass request",
+    },
+    decide: {
+        conflictCode: "MASS_REQUEST_DECIDE_STATUS_CONFLICT",
+        conflictMessage: "No item of this mass request is waiting for approval",
+        forbiddenCode: "MASS_REQUEST_DECIDE_FORBIDDEN",
+        forbiddenMessage:
+            "Forbidden: only the Master Data claimer or ADMIN can decide this mass request",
+    },
+});
+
+const normalizeMassItemIdList = itemIds => {
+    if (itemIds === undefined || itemIds === null) {
+        return null;
+    }
+
+    const list = (Array.isArray(itemIds) ? itemIds : [itemIds])
+        .map(id => String(id ?? "").trim())
+        .filter(Boolean);
+
+    return list.length > 0 ? [...new Set(list)] : null;
+};
+
+/**
+ * Resolve the items (the cohort) one mass action applies to.
+ *
+ * With `itemIds`, exactly those items — each must be in flight, the actor's to
+ * act on, and all on the same lane. Without, every in-flight item on the lane
+ * of the actor's first actionable item: at a manual stage that is the whole
+ * batch, exactly as before items could diverge.
+ *
+ * @param {object} opts
+ * @param {Array}  opts.items    loadMassBatchState rows
+ * @param {Array}  [opts.itemIds] mat_mass_request_item ids the caller targets
+ * @param {object} opts.actor    { actorUserId, actorUsername, actorIsMdmMaterial }
+ * @param {object} opts.errors   one MASS_ACTION_ERRORS entry
+ * @returns {Array} the cohort's batch items, in item_no order
+ */
+const resolveMassActionCohort = ({
+    items = [],
+    itemIds = null,
+    actor = {},
+    errors = MASS_ACTION_ERRORS.approve,
+} = {}) => {
+    const requestedIds = normalizeMassItemIdList(itemIds);
+
+    if (requestedIds) {
+        const itemsById = new Map(items.map(item => [String(item.id), item]));
+        const cohort = requestedIds
+            .map(id => {
+                const item = itemsById.get(id);
+
+                if (!item) {
+                    throw buildMassActionError(
+                        "Item does not belong to this mass request",
+                        "MASS_REQUEST_ITEM_NOT_IN_BATCH",
+                        400
+                    );
+                }
+
+                if (!isMassItemInFlight(item)) {
+                    throw buildMassActionError(
+                        `Item ${item.item_no} is not waiting for approval`,
+                        "MASS_REQUEST_ITEM_NOT_PENDING",
+                        409
+                    );
+                }
+
+                if (!canActorActOnStep(item.activeStep, actor)) {
+                    throw buildMassActionError(
+                        errors.forbiddenMessage,
+                        errors.forbiddenCode,
+                        403
+                    );
+                }
+
+                return item;
+            })
+            .sort((a, b) => Number(a.item_no) - Number(b.item_no));
+
+        const lane = massStepLaneKey(cohort[0].activeStep);
+        if (cohort.some(item => massStepLaneKey(item.activeStep) !== lane)) {
+            throw buildMassActionError(
+                "The selected items are not waiting at the same approval stage",
+                "MASS_REQUEST_ITEM_STAGE_MISMATCH",
+                409
+            );
+        }
+
+        return cohort;
+    }
+
+    const inFlight = items.filter(isMassItemInFlight);
+    const actionable = inFlight.filter(item =>
+        canActorActOnStep(item.activeStep, actor)
+    );
+
+    if (actionable.length === 0) {
+        throw inFlight.length === 0
+            ? buildMassActionError(errors.conflictMessage, errors.conflictCode, 409)
+            : buildMassActionError(errors.forbiddenMessage, errors.forbiddenCode, 403);
+    }
+
+    const lane = massStepLaneKey(actionable[0].activeStep);
+    return actionable.filter(item => massStepLaneKey(item.activeStep) === lane);
+};
+
+// Apply a step-status patch to the given step rows (one per cohort item). Patch
+// values may include raw-SQL sentinels (e.g. NOW()).
+const updateMassItemStepRowsById = async (client, stepIds = [], patch = {}) => {
+    const ids = stepIds.filter(id => id !== null && id !== undefined);
     const assignments = [];
-    const params = [massRequestId, level];
-    let paramIndex = 3;
+    const params = [ids];
+    let paramIndex = 2;
 
     for (const field of Object.keys(patch)) {
         const value = patch[field];
@@ -2283,7 +2542,7 @@ const updateMassItemStepRowsByLevel = async (
         paramIndex += 1;
     }
 
-    if (assignments.length === 0) {
+    if (ids.length === 0 || assignments.length === 0) {
         return;
     }
 
@@ -2291,33 +2550,199 @@ const updateMassItemStepRowsByLevel = async (
         `UPDATE mat_mass_request_item_approval_step s
          SET ${assignments.join(", ")},
              updated_at = NOW()
-         FROM mat_mass_request_item i
-         WHERE s.item_id = i.id
-           AND i.mass_request_id = $1
-           AND s.level = $2`,
+         WHERE s.id = ANY($1::bigint[])`,
         params
     );
 };
 
-// Atomic single-winner grab of the open MDM step across ALL items of a batch.
-// Only succeeds when none of the batch's MDM steps have been claimed yet.
-const claimMdmMassItemStep = async (client, massRequestId, level, actorUserId) => {
+// Move the given items' header. Items of one cohort can land on different next
+// stages, so callers group them by destination first (planMassApprovalDestinations).
+// Terminal completion also flags the items for the Oracle SAP-staging push.
+const updateMassItemHeaders = async (
+    client,
+    massRequestId,
+    itemIds,
+    { status, assignedTo, markSapPending = false }
+) => {
     const result = await client.query(
-        `UPDATE mat_mass_request_item_approval_step s
-         SET approver_user_id = $3,
-             claimed_at = NOW(),
+        `UPDATE mat_mass_request_item
+         SET status = $2,
+             assigned_to = $3,${
+                 markSapPending
+                     ? "\n             sap_push_status = 'PENDING',"
+                     : ""
+             }
              updated_at = NOW()
-         FROM mat_mass_request_item i
-         WHERE s.item_id = i.id
-           AND i.mass_request_id = $1
-           AND s.level = $2
-           AND s.kind = 'MDM'
-           AND s.approver_user_id IS NULL
-         RETURNING s.id`,
-        [massRequestId, level, actorUserId]
+         WHERE mass_request_id = $1
+           AND id = ANY($4::bigint[])
+         RETURNING id`,
+        [massRequestId, status, assignedTo, itemIds]
     );
 
-    return result.rowCount > 0;
+    return result.rowCount;
+};
+
+// Where each approved item goes next. Items of one cohort share the step being
+// approved but not necessarily the rest of their chain (an item whose chain was
+// replaced at Master Data has its own), so the destination is computed per item
+// and grouped for the header write.
+const planMassApprovalDestinations = cohort => {
+    const groups = new Map();
+
+    for (const item of cohort) {
+        const nextSteps = item.steps.map(step =>
+            step.id === item.activeStep.id
+                ? { ...step, status: STEP_STATUS.APPROVED }
+                : step
+        );
+        const nextActive = resolveActiveStep(nextSteps);
+        const status = nextActive ? "Submit" : "DONE";
+        const assignedTo = nextActive ? stepLabel(nextActive) : "Completed";
+        const key = `${status}|${assignedTo}`;
+
+        if (!groups.has(key)) {
+            groups.set(key, {
+                status,
+                assignedTo,
+                completed: !nextActive,
+                itemIds: [],
+            });
+        }
+        groups.get(key).itemIds.push(item.id);
+    }
+
+    return [...groups.values()];
+};
+
+// A request comment covers the whole batch; when an action touched only some of
+// its items the history has to say which ("Item 2, 4: <reason>"). An action on
+// every item reads exactly as it did before items could diverge.
+const buildMassItemScopeLabel = (cohort = [], batchItems = []) =>
+    cohort.length === 0 || cohort.length === batchItems.length
+        ? null
+        : `Item ${cohort.map(item => item.item_no).join(", ")}`;
+
+const prefixMassItemScope = (comment, scopeLabel) => {
+    if (!scopeLabel) {
+        return comment;
+    }
+
+    const text = String(comment ?? "").trim();
+    return text ? `${scopeLabel}: ${text}` : scopeLabel;
+};
+
+const MASS_ITEM_EDITABLE_FIELDS = Object.freeze([
+    "material_description",
+    "base_uom",
+    "plant_code",
+    "sloc_code",
+    "material_group",
+    "material_sub_group",
+    "po_text",
+    "spesifikasi_tambahan",
+]);
+
+const pickMassItemFieldEdits = item => {
+    const edits = {};
+
+    for (const field of MASS_ITEM_EDITABLE_FIELDS) {
+        if (item[field] !== undefined) {
+            edits[field] = item[field];
+        }
+    }
+    // Handle uom -> base_uom mapping
+    if (item.uom !== undefined && edits.base_uom === undefined) {
+        edits.base_uom = item.uom;
+    }
+
+    return edits;
+};
+
+// An action may only change the items it moves. A payload entry that edits
+// another item of the same batch (or changes its attachments) is refused rather
+// than written: that item is DONE, with the requester, someone else's turn, or
+// decided differently. Field edits and attachment changes are allowed on
+// separate sets because a Master Data rework carries attachments but not edits.
+const assertMassItemPayloadWithin = (
+    items,
+    batchItems,
+    { editableItemIds = [], attachableItemIds = editableItemIds } = {}
+) => {
+    if (!Array.isArray(items)) {
+        return;
+    }
+
+    const batchItemsById = new Map(
+        batchItems.map(item => [String(item.id), item])
+    );
+    const editable = new Set(editableItemIds.map(id => String(id)));
+    const attachable = new Set(attachableItemIds.map(id => String(id)));
+
+    for (const item of items) {
+        const batchItem = item?.id ? batchItemsById.get(String(item.id)) : null;
+
+        if (!batchItem) {
+            continue;
+        }
+
+        const editsFields = Object.keys(pickMassItemFieldEdits(item)).length > 0;
+        const changesAttachments =
+            normalizeAttachmentInstructions(item.attachments) !== null;
+
+        if (
+            (editsFields && !editable.has(String(item.id))) ||
+            (changesAttachments && !attachable.has(String(item.id)))
+        ) {
+            throw buildMassActionError(
+                `Item ${batchItem.item_no} cannot be changed by this action`,
+                "MASS_REQUEST_ITEM_NOT_EDITABLE",
+                409
+            );
+        }
+    }
+};
+
+// The payload entries an action applies to: those naming one of
+// `allowedItemIds`. An entry naming no item of this batch is kept, so the
+// attachment ownership check refuses it instead of it being silently dropped.
+const filterMassItemPayload = (items, batchItems, allowedItemIds) => {
+    if (!Array.isArray(items)) {
+        return items;
+    }
+
+    const batchIds = new Set(batchItems.map(item => String(item.id)));
+    const allowed = new Set(allowedItemIds.map(id => String(id)));
+
+    return items.filter(
+        item =>
+            item?.id &&
+            (allowed.has(String(item.id)) || !batchIds.has(String(item.id)))
+    );
+};
+
+// Write the editable fields of the given items (an approver's or the
+// requester's corrections). Callers pass only items the action may change.
+const applyMassItemFieldEdits = async (client, massRequestId, items) => {
+    if (!Array.isArray(items)) {
+        return;
+    }
+
+    for (const item of items) {
+        if (!item?.id) continue;
+
+        const editEntries = Object.entries(pickMassItemFieldEdits(item));
+        if (editEntries.length === 0) continue;
+
+        const setClauses = editEntries.map(([field], i) => `${field} = $${i + 3}`);
+        setClauses.push("updated_at = NOW()");
+
+        await client.query(
+            `UPDATE mat_mass_request_item
+             SET ${setClauses.join(", ")}
+             WHERE id = $1 AND mass_request_id = $2`,
+            [item.id, massRequestId, ...editEntries.map(([, value]) => value)]
+        );
+    }
 };
 
 // --- Mass-item final code helpers (DB side) --------------------------------
@@ -2327,8 +2752,9 @@ const claimMdmMassItemStep = async (client, massRequestId, level, actorUserId) =
 // builds, a code on others), while the final-code composer needs the bare
 // 3-digit codes — the two LATERAL fragments accept every shape the UI can have
 // written. A NULL code means "unresolvable"; the composer turns that into a 409
-// naming the item.
-const loadMassItemGroupCodes = async (client, massRequestId) => {
+// naming the item. Scoped to `itemIds` — only the items being approved get a
+// code; the rest of the batch is reworked, rejected or already done.
+const loadMassItemGroupCodes = async (client, massRequestId, itemIds) => {
     const result = await client.query(
         `SELECT
             i.id AS item_id,
@@ -2340,8 +2766,9 @@ const loadMassItemGroupCodes = async (client, massRequestId) => {
          ${MASS_ITEM_GROUP_CODE_LATERAL_SQL}
          ${MASS_ITEM_SUB_GROUP_CODE_LATERAL_SQL}
          WHERE i.mass_request_id = $1
+           AND i.id = ANY($2::bigint[])
          ORDER BY i.item_no ASC`,
-        [massRequestId]
+        [massRequestId, itemIds]
     );
 
     return result.rows;
@@ -2356,7 +2783,7 @@ const loadMassItemGroupCodes = async (client, massRequestId) => {
 // recovered from the plan for the message.
 const assertMassFinalCodePlanIsAvailable = async (
     client,
-    { massRequestId, plan = [] } = {}
+    { plan = [] } = {}
 ) => {
     const codes = plan.map(entry => entry.final_code).filter(Boolean);
 
@@ -2402,17 +2829,19 @@ const assertMassFinalCodePlanIsAvailable = async (
         );
     }
 
-    // Scoped to OTHER batches: this batch's own items are the rows being
-    // rewritten right now (a SAP-error resubmit re-approval still carries the
-    // previous codes), so they must not collide with themselves.
+    // Skips only the items being rewritten right now (a SAP-error resubmit
+    // re-approval still carries their previous codes, so they must not collide
+    // with themselves). Their siblings in this same batch are checked like any
+    // other item: Master Data decides items one by one, so a sibling approved
+    // earlier already holds its code.
     const massDuplicate = await client.query(
         `SELECT request_no, item_no, final_code
          FROM mat_mass_request_item
          WHERE final_code = ANY($1::text[])
-           AND mass_request_id <> $2
+           AND id <> ALL($2::bigint[])
            AND UPPER(COALESCE(status, '')) <> 'CANCEL'
          LIMIT 1`,
-        [codes, massRequestId]
+        [codes, plan.map(entry => entry.item_id)]
     );
     if (massDuplicate.rowCount > 0) {
         const row = massDuplicate.rows[0];
@@ -2431,6 +2860,506 @@ const applyMassItemFinalCodes = async (client, { massRequestId, plan = [] }) => 
                  updated_at = NOW()
              WHERE id = $1 AND mass_request_id = $2`,
             [entry.item_id, massRequestId, entry.final_code]
+        );
+    }
+};
+
+// --- Mass cohort actions (inside the caller's transaction) -------------------
+// One per decision. Each moves exactly the cohort it is handed (see
+// resolveMassActionCohort) and records its own request comment; the callers own
+// BEGIN/COMMIT and every post-commit side effect (mail, SAP push, file cleanup).
+
+// Approve the cohort's active step. At the Master Data step this also composes
+// and stores each approved item's final code; an item whose chain ends here is
+// DONE and flagged for the SAP-staging push.
+const applyMassApproval = async (
+    client,
+    {
+        massRequestId,
+        batchItems,
+        cohort,
+        actorUserId,
+        remark,
+        finalCodeSuffixes,
+        attachmentNote = null,
+    }
+) => {
+    const leadStep = cohort[0].activeStep;
+    const stage = stepLabel(leadStep);
+    const isMdmStep = stepKindOf(leadStep) === STEP_KINDS.MDM;
+    const cohortItemIds = cohort.map(item => item.id);
+    const stepIds = cohort.map(item => item.activeStep.id);
+
+    // Per-item final codes: only at the Master Data step (always the last step
+    // of the plan, and a mass batch is Create-only, so every approved item needs
+    // a code). The caller applies the item edits first — the MDM approver can
+    // fix an item's group/sub group in the same action that assigns the running
+    // number, and the code must follow the group the item ends up with.
+    const finalCodePlan = isMdmStep
+        ? buildMassRequestFinalCodePlan({
+              finalCodeSuffixes,
+              items: await loadMassItemGroupCodes(
+                  client,
+                  massRequestId,
+                  cohortItemIds
+              ),
+          })
+        : [];
+
+    if (finalCodePlan.length > 0) {
+        await assertMassFinalCodePlanIsAvailable(client, {
+            plan: finalCodePlan,
+        });
+        await applyMassItemFinalCodes(client, {
+            massRequestId,
+            plan: finalCodePlan,
+        });
+    }
+
+    // Mark this stage APPROVED on each cohort item's step row. For MDM, record
+    // the approver (claimer or this actor).
+    await updateMassItemStepRowsById(
+        client,
+        stepIds,
+        buildMassStepApprovePatch({ remark }).step
+    );
+    if (isMdmStep) {
+        await client.query(
+            `UPDATE mat_mass_request_item_approval_step s
+             SET approver_user_id = COALESCE(s.approver_user_id, $2),
+                 updated_at = NOW()
+             WHERE s.id = ANY($1::bigint[])`,
+            [stepIds, actorUserId ?? null]
+        );
+    }
+
+    const destinations = planMassApprovalDestinations(cohort);
+    let updatedCount = 0;
+    let completedCount = 0;
+
+    for (const destination of destinations) {
+        updatedCount += await updateMassItemHeaders(
+            client,
+            massRequestId,
+            destination.itemIds,
+            {
+                status: destination.status,
+                assignedTo: destination.assignedTo,
+                markSapPending: destination.completed,
+            }
+        );
+        if (destination.completed) {
+            completedCount += destination.itemIds.length;
+        }
+    }
+
+    await insertRequestComment(client, {
+        requestKind: REQUEST_COMMENT_KINDS.MASS,
+        requestId: massRequestId,
+        eventType: REQUEST_COMMENT_EVENTS.APPROVE,
+        stage,
+        actorUserId,
+        comment: prefixMassItemScope(
+            appendCommentNote(remark, attachmentNote),
+            buildMassItemScopeLabel(cohort, batchItems)
+        ),
+    });
+
+    const leadDestination = destinations.find(destination =>
+        destination.itemIds.includes(cohort[0].id)
+    );
+
+    return {
+        stage,
+        status: leadDestination.status,
+        assigned_to: leadDestination.assignedTo,
+        item_ids: cohortItemIds,
+        updated_count: updatedCount,
+        completed_count: completedCount,
+        final_codes: finalCodePlan.map(entry => ({
+            item_no: entry.item_no,
+            request_no: entry.request_no,
+            final_code: entry.final_code,
+        })),
+    };
+};
+
+// Rework the cohort, in one of three modes:
+//   - no `newApprovers`              -> back to the requester (items Rework);
+//   - `newApprovers`, no mail        -> Master Data replaces the cohort items'
+//                                       MANUAL chain; they re-climb it while the
+//                                       rest of the batch stays where it is;
+//   - `newApprovers` + `mailContent` -> "via email" is CORRESPONDENCE ONLY
+//                                       (product decision 2026-08-07): nothing is
+//                                       reassigned, the caller sends the mail
+//                                       after COMMIT.
+const applyMassRework = async (
+    client,
+    {
+        massRequestId,
+        batchItems,
+        cohort,
+        actorUserId,
+        requesterUserId,
+        reason,
+        newApprovers,
+        mailContent,
+        attachmentNote = null,
+    }
+) => {
+    const leadStep = cohort[0].activeStep;
+    const stage = stepLabel(leadStep);
+    const scopeLabel = buildMassItemScopeLabel(cohort, batchItems);
+    const cohortItemIds = cohort.map(item => item.id);
+    const stepIds = cohort.map(item => item.activeStep.id);
+
+    if (isChainReplaceRequested(newApprovers)) {
+        const plan = buildStepChainReplacePlan({
+            steps: cohort[0].steps,
+            activeStep: leadStep,
+            newApprovers,
+            requesterUserId,
+            actorUserId,
+            reason,
+            codePrefix: "MASS_REQUEST",
+        });
+
+        const approverEmails = await assertActiveApproverUsersExist(
+            client,
+            plan.approverIds,
+            "MASS_REQUEST"
+        );
+
+        // "Via email": the picked person is the mail's recipient, the items
+        // stay claimed at Master Data, and `reason` is validated by the plan
+        // builder and then dropped. Any staged attachment change the caller
+        // already applied is still recorded.
+        if (mailContent) {
+            if (attachmentNote) {
+                await insertRequestComment(client, {
+                    requestKind: REQUEST_COMMENT_KINDS.MASS,
+                    requestId: massRequestId,
+                    eventType: REQUEST_COMMENT_EVENTS.CORRESPONDENCE,
+                    stage,
+                    actorUserId,
+                    comment: prefixMassItemScope(attachmentNote, scopeLabel),
+                });
+            }
+
+            return {
+                mode: "EMAIL",
+                stage,
+                // The cohort's CURRENT values, unchanged.
+                status: cohort[0].status,
+                assigned_to: cohort[0].assigned_to ?? stage,
+                item_ids: cohortItemIds,
+                updated_count: 0,
+                approverUserId: plan.approverIds[0],
+                approverEmail:
+                    approverEmails.get(String(plan.approverIds[0])) ?? null,
+            };
+        }
+
+        // Order is forced by UNIQUE (item_id, level): drop the cohort's old
+        // MANUAL rows, move its surviving MDM rows to N+1, then insert 1..N per
+        // item. approver_user_id / claimed_at are not in the MDM patch, so the
+        // grab survives the rewrite.
+        await client.query(
+            `DELETE FROM mat_mass_request_item_approval_step s
+             WHERE s.item_id = ANY($1::bigint[])
+               AND s.kind = $2`,
+            [cohortItemIds, STEP_KINDS.MANUAL]
+        );
+        await updateMassItemStepRowsById(client, stepIds, plan.mdmStep);
+        for (const itemId of cohortItemIds) {
+            await insertMassItemApprovalSteps(client, itemId, plan.manualSteps);
+        }
+
+        // mat_mass_request_item carries no rework_* columns, so the header
+        // write stays status/assigned_to like every other mass action.
+        const updatedCount = await updateMassItemHeaders(
+            client,
+            massRequestId,
+            cohortItemIds,
+            {
+                status: plan.header.status,
+                assignedTo: plan.header.assigned_to,
+            }
+        );
+
+        if (updatedCount === 0) {
+            throw buildMassActionError(
+                "Mass request is already processed or not waiting for rework",
+                "MASS_REQUEST_REWORK_CONFLICT",
+                409
+            );
+        }
+
+        await insertRequestComment(client, {
+            requestKind: REQUEST_COMMENT_KINDS.MASS,
+            requestId: massRequestId,
+            eventType: REQUEST_COMMENT_EVENTS.REWORK,
+            stage,
+            actorUserId,
+            comment: prefixMassItemScope(
+                appendCommentNote(plan._meta.reason, attachmentNote),
+                scopeLabel
+            ),
+        });
+
+        return {
+            mode: "CHAIN_REPLACE",
+            stage,
+            status: plan.header.status,
+            assigned_to: plan.header.assigned_to,
+            item_ids: cohortItemIds,
+            updated_count: updatedCount,
+            approverIds: plan.approverIds,
+            reason: plan._meta.reason,
+        };
+    }
+
+    const reworkPatch = buildMassStepReworkPatch({
+        activeStep: leadStep,
+        actorUserId,
+        reason,
+    });
+
+    await updateMassItemStepRowsById(client, stepIds, reworkPatch.step);
+    const updatedCount = await updateMassItemHeaders(
+        client,
+        massRequestId,
+        cohortItemIds,
+        {
+            status: reworkPatch.header.status,
+            assignedTo: reworkPatch.header.assigned_to,
+        }
+    );
+
+    if (updatedCount === 0) {
+        throw buildMassActionError(
+            "Mass request is already processed or not waiting for rework",
+            "MASS_REQUEST_REWORK_CONFLICT",
+            409
+        );
+    }
+
+    await insertRequestComment(client, {
+        requestKind: REQUEST_COMMENT_KINDS.MASS,
+        requestId: massRequestId,
+        eventType: REQUEST_COMMENT_EVENTS.REWORK,
+        stage,
+        actorUserId,
+        comment: prefixMassItemScope(
+            appendCommentNote(reworkPatch.header.rework_reason, attachmentNote),
+            scopeLabel
+        ),
+    });
+
+    return {
+        mode: "REQUESTER",
+        stage,
+        status: reworkPatch.header.status,
+        assigned_to: reworkPatch.header.assigned_to,
+        item_ids: cohortItemIds,
+        updated_count: updatedCount,
+        reason: reworkPatch.header.rework_reason,
+    };
+};
+
+// Reject the cohort: its active step REJECTED, its items CANCEL. Terminal for
+// those items only — a CANCELled item releases its final code.
+const applyMassReject = async (
+    client,
+    { massRequestId, batchItems, cohort, actorUserId, reason }
+) => {
+    const leadStep = cohort[0].activeStep;
+    const stage = stepLabel(leadStep);
+    const rejectPatch = buildMassStepRejectPatch({
+        activeStep: leadStep,
+        reason,
+    });
+    const cohortItemIds = cohort.map(item => item.id);
+
+    await updateMassItemStepRowsById(
+        client,
+        cohort.map(item => item.activeStep.id),
+        rejectPatch.step
+    );
+    const updatedCount = await updateMassItemHeaders(
+        client,
+        massRequestId,
+        cohortItemIds,
+        {
+            status: rejectPatch.header.status,
+            assignedTo: rejectPatch.header.assigned_to,
+        }
+    );
+
+    if (updatedCount === 0) {
+        throw buildMassActionError(
+            "Mass request is already processed or not waiting for rejection",
+            "MASS_REQUEST_REJECT_CONFLICT",
+            409
+        );
+    }
+
+    await insertRequestComment(client, {
+        requestKind: REQUEST_COMMENT_KINDS.MASS,
+        requestId: massRequestId,
+        eventType: REQUEST_COMMENT_EVENTS.REJECT,
+        stage,
+        actorUserId,
+        comment: prefixMassItemScope(
+            rejectPatch.step.remark,
+            buildMassItemScopeLabel(cohort, batchItems)
+        ),
+    });
+
+    return {
+        stage,
+        status: rejectPatch.header.status,
+        assigned_to: rejectPatch.header.assigned_to,
+        item_ids: cohortItemIds,
+        updated_count: updatedCount,
+    };
+};
+
+// Staged per-item attachment changes for the items an action may change,
+// carried into the same transaction. Returns the files to clean up either way
+// and the removal note the action's comment carries.
+const applyMassCohortAttachmentChanges = async (
+    client,
+    { massRequestId, batchItems, items, allowedItemIds, uploadedBy }
+) => {
+    const {
+        savedFiles,
+        removedFilePaths,
+        attachmentRemovalNotesByItem,
+    } = await applyMassRequestItemAttachmentChanges(client, {
+        massRequestId,
+        items: filterMassItemPayload(items, batchItems, allowedItemIds),
+        uploadedBy,
+    });
+
+    return {
+        savedFiles,
+        removedFilePaths,
+        attachmentNote:
+            attachmentRemovalNotesByItem.length > 0
+                ? attachmentRemovalNotesByItem.join("; ")
+                : null,
+    };
+};
+
+// Master Data's per-item decisions, as submitted from the batch dialog.
+const MASS_DECISION_ACTIONS = Object.freeze({
+    APPROVE: "APPROVE",
+    REWORK: "REWORK",
+    REJECT: "REJECT",
+});
+
+const buildMassDecisionError = (message, code) =>
+    Object.assign(buildMassActionError(message, code, 400), {
+        errors: [{ fieldKey: "decisions", message }],
+    });
+
+/**
+ * Validate and normalize `decisions` ([{ itemId, action }]). Pure body-shape
+ * checks; which items are actually waiting is settled under the batch lock.
+ *
+ * @returns {{ decisions: Array<{itemId: string, action: string}>,
+ *             byAction: Record<'APPROVE'|'REWORK'|'REJECT', string[]> }}
+ */
+const normalizeMassDecisions = decisions => {
+    if (!Array.isArray(decisions) || decisions.length === 0) {
+        throw buildMassDecisionError(
+            "Choose Approve, Rework or Reject for every item",
+            "MASS_REQUEST_DECISIONS_REQUIRED"
+        );
+    }
+
+    const seen = new Set();
+    const byAction = {
+        [MASS_DECISION_ACTIONS.APPROVE]: [],
+        [MASS_DECISION_ACTIONS.REWORK]: [],
+        [MASS_DECISION_ACTIONS.REJECT]: [],
+    };
+
+    const normalized = decisions.map(entry => {
+        const itemId = String(entry?.itemId ?? entry?.item_id ?? "").trim();
+        const action = String(entry?.action ?? "").trim().toUpperCase();
+
+        if (!itemId || !MASS_DECISION_ACTIONS[action]) {
+            throw buildMassDecisionError(
+                "Each decision needs an item and one of Approve, Rework or Reject",
+                "MASS_REQUEST_DECISION_INVALID"
+            );
+        }
+
+        if (seen.has(itemId)) {
+            throw buildMassDecisionError(
+                "An item can only get one decision",
+                "MASS_REQUEST_DECISION_DUPLICATE"
+            );
+        }
+
+        seen.add(itemId);
+        byAction[action].push(itemId);
+        return { itemId, action };
+    });
+
+    return { decisions: normalized, byAction };
+};
+
+// The `notify` block a mass rework response carries. MUST run after COMMIT
+// (see buildReworkNotifyResult): the EMAIL mode puts a real mail on the wire to
+// the picked recipient, threaded on the batch's anchor item; every other mode
+// keeps the inert in-app block.
+const notifyMassRework = async (
+    client,
+    { massRequestId, anchor, rework, notifyChannel, mailContent, actorUserId }
+) => {
+    if (rework.mode === "EMAIL") {
+        return await sendReworkChainReplaceEmail(client, {
+            mailContent,
+            requestKind: "MASS",
+            requestId: Number(massRequestId),
+            requestNo: anchor.request_no ?? null,
+            approverUserId: rework.approverUserId,
+            approverEmail: rework.approverEmail,
+            actorUserId,
+        });
+    }
+
+    // No mail on the EMAIL channel for a rework to the requester: it picks
+    // nobody, so there is no address to send to.
+    return buildReworkNotifyResult(notifyChannel, {
+        massRequestId: Number(massRequestId),
+        approverUserIds:
+            rework.mode === "CHAIN_REPLACE" ? rework.approverIds : [],
+        reason: rework.reason,
+    });
+};
+
+// Immediate SAP staging push once items completed, mirroring the single flow:
+// best-effort and out of the transaction. The items are already committed DONE
+// with sap_push_status='PENDING', so a push failure leaves them PENDING
+// (recoverable by the next cron tick) and must NOT fail the response.
+const pushCompletedMassItemsToSap = async (massRequestId, completedCount) => {
+    if (!(Number(completedCount) > 0)) {
+        return;
+    }
+
+    try {
+        await materialSapStagingService.pushPendingMaterialsToSapStaging({
+            massRequestId,
+            limit: Math.max(Number(completedCount), 1),
+        });
+    } catch (pushError) {
+        console.error(
+            `Immediate SAP staging push failed for mass request ${massRequestId}:`,
+            pushError
         );
     }
 };
@@ -4095,6 +5024,46 @@ const MASS_REQUEST_FIRST_ITEM_STEP_LATERAL = `LEFT JOIN LATERAL (
     LIMIT 1
 ) first_item ON TRUE`;
 
+// Every item's own state (status, assigned_to, step rows), so the JS side can
+// pick the item a viewer should see the batch through and tell a batch whose
+// items diverged at Master Data (see applyMassItemsStateToRow). `m` is the alias
+// for mat_mass_request.
+const MASS_REQUEST_ITEMS_STATE_LATERAL = `LEFT JOIN LATERAL (
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'item_id', bi.id,
+            'item_no', bi.item_no,
+            'status', bi.status,
+            'assigned_to', bi.assigned_to,
+            'approval_steps', COALESCE(
+                (
+                    SELECT jsonb_agg(
+                        jsonb_build_object(
+                            'level', bs.level,
+                            'kind', bs.kind,
+                            'approver_user_id', bs.approver_user_id,
+                            'approver_name', COALESCE(bau.fullname, bau.username, bs.approver_user_id),
+                            'approver_email', bau.email,
+                            'status', bs.status,
+                            'claimed_at', bs.claimed_at,
+                            'acted_at', bs.acted_at,
+                            'remark', bs.remark
+                        )
+                        ORDER BY bs.level
+                    )
+                    FROM mat_mass_request_item_approval_step bs
+                    LEFT JOIN ${MATERIAL_PEOPLE_SQL} bau ON bau.user_id = bs.approver_user_id
+                    WHERE bs.item_id = bi.id
+                ),
+                '[]'::jsonb
+            )
+        )
+        ORDER BY bi.item_no
+    ) AS items_state
+    FROM mat_mass_request_item bi
+    WHERE bi.mass_request_id = m.id
+) batch_items ON TRUE`;
+
 // Scalar block (mass request): roll the per-ITEM sap_push_status up to one
 // batch-level value, so the list/inbox rows can offer the SAP-error resubmit
 // action the same way the single-request rows do off r.sap_push_status.
@@ -4144,10 +5113,12 @@ const buildMassRequestsByUserQuery = ({
     first_item.first_item_assigned_to,
     COALESCE(first_item.approval_steps, '[]'::jsonb) AS approval_steps,
     first_item.active_step,
+    COALESCE(batch_items.items_state, '[]'::jsonb) AS items_state,
     ${MASS_REQUEST_SAP_PUSH_STATUS_SQL}
 FROM mat_mass_request m
 LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON u.user_id = m.created_by
 ${MASS_REQUEST_FIRST_ITEM_STEP_LATERAL}
+${MASS_REQUEST_ITEMS_STATE_LATERAL}
 WHERE m.created_by = $1
 ORDER BY m.created_at DESC, m.id DESC`;
 
@@ -4167,10 +5138,12 @@ const buildMassRequestApprovalInboxQuery = ({
     first_item.first_item_assigned_to,
     COALESCE(first_item.approval_steps, '[]'::jsonb) AS approval_steps,
     first_item.active_step,
+    COALESCE(batch_items.items_state, '[]'::jsonb) AS items_state,
     ${MASS_REQUEST_SAP_PUSH_STATUS_SQL}
 FROM mat_mass_request m
 LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON u.user_id = m.created_by
 ${MASS_REQUEST_FIRST_ITEM_STEP_LATERAL}
+${MASS_REQUEST_ITEMS_STATE_LATERAL}
 WHERE (
     first_item.active_step IS NOT NULL
     OR UPPER(COALESCE(first_item.first_item_status, '')) IN ('DONE', 'REWORK', 'REJECT', 'REJECTED', 'CANCEL')
@@ -4492,6 +5465,156 @@ const applyStepInboxVisibility = (
                 (includeGrabbedMdmRows && hasGrabbedMdmStep(steps))
         )
         .map(({ row }) => row);
+};
+
+// =====================================================================
+// Mass batch rows: per-item state -> one list/inbox row per batch.
+// =====================================================================
+// Master Data decides each item on its own, so a batch's items can sit in
+// different places. A list row still shows one status / stage / assignee, so it
+// is read through one representative item — the one that needs the viewer — and
+// carries a batch-level summary next to it.
+
+const MASS_BATCH_STATUS_PARTIAL = "Partial";
+
+const normalizeMassItemsState = row => {
+    let raw = row?.items_state;
+
+    if (typeof raw === "string") {
+        try {
+            raw = JSON.parse(raw);
+        } catch (error) {
+            raw = [];
+        }
+    }
+
+    return (Array.isArray(raw) ? raw : []).map(item => {
+        const steps = sortSteps(normalizeRowApprovalSteps(item));
+        return { ...item, steps, activeStep: resolveActiveStep(steps) };
+    });
+};
+
+// The item a viewer sees the batch through: the first one that needs THEM (for
+// an approver, an item whose active step is theirs to act on; for the
+// requester, one back in Rework), else the first still in flight, else the
+// first in Rework, else the first item.
+const pickMassRepresentativeItem = (items, needsViewer = () => false) =>
+    items.find(item => needsViewer(item)) ??
+    items.find(isMassItemInFlight) ??
+    items.find(
+        item => normalizeMassItemStatus(item.status) === MASS_ITEM_STATUS.REWORK
+    ) ??
+    items[0] ??
+    null;
+
+const summarizeMassItemStatuses = items => {
+    const counts = {};
+
+    for (const item of items) {
+        const key = normalizeMassItemStatus(item.status) || MASS_ITEM_STATUS.SUBMIT;
+        counts[key] = (counts[key] || 0) + 1;
+    }
+
+    return counts;
+};
+
+// Overlay the representative item's state on the row's first_item_* /
+// approval_steps / active_step fields (the names every consumer already reads)
+// and add the batch summary: batch_status ("Partial" once the items' statuses
+// differ, else their shared status) and item_status_counts. items_state itself
+// is dropped — the dialog loads the items on its own.
+const applyMassItemsStateToRow = (row, items, representative) => {
+    if (representative) {
+        const active = representative.activeStep;
+        row.first_item_status = representative.status;
+        row.first_item_assigned_to = representative.assigned_to;
+        row.approval_steps = representative.steps;
+        row.active_step = active
+            ? {
+                  level: active.level,
+                  kind: active.kind,
+                  approver_user_id: stepApproverUserId(active),
+                  status: active.status ?? null,
+              }
+            : null;
+    }
+
+    const statuses = new Set(
+        items.map(item => normalizeMassItemStatus(item.status))
+    );
+    row.batch_status =
+        statuses.size > 1
+            ? MASS_BATCH_STATUS_PARTIAL
+            : row.first_item_status ?? null;
+    row.item_status_counts = summarizeMassItemStatuses(items);
+    delete row.items_state;
+
+    return row;
+};
+
+// My Approval, mass tab: applyStepInboxVisibility per ITEM — a batch is
+// visible when any of its items is (an approver re-climbing a replaced chain
+// for two items must see the batch while the rest waits at Master Data) — and
+// read through the first item that is the actor's turn.
+const applyMassStepInboxVisibility = (
+    rows = [],
+    { actorUserId, actorUsername, actorIsMdmMaterial, scope } = {}
+) => {
+    const actor = { actorUserId, actorUsername, actorIsMdmMaterial };
+    const isAdmin = isAdminMaterialApprover(actorUsername);
+    const includeGrabbedMdmRows =
+        normalizeInboxScope(scope) === INBOX_SCOPES.MDM_ALL &&
+        Boolean(actorIsMdmMaterial);
+
+    return rows
+        .map(row => {
+            const items = normalizeMassItemsState(row);
+            const itemSteps =
+                items.length > 0
+                    ? items.map(item => item.steps)
+                    : [normalizeRowApprovalSteps(row)];
+
+            applyMassItemsStateToRow(
+                row,
+                items,
+                pickMassRepresentativeItem(
+                    items,
+                    item =>
+                        isMassItemInFlight(item) &&
+                        canActorActOnStep(item.activeStep, actor)
+                )
+            );
+            attachStepPayloadToRow(row);
+            return { row, itemSteps };
+        })
+        .filter(
+            ({ itemSteps }) =>
+                isAdmin ||
+                itemSteps.some(
+                    steps =>
+                        isStepRowVisibleForActor(steps, actor) ||
+                        (includeGrabbedMdmRows && hasGrabbedMdmStep(steps))
+                )
+        )
+        .map(({ row }) => row);
+};
+
+// My Request, mass tab: the requester's own batches, read through the first
+// item back with them in Rework.
+const applyMassRequesterView = row => {
+    const items = normalizeMassItemsState(row);
+
+    applyMassItemsStateToRow(
+        row,
+        items,
+        pickMassRepresentativeItem(
+            items,
+            item =>
+                normalizeMassItemStatus(item.status) === MASS_ITEM_STATUS.REWORK
+        )
+    );
+
+    return attachStepPayloadToRow(row);
 };
 
 // Dynamic-approver masters: one row per requester with their ordered MANUAL
@@ -4850,30 +5973,36 @@ const MaterialRequests = {
                         throw Object.assign(new Error("Forbidden: only an active MDM_MATERIAL user can claim the Master Data step"), { statusCode: 403, code: "MASS_REQUEST_MDM_CLAIM_FORBIDDEN" });
                     }
 
-                    const firstItemSteps = await loadMassItemSteps(
+                    const batchItems = await loadMassBatchState(
                         client,
                         massRequestId,
                         { forUpdate: true }
                     );
 
-                    if (firstItemSteps.length === 0) {
+                    if (batchItems.length === 0) {
                         throw Object.assign(new Error("Mass request not found"), { statusCode: 404, code: "MASS_REQUEST_NOT_FOUND" });
                     }
 
-                    const activeStep = resolveActiveStep(firstItemSteps);
+                    // The items currently waiting at Master Data. Before the
+                    // first grab every in-flight item is there together — the
+                    // manual stages move the batch as one.
+                    const mdmItems = batchItems.filter(
+                        item =>
+                            isMassItemInFlight(item) &&
+                            stepKindOf(item.activeStep) === STEP_KINDS.MDM
+                    );
 
-                    if (!activeStep || activeStep.kind !== STEP_KINDS.MDM) {
+                    if (mdmItems.length === 0) {
                         throw Object.assign(new Error("Master Data step is not currently open for this mass request"), { statusCode: 409, code: "MASS_REQUEST_MDM_STEP_NOT_ACTIVE" });
                     }
 
-                    if (hasActorApprovedEarlierStep(firstItemSteps, activeStep, actorUserId)) {
+                    if (mdmItems.some(item => hasActorApprovedEarlierStep(item.steps, item.activeStep, actorUserId))) {
                         throw Object.assign(new Error("Forbidden: you already acted as an approver on this request and cannot claim its Master Data step"), { statusCode: 403, code: "MASS_REQUEST_MDM_CLAIM_PRIOR_APPROVER" });
                     }
 
                     const won = await claimMdmMassItemStep(
                         client,
                         massRequestId,
-                        activeStep.level,
                         actorUserId
                     );
 
@@ -4881,10 +6010,15 @@ const MaterialRequests = {
                         throw Object.assign(new Error("Master Data step has already been claimed"), { statusCode: 409, code: "ALREADY_CLAIMED" });
                     }
 
-                    const refreshedSteps = await loadMassItemSteps(
+                    const refreshedItems = await loadMassBatchState(
                         client,
                         massRequestId
                     );
+                    const refreshedSteps = (
+                        refreshedItems.find(
+                            item => String(item.id) === String(mdmItems[0].id)
+                        ) ?? refreshedItems[0]
+                    ).steps;
 
                     await client.query("COMMIT");
 
@@ -5854,7 +6988,7 @@ const MaterialRequests = {
                     createdBy
                 );
 
-                return result.rows.map(attachStepPayloadToRow);
+                return result.rows.map(applyMassRequesterView);
             });
         } catch (error) {
             console.error("Error fetching mass requests by user:", error);
@@ -6953,7 +8087,7 @@ const MaterialRequests = {
                     actorUserId
                 );
 
-                return applyStepInboxVisibility(result.rows, {
+                return applyMassStepInboxVisibility(result.rows, {
                     actorUserId,
                     actorUsername,
                     actorIsMdmMaterial,
@@ -6969,6 +8103,10 @@ const MaterialRequests = {
         }
     },
 
+    // Approve the cohort waiting at the actor's step (resolveMassActionCohort):
+    // through the manual stages that is the whole batch; at Master Data, every
+    // item still waiting there. Master Data's per-item decisions go through
+    // decideMassRequest instead.
     approveMassRequest: async ({
         massRequestId,
         actorUserId,
@@ -6985,255 +8123,65 @@ const MaterialRequests = {
                 await client.query("BEGIN");
 
                 try {
-                    // Lock and read the first item of the batch to validate status.
-                    const lockResult = await client.query(
-                        `SELECT i.id, i.status
-                         FROM mat_mass_request_item i
-                         WHERE i.mass_request_id = $1
-                         ORDER BY i.item_no ASC
-                         LIMIT 1
-                         FOR UPDATE OF i`,
-                        [massRequestId]
-                    );
-
-                    if (lockResult.rows.length === 0) {
-                        throw Object.assign(
-                            new Error("Mass request not found"),
-                            { statusCode: 404, code: "MASS_REQUEST_NOT_FOUND" }
-                        );
-                    }
-
-                    const firstItem = lockResult.rows[0];
-
-                    if (
-                        String(firstItem.status || "")
-                            .trim()
-                            .toUpperCase() !== "SUBMIT"
-                    ) {
-                        throw Object.assign(
-                            new Error(
-                                "Mass request can only be approved while status is Submit"
-                            ),
-                            {
-                                statusCode: 409,
-                                code: "MASS_REQUEST_APPROVAL_STATUS_CONFLICT",
-                            }
-                        );
-                    }
-
-                    // Step model: all items share the plan, so route off the
-                    // first item's steps and apply the change to every item.
-                    const firstItemSteps = await loadMassItemSteps(
+                    await lockMassRequestAnchor(client, massRequestId);
+                    const batchItems = await loadMassBatchState(
                         client,
                         massRequestId,
                         { forUpdate: true }
                     );
-                    const activeStep = resolveActiveStep(firstItemSteps);
-
-                    if (!activeStep) {
-                        throw Object.assign(
-                            new Error(
-                                "Mass request is already processed or not waiting for approval"
-                            ),
-                            {
-                                statusCode: 409,
-                                code: "MASS_REQUEST_APPROVAL_CONFLICT",
-                            }
-                        );
-                    }
-
-                    const activeStepLabel = stepLabel(activeStep);
-                    const actorIsMdmMaterial =
-                        activeStep.kind === STEP_KINDS.MDM
-                            ? await isActorMdmMaterialUser(client, actorUserId)
-                            : false;
-
-                    if (
-                        !canActorActOnStep(activeStep, {
-                            actorUserId,
-                            actorUsername,
-                            actorIsMdmMaterial,
-                        })
-                    ) {
-                        throw Object.assign(
-                            new Error(
-                                "Forbidden: only the assigned approver or ADMIN can approve this mass request"
-                            ),
-                            {
-                                statusCode: 403,
-                                code: "MASS_REQUEST_APPROVAL_FORBIDDEN",
-                            }
-                        );
-                    }
-
-                    // If item edits are provided, update editable fields per item
-                    if (Array.isArray(items) && items.length > 0) {
-                        const ALLOWED_ITEM_FIELDS = [
-                            "material_description",
-                            "base_uom",
-                            "plant_code",
-                            "sloc_code",
-                            "material_group",
-                            "material_sub_group",
-                            "po_text",
-                            "spesifikasi_tambahan",
-                        ];
-
-                        for (const item of items) {
-                            if (!item.id) continue;
-
-                            const edits = {};
-                            for (const field of ALLOWED_ITEM_FIELDS) {
-                                if (item[field] !== undefined) {
-                                    edits[field] = item[field];
-                                }
-                            }
-                            // Handle uom -> base_uom mapping
-                            if (item.uom !== undefined && edits.base_uom === undefined) {
-                                edits.base_uom = item.uom;
-                            }
-
-                            if (Object.keys(edits).length === 0) continue;
-                            const editEntries = Object.entries(edits);
-                            const itemSetClauses = editEntries.map(
-                                ([field], i) => `${field} = $${i + 3}`
-                            );
-                            itemSetClauses.push("updated_at = NOW()");
-
-                            await client.query(
-                                `UPDATE mat_mass_request_item
-                                 SET ${itemSetClauses.join(", ")}
-                                 WHERE id = $1 AND mass_request_id = $2`,
-                                [item.id, massRequestId, ...editEntries.map(([_, v]) => v)]
-                            );
-                        }
-                    }
-
-                    // Staged per-item attachment changes, carried with the
-                    // approval into the same transaction. mat_mass_request_attachment
-                    // is keyed by item_id, so each item's add/remove and count
-                    // limit is resolved independently — one item's attachments
-                    // never consume another's allowance.
-                    const {
-                        savedFiles: attachmentSavedFiles,
-                        removedFilePaths: attachmentRemovedFilePaths,
-                        attachmentRemovalNotesByItem,
-                    } = await applyMassRequestItemAttachmentChanges(client, {
-                        massRequestId,
-                        items,
-                        uploadedBy: actorUsername ?? null,
+                    const actor = await resolveMassActor(client, batchItems, {
+                        actorUserId,
+                        actorUsername,
                     });
-                    savedFiles.push(...attachmentSavedFiles);
-                    removedFilePaths.push(...attachmentRemovedFilePaths);
+                    const cohort = resolveMassActionCohort({
+                        items: batchItems,
+                        actor,
+                        errors: MASS_ACTION_ERRORS.approve,
+                    });
+                    const cohortItemIds = cohort.map(item => item.id);
 
-                    // Per-item final codes: only when the active step is the
-                    // Master Data one (always the last step of the plan, so a
-                    // mass batch is Create-only and every item needs a code).
-                    // Composed AFTER the item edits above — the MDM approver can
-                    // fix an item's group/sub group in the same action that
-                    // assigns the running number, and the code must follow the
-                    // group the item ends up with.
-                    const isMdmStep = activeStep.kind === STEP_KINDS.MDM;
-                    const finalCodePlan = isMdmStep
-                        ? buildMassRequestFinalCodePlan({
-                              finalCodeSuffixes,
-                              items: await loadMassItemGroupCodes(
-                                  client,
-                                  massRequestId
-                              ),
-                          })
-                        : [];
-
-                    if (finalCodePlan.length > 0) {
-                        await assertMassFinalCodePlanIsAvailable(client, {
-                            massRequestId,
-                            plan: finalCodePlan,
-                        });
-                        await applyMassItemFinalCodes(client, {
-                            massRequestId,
-                            plan: finalCodePlan,
-                        });
-                    }
-
-                    // Mark this stage APPROVED on the matching step row of EVERY
-                    // item. For MDM, record the approver (claimer or this actor).
-                    const approvePatch = buildMassStepApprovePatch({ remark });
-                    await updateMassItemStepRowsByLevel(
+                    // Item edits and staged per-item attachment changes ride
+                    // with the approval in the same transaction, for the items
+                    // it moves only. mat_mass_request_attachment is keyed by
+                    // item_id, so each item's add/remove and count limit is
+                    // resolved independently.
+                    assertMassItemPayloadWithin(items, batchItems, {
+                        editableItemIds: cohortItemIds,
+                    });
+                    await applyMassItemFieldEdits(
                         client,
                         massRequestId,
-                        activeStep.level,
-                        approvePatch.step
+                        filterMassItemPayload(items, batchItems, cohortItemIds)
                     );
-                    if (activeStep.kind === STEP_KINDS.MDM) {
-                        await client.query(
-                            `UPDATE mat_mass_request_item_approval_step s
-                             SET approver_user_id = COALESCE(s.approver_user_id, $3),
-                                 updated_at = NOW()
-                             FROM mat_mass_request_item i
-                             WHERE s.item_id = i.id
-                               AND i.mass_request_id = $1
-                               AND s.level = $2`,
-                            [massRequestId, activeStep.level, actorUserId ?? null]
-                        );
-                    }
-
-                    // Recompute the next active step from the post-approval state.
-                    const nextSteps = firstItemSteps.map(step =>
-                        step.id === activeStep.id
-                            ? { ...step, status: "APPROVED" }
-                            : step
+                    const attachments = await applyMassCohortAttachmentChanges(
+                        client,
+                        {
+                            massRequestId,
+                            batchItems,
+                            items,
+                            allowedItemIds: cohortItemIds,
+                            uploadedBy: actorUsername ?? null,
+                        }
                     );
-                    const nextActive = resolveActiveStep(nextSteps);
-                    const headerStatus = nextActive ? "Submit" : "DONE";
-                    const headerAssignedTo = nextActive
-                        ? stepLabel(nextActive)
-                        : "Completed";
+                    savedFiles.push(...attachments.savedFiles);
+                    removedFilePaths.push(...attachments.removedFilePaths);
 
-                    // Terminal completion: flag EVERY item for the Oracle
-                    // SAP-staging push (one VMS_MATERIALDATA row per item). The
-                    // inline push below picks them up right after COMMIT, same
-                    // as the single flow.
-                    const updateResult = await client.query(
-                        `UPDATE mat_mass_request_item
-                         SET status = $2,
-                             assigned_to = $3,${
-                                 nextActive
-                                     ? ""
-                                     : "\n                             sap_push_status = 'PENDING',"
-                             }
-                             updated_at = NOW()
-                         WHERE mass_request_id = $1
-                         RETURNING id`,
-                        [massRequestId, headerStatus, headerAssignedTo]
-                    );
-
-                    await insertRequestComment(client, {
-                        requestKind: REQUEST_COMMENT_KINDS.MASS,
-                        requestId: massRequestId,
-                        eventType: REQUEST_COMMENT_EVENTS.APPROVE,
-                        stage: activeStepLabel,
+                    const approval = await applyMassApproval(client, {
+                        massRequestId,
+                        batchItems,
+                        cohort,
                         actorUserId,
-                        comment: appendCommentNote(
-                            remark,
-                            attachmentRemovalNotesByItem.length > 0
-                                ? attachmentRemovalNotesByItem.join("; ")
-                                : null
-                        ),
+                        remark,
+                        finalCodeSuffixes,
+                        attachmentNote: attachments.attachmentNote,
                     });
+
                     await client.query("COMMIT");
                     deleteSingleRequestStoredFiles(removedFilePaths);
 
                     return {
                         mass_request_id: Number(massRequestId),
-                        stage: activeStepLabel,
-                        status: headerStatus,
-                        assigned_to: headerAssignedTo,
-                        updated_count: updateResult.rowCount,
-                        final_codes: finalCodePlan.map(entry => ({
-                            item_no: entry.item_no,
-                            request_no: entry.request_no,
-                            final_code: entry.final_code,
-                        })),
+                        ...approval,
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -7241,26 +8189,10 @@ const MaterialRequests = {
                 }
             });
 
-            // Immediate SAP staging push on terminal completion, mirroring the
-            // single flow: best-effort + out-of-transaction. The items are
-            // already committed DONE with sap_push_status='PENDING', so a push
-            // failure here leaves them PENDING (recoverable by the next cron
-            // tick) and must NOT fail the approval response.
-            if (result && result.status === "DONE") {
-                try {
-                    await materialSapStagingService.pushPendingMaterialsToSapStaging(
-                        {
-                            massRequestId,
-                            limit: Math.max(result.updated_count || 0, 1),
-                        }
-                    );
-                } catch (pushError) {
-                    console.error(
-                        `Immediate SAP staging push failed for mass request ${massRequestId}:`,
-                        pushError
-                    );
-                }
-            }
+            await pushCompletedMassItemsToSap(
+                massRequestId,
+                result?.completed_count
+            );
 
             return result;
         } catch (error) {
@@ -7275,12 +8207,13 @@ const MaterialRequests = {
         }
     },
 
-    // Two rework modes (no `reworkToLevel` here — mass rework never gained the
-    // rewind): no `newApprovers` = back to the requester, `newApprovers` =
-    // Master Data replaces the MANUAL chain of EVERY item in the batch.
-    // `notifyVia` defaults to APP; on EMAIL it also requires the (editable)
-    // `emailSubject` / `emailBody` the dialog prefilled from
-    // getMassRequestReworkEmailTemplate.
+    // Rework the cohort waiting at the actor's step (see approveMassRequest).
+    // Three modes, see applyMassRework: back to the
+    // requester (no `newApprovers`), Master Data replacing the cohort's MANUAL
+    // chain (`newApprovers`), or a correspondence-only mail (`newApprovers` +
+    // `notifyVia` EMAIL with the editable `emailSubject` / `emailBody` the
+    // dialog prefilled from getMassRequestReworkEmailTemplate). No
+    // `reworkToLevel` here — mass rework never gained the rewind.
     requestMassRequestRework: async ({
         massRequestId,
         actorUserId,
@@ -7307,365 +8240,95 @@ const MaterialRequests = {
                 { emailSubject, emailBody },
                 "MASS_REQUEST"
             );
-            const replaceChain = isChainReplaceRequested(newApprovers);
 
-            return await DBClientWrapper(async client => {
+            const outcome = await DBClientWrapper(async client => {
                 await client.query("BEGIN");
 
                 try {
-                    // request_no rides along on the lock: this row IS the
-                    // batch's thread identity (see the [VMS#...] token note in
-                    // migration/20260807_rework_email_thread.sql).
-                    const lockResult = await client.query(
-                        `SELECT i.id, i.status, i.created_by, i.request_no, i.assigned_to
-                         FROM mat_mass_request_item i
-                         WHERE i.mass_request_id = $1
-                         ORDER BY i.item_no ASC
-                         LIMIT 1
-                         FOR UPDATE OF i`,
-                        [massRequestId]
+                    const anchor = await lockMassRequestAnchor(
+                        client,
+                        massRequestId
                     );
-
-                    if (lockResult.rows.length === 0) {
-                        throw Object.assign(
-                            new Error("Mass request not found"),
-                            { statusCode: 404, code: "MASS_REQUEST_NOT_FOUND" }
-                        );
-                    }
-
-                    const firstItem = lockResult.rows[0];
-
-                    if (
-                        String(firstItem.status || "")
-                            .trim()
-                            .toUpperCase() !== "SUBMIT"
-                    ) {
-                        throw Object.assign(
-                            new Error(
-                                "Mass request rework can only be requested while status is Submit"
-                            ),
-                            {
-                                statusCode: 409,
-                                code: "MASS_REQUEST_REWORK_STATUS_CONFLICT",
-                            }
-                        );
-                    }
-
-                    const firstItemSteps = await loadMassItemSteps(
+                    const batchItems = await loadMassBatchState(
                         client,
                         massRequestId,
                         { forUpdate: true }
                     );
-                    const activeStep = resolveActiveStep(firstItemSteps);
-
-                    if (!activeStep) {
-                        throw Object.assign(
-                            new Error(
-                                "Mass request is already processed or not waiting for approval"
-                            ),
-                            {
-                                statusCode: 409,
-                                code: "MASS_REQUEST_REWORK_CONFLICT",
-                            }
-                        );
-                    }
-
-                    const actorIsMdmMaterial =
-                        activeStep.kind === STEP_KINDS.MDM
-                            ? await isActorMdmMaterialUser(client, actorUserId)
-                            : false;
-
-                    if (
-                        !canActorActOnStep(activeStep, {
-                            actorUserId,
-                            actorUsername,
-                            actorIsMdmMaterial,
-                        })
-                    ) {
-                        throw Object.assign(
-                            new Error(
-                                "Forbidden: only the assigned approver or ADMIN can request rework on this mass request"
-                            ),
-                            {
-                                statusCode: 403,
-                                code: "MASS_REQUEST_REWORK_FORBIDDEN",
-                            }
-                        );
-                    }
-
-                    // Staged per-item attachment changes, carried with the
-                    // rework into the same transaction, ahead of every exit
-                    // branch below (rework-to-requester, chain-replace, and
-                    // the email-only correspondence path all commit past this
-                    // point).
-                    const {
-                        savedFiles: attachmentSavedFiles,
-                        removedFilePaths: attachmentRemovedFilePaths,
-                        attachmentRemovalNotesByItem,
-                    } = await applyMassRequestItemAttachmentChanges(client, {
-                        massRequestId,
-                        items,
-                        uploadedBy: actorUsername ?? null,
-                    });
-                    savedFiles.push(...attachmentSavedFiles);
-                    removedFilePaths.push(...attachmentRemovedFilePaths);
-                    const attachmentRemovalNote =
-                        attachmentRemovalNotesByItem.length > 0
-                            ? attachmentRemovalNotesByItem.join("; ")
-                            : null;
-
-                    if (replaceChain) {
-                        const plan = buildStepChainReplacePlan({
-                            steps: firstItemSteps,
-                            activeStep,
-                            newApprovers,
-                            requesterUserId: firstItem.created_by,
-                            actorUserId,
-                            reason,
-                            codePrefix: "MASS_REQUEST",
-                        });
-
-                        const approverEmails =
-                            await assertActiveApproverUsersExist(
-                                client,
-                                plan.approverIds,
-                                "MASS_REQUEST"
-                            );
-
-                        // "Via email" is CORRESPONDENCE ONLY (product decision
-                        // 2026-08-07) — see the twin branch in
-                        // requestSingleRequestRework. The batch is not
-                        // reassigned: no step row, no item header, nothing. The
-                        // picked person is the mail's recipient, the batch stays
-                        // claimed at Master Data, and `reason` is validated by
-                        // the plan builder and then dropped.
-                        if (mailContent) {
-                            // Otherwise read-only: COMMIT mainly drops the FOR
-                            // UPDATE locks. It also persists any staged
-                            // per-item attachment change applied above — a
-                            // reviewer can still attach/remove files on this
-                            // path even though no step or header is touched.
-                            if (attachmentRemovalNote) {
-                                await insertRequestComment(client, {
-                                    requestKind: REQUEST_COMMENT_KINDS.MASS,
-                                    requestId: massRequestId,
-                                    eventType:
-                                        REQUEST_COMMENT_EVENTS.CORRESPONDENCE,
-                                    stage: stepLabel(activeStep),
-                                    actorUserId,
-                                    comment: attachmentRemovalNote,
-                                });
-                            }
-                            await client.query("COMMIT");
-                            deleteSingleRequestStoredFiles(removedFilePaths);
-
-                            const notify = await sendReworkChainReplaceEmail(
-                                client,
-                                {
-                                    mailContent,
-                                    requestKind: "MASS",
-                                    requestId: Number(massRequestId),
-                                    requestNo: firstItem.request_no ?? null,
-                                    approverUserId: plan.approverIds[0],
-                                    approverEmail:
-                                        approverEmails.get(
-                                            String(plan.approverIds[0])
-                                        ) ?? null,
-                                    actorUserId,
-                                }
-                            );
-
-                            return {
-                                mass_request_id: Number(massRequestId),
-                                stage: stepLabel(activeStep),
-                                // The batch's CURRENT values, unchanged.
-                                status: firstItem.status,
-                                assigned_to:
-                                    firstItem.assigned_to ??
-                                    stepLabel(activeStep),
-                                // Nothing was reassigned, so nothing was updated.
-                                updated_count: 0,
-                                notify,
-                                emailOnly: true,
-                            };
-                        }
-
-                        // Steps are mirrored per item, so every write below fans
-                        // out over the batch exactly like approveMassRequest
-                        // does — join back to mat_mass_request_item on
-                        // mass_request_id, never touch one item's rows alone.
-                        const itemsResult = await client.query(
-                            `SELECT i.id
-                             FROM mat_mass_request_item i
-                             WHERE i.mass_request_id = $1
-                             ORDER BY i.item_no ASC`,
-                            [massRequestId]
-                        );
-
-                        // Order is forced by UNIQUE (item_id, level): drop the
-                        // old MANUAL rows, move the surviving MDM rows up to
-                        // N+1, then insert 1..N per item.
-                        await client.query(
-                            `DELETE FROM mat_mass_request_item_approval_step s
-                             USING mat_mass_request_item i
-                             WHERE s.item_id = i.id
-                               AND i.mass_request_id = $1
-                               AND s.kind = $2`,
-                            [massRequestId, STEP_KINDS.MANUAL]
-                        );
-                        // Matched by the MDM step's CURRENT level (still the old
-                        // one at this point). approver_user_id / claimed_at are
-                        // not in the patch, so the grab survives the rewrite.
-                        await updateMassItemStepRowsByLevel(
-                            client,
-                            massRequestId,
-                            activeStep.level,
-                            plan.mdmStep
-                        );
-                        for (const item of itemsResult.rows) {
-                            await insertMassItemApprovalSteps(
-                                client,
-                                item.id,
-                                plan.manualSteps
-                            );
-                        }
-
-                        // mat_mass_request_item carries no rework_* columns, so
-                        // the header write stays status/assigned_to like every
-                        // other mass action.
-                        const chainUpdateResult = await client.query(
-                            `UPDATE mat_mass_request_item
-                             SET status = $2,
-                                 assigned_to = $3,
-                                 updated_at = NOW()
-                             WHERE mass_request_id = $1
-                             RETURNING id`,
-                            [
-                                massRequestId,
-                                plan.header.status,
-                                plan.header.assigned_to,
-                            ]
-                        );
-
-                        if (chainUpdateResult.rowCount === 0) {
-                            throw Object.assign(
-                                new Error(
-                                    "Mass request is already processed or not waiting for rework"
-                                ),
-                                {
-                                    statusCode: 409,
-                                    code: "MASS_REQUEST_REWORK_CONFLICT",
-                                }
-                            );
-                        }
-
-                        await insertRequestComment(client, {
-                            requestKind: REQUEST_COMMENT_KINDS.MASS,
-                            requestId: massRequestId,
-                            eventType: REQUEST_COMMENT_EVENTS.REWORK,
-                            stage: stepLabel(activeStep),
-                            actorUserId,
-                            comment: appendCommentNote(
-                                plan._meta.reason,
-                                attachmentRemovalNote
-                            ),
-                        });
-                        await client.query("COMMIT");
-                        deleteSingleRequestStoredFiles(removedFilePaths);
-
-                        // Post-commit on purpose (see buildReworkNotifyResult).
-                        // Always the APP block: the EMAIL channel returned above
-                        // without reassigning anything.
-                        const notify = buildReworkNotifyResult(notifyChannel, {
-                            massRequestId: Number(massRequestId),
-                            approverUserIds: plan.approverIds,
-                            reason: plan._meta.reason,
-                        });
-
-                        return {
-                            mass_request_id: Number(massRequestId),
-                            stage: stepLabel(activeStep),
-                            status: plan.header.status,
-                            assigned_to: plan.header.assigned_to,
-                            updated_count: chainUpdateResult.rowCount,
-                            notify,
-                        };
-                    }
-
-                    const reworkPatch = buildMassStepReworkPatch({
-                        activeStep,
+                    const actor = await resolveMassActor(client, batchItems, {
                         actorUserId,
-                        reason,
+                        actorUsername,
                     });
+                    const cohort = resolveMassActionCohort({
+                        items: batchItems,
+                        actor,
+                        errors: MASS_ACTION_ERRORS.rework,
+                    });
+                    const cohortItemIds = cohort.map(item => item.id);
 
-                    // Mark the active step REWORK on every item, then push the
-                    // header (status/assigned_to + rework_* metadata) to all items.
-                    await updateMassItemStepRowsByLevel(
+                    // A rework carries staged attachment changes (it is a
+                    // recorded action, so a change made here has a reason
+                    // attached) but never writes field edits. Applied ahead of
+                    // every mode — the email-only one commits past here too.
+                    assertMassItemPayloadWithin(items, batchItems, {
+                        editableItemIds: cohortItemIds,
+                    });
+                    const attachments = await applyMassCohortAttachmentChanges(
                         client,
-                        massRequestId,
-                        activeStep.level,
-                        reworkPatch.step
-                    );
-                    const updateResult = await client.query(
-                        `UPDATE mat_mass_request_item
-                         SET status = $2,
-                             assigned_to = $3,
-                             updated_at = NOW()
-                         WHERE mass_request_id = $1
-                         RETURNING id`,
-                        [
+                        {
                             massRequestId,
-                            reworkPatch.header.status,
-                            reworkPatch.header.assigned_to,
-                        ]
+                            batchItems,
+                            items,
+                            allowedItemIds: cohortItemIds,
+                            uploadedBy: actorUsername ?? null,
+                        }
                     );
+                    savedFiles.push(...attachments.savedFiles);
+                    removedFilePaths.push(...attachments.removedFilePaths);
 
-                    if (updateResult.rowCount === 0) {
-                        throw Object.assign(
-                            new Error(
-                                "Mass request is already processed or not waiting for rework"
-                            ),
-                            {
-                                statusCode: 409,
-                                code: "MASS_REQUEST_REWORK_CONFLICT",
-                            }
-                        );
-                    }
-
-                    await insertRequestComment(client, {
-                        requestKind: REQUEST_COMMENT_KINDS.MASS,
-                        requestId: massRequestId,
-                        eventType: REQUEST_COMMENT_EVENTS.REWORK,
-                        stage: stepLabel(activeStep),
+                    const rework = await applyMassRework(client, {
+                        massRequestId,
+                        batchItems,
+                        cohort,
                         actorUserId,
-                        comment: appendCommentNote(
-                            reworkPatch.header.rework_reason,
-                            attachmentRemovalNote
-                        ),
+                        requesterUserId: anchor.created_by,
+                        reason,
+                        newApprovers,
+                        mailContent,
+                        attachmentNote: attachments.attachmentNote,
                     });
+
                     await client.query("COMMIT");
                     deleteSingleRequestStoredFiles(removedFilePaths);
 
-                    return {
-                        mass_request_id: Number(massRequestId),
-                        stage: stepLabel(activeStep),
-                        status: reworkPatch.header.status,
-                        assigned_to: reworkPatch.header.assigned_to,
-                        updated_count: updateResult.rowCount,
-                        // Post-commit on purpose (see buildReworkNotifyResult).
-                        // No mail even on the EMAIL channel: rework-to-requester
-                        // picks nobody, so there is no address to send to.
-                        notify: buildReworkNotifyResult(notifyChannel, {
-                            massRequestId: Number(massRequestId),
-                            approverUserIds: [],
-                            reason,
-                        }),
-                    };
+                    // Post-commit on purpose (see buildReworkNotifyResult).
+                    const notify = await notifyMassRework(client, {
+                        massRequestId,
+                        anchor,
+                        rework,
+                        notifyChannel,
+                        mailContent,
+                        actorUserId,
+                    });
+
+                    return { rework, notify };
                 } catch (error) {
                     await client.query("ROLLBACK");
                     throw error;
                 }
             });
+
+            const { rework, notify } = outcome;
+
+            return {
+                mass_request_id: Number(massRequestId),
+                stage: rework.stage,
+                status: rework.status,
+                assigned_to: rework.assigned_to,
+                item_ids: rework.item_ids,
+                updated_count: rework.updated_count,
+                notify,
+                ...(rework.mode === "EMAIL" ? { emailOnly: true } : {}),
+            };
         } catch (error) {
             for (const savedFile of savedFiles) {
                 if (fs.existsSync(savedFile)) {
@@ -7678,6 +8341,8 @@ const MaterialRequests = {
         }
     },
 
+    // Reject the cohort waiting at the actor's step (see approveMassRequest).
+    // Reject discards staged attachment changes.
     rejectMassRequestByAdmin: async ({
         massRequestId,
         actorUserId,
@@ -7689,138 +8354,35 @@ const MaterialRequests = {
                 await client.query("BEGIN");
 
                 try {
-                    const lockResult = await client.query(
-                        `SELECT i.id, i.status
-                         FROM mat_mass_request_item i
-                         WHERE i.mass_request_id = $1
-                         ORDER BY i.item_no ASC
-                         LIMIT 1
-                         FOR UPDATE OF i`,
-                        [massRequestId]
-                    );
-
-                    if (lockResult.rows.length === 0) {
-                        throw Object.assign(
-                            new Error("Mass request not found"),
-                            { statusCode: 404, code: "MASS_REQUEST_NOT_FOUND" }
-                        );
-                    }
-
-                    const firstItem = lockResult.rows[0];
-
-                    if (
-                        String(firstItem.status || "")
-                            .trim()
-                            .toUpperCase() !== "SUBMIT"
-                    ) {
-                        throw Object.assign(
-                            new Error(
-                                "Mass request can only be rejected while status is Submit"
-                            ),
-                            {
-                                statusCode: 409,
-                                code: "MASS_REQUEST_REJECT_STATUS_CONFLICT",
-                            }
-                        );
-                    }
-
-                    const firstItemSteps = await loadMassItemSteps(
+                    await lockMassRequestAnchor(client, massRequestId);
+                    const batchItems = await loadMassBatchState(
                         client,
                         massRequestId,
                         { forUpdate: true }
                     );
-                    const activeStep = resolveActiveStep(firstItemSteps);
+                    const actor = await resolveMassActor(client, batchItems, {
+                        actorUserId,
+                        actorUsername,
+                    });
+                    const cohort = resolveMassActionCohort({
+                        items: batchItems,
+                        actor,
+                        errors: MASS_ACTION_ERRORS.reject,
+                    });
 
-                    if (!activeStep) {
-                        throw Object.assign(
-                            new Error(
-                                "Mass request is already processed or not waiting for approval"
-                            ),
-                            {
-                                statusCode: 409,
-                                code: "MASS_REQUEST_REJECT_CONFLICT",
-                            }
-                        );
-                    }
-
-                    const actorIsMdmMaterial =
-                        activeStep.kind === STEP_KINDS.MDM
-                            ? await isActorMdmMaterialUser(client, actorUserId)
-                            : false;
-
-                    if (
-                        !canActorActOnStep(activeStep, {
-                            actorUserId,
-                            actorUsername,
-                            actorIsMdmMaterial,
-                        })
-                    ) {
-                        throw Object.assign(
-                            new Error(
-                                "Forbidden: only the assigned approver or ADMIN can reject this mass request"
-                            ),
-                            {
-                                statusCode: 403,
-                                code: "MASS_REQUEST_REJECT_FORBIDDEN",
-                            }
-                        );
-                    }
-
-                    const rejectPatch = buildMassStepRejectPatch({
-                        activeStep,
+                    const rejection = await applyMassReject(client, {
+                        massRequestId,
+                        batchItems,
+                        cohort,
+                        actorUserId,
                         reason,
                     });
 
-                    // Mark the active step REJECTED on every item, then push the
-                    // header (CANCEL/Cancelled) to all items.
-                    await updateMassItemStepRowsByLevel(
-                        client,
-                        massRequestId,
-                        activeStep.level,
-                        rejectPatch.step
-                    );
-                    const updateResult = await client.query(
-                        `UPDATE mat_mass_request_item
-                         SET status = $2,
-                             assigned_to = $3,
-                             updated_at = NOW()
-                         WHERE mass_request_id = $1
-                         RETURNING id`,
-                        [
-                            massRequestId,
-                            rejectPatch.header.status,
-                            rejectPatch.header.assigned_to,
-                        ]
-                    );
-
-                    if (updateResult.rowCount === 0) {
-                        throw Object.assign(
-                            new Error(
-                                "Mass request is already processed or not waiting for rejection"
-                            ),
-                            {
-                                statusCode: 409,
-                                code: "MASS_REQUEST_REJECT_CONFLICT",
-                            }
-                        );
-                    }
-
-                    await insertRequestComment(client, {
-                        requestKind: REQUEST_COMMENT_KINDS.MASS,
-                        requestId: massRequestId,
-                        eventType: REQUEST_COMMENT_EVENTS.REJECT,
-                        stage: stepLabel(activeStep),
-                        actorUserId,
-                        comment: rejectPatch.step.remark,
-                    });
                     await client.query("COMMIT");
 
                     return {
                         mass_request_id: Number(massRequestId),
-                        stage: stepLabel(activeStep),
-                        status: rejectPatch.header.status,
-                        assigned_to: rejectPatch.header.assigned_to,
-                        updated_count: updateResult.rowCount,
+                        ...rejection,
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -7833,15 +8395,266 @@ const MaterialRequests = {
         }
     },
 
+    /**
+     * Master Data's per-item decisions on a batch, in one transaction.
+     *
+     * Every item waiting at Master Data must get exactly one decision; each
+     * group then follows its own flow, exactly as if the whole batch had taken
+     * that action: APPROVE composes the item's final code and (being the last
+     * step) completes it for the SAP push, REWORK goes to the requester / a
+     * replaced chain / a correspondence-only mail, REJECT cancels it.
+     *
+     * @param {object} opts
+     * @param {Array<{itemId, action}>} opts.decisions APPROVE | REWORK | REJECT
+     * @param {string} [opts.remark]            approve remark
+     * @param {object} [opts.finalCodeSuffixes] running number per APPROVE item id
+     * @param {string} [opts.reworkReason]      required with any REWORK
+     * @param {Array}  [opts.newApprovers]      rework to a replaced chain / mail
+     * @param {string} [opts.notifyVia]         APP | EMAIL (rework)
+     * @param {string} [opts.emailSubject]      EMAIL rework mail
+     * @param {string} [opts.emailBody]         EMAIL rework mail
+     * @param {string} [opts.rejectReason]      required with any REJECT
+     * @param {Array}  [opts.items]             field edits (APPROVE items) and
+     *                                          attachment changes (APPROVE and
+     *                                          REWORK items)
+     */
+    decideMassRequest: async ({
+        massRequestId,
+        actorUserId,
+        actorUsername,
+        decisions,
+        remark = null,
+        finalCodeSuffixes = null,
+        reworkReason = null,
+        newApprovers = null,
+        notifyVia = null,
+        emailSubject = null,
+        emailBody = null,
+        rejectReason = null,
+        items = null,
+    }) => {
+        const savedFiles = [];
+        const removedFilePaths = [];
+
+        try {
+            // Pure body-shape checks before any transaction.
+            const { decisions: normalizedDecisions, byAction } =
+                normalizeMassDecisions(decisions);
+            const hasRework = byAction.REWORK.length > 0;
+            const hasReject = byAction.REJECT.length > 0;
+            const notifyChannel = hasRework
+                ? normalizeReworkNotifyVia(notifyVia, "MASS_REQUEST")
+                : REWORK_NOTIFY_CHANNELS.APP;
+            const mailContent = hasRework
+                ? assertReworkEmailContent(
+                      notifyChannel,
+                      { emailSubject, emailBody },
+                      "MASS_REQUEST"
+                  )
+                : null;
+            if (hasReject) {
+                assertRequiredActionReason(rejectReason, "reject");
+            }
+
+            const outcome = await DBClientWrapper(async client => {
+                await client.query("BEGIN");
+
+                try {
+                    const anchor = await lockMassRequestAnchor(
+                        client,
+                        massRequestId
+                    );
+                    const batchItems = await loadMassBatchState(
+                        client,
+                        massRequestId,
+                        { forUpdate: true }
+                    );
+                    const actor = await resolveMassActor(client, batchItems, {
+                        actorUserId,
+                        actorUsername,
+                    });
+                    // Every decided item must be the actor's to act on and on
+                    // one lane; that lane must be Master Data.
+                    const decided = resolveMassActionCohort({
+                        items: batchItems,
+                        itemIds: normalizedDecisions.map(entry => entry.itemId),
+                        actor,
+                        errors: MASS_ACTION_ERRORS.decide,
+                    });
+
+                    if (stepKindOf(decided[0].activeStep) !== STEP_KINDS.MDM) {
+                        throw buildMassActionError(
+                            "Per-item decisions are only available at the Master Data stage",
+                            "MASS_REQUEST_DECIDE_NOT_MASTER_DATA",
+                            409
+                        );
+                    }
+
+                    // ...and every item waiting at Master Data must be decided:
+                    // one submit resolves the whole stage.
+                    const decidedIds = new Set(
+                        decided.map(item => String(item.id))
+                    );
+                    const undecided = batchItems.filter(
+                        item =>
+                            isMassItemInFlight(item) &&
+                            stepKindOf(item.activeStep) === STEP_KINDS.MDM &&
+                            !decidedIds.has(String(item.id))
+                    );
+                    if (undecided.length > 0) {
+                        throw buildMassDecisionError(
+                            `Choose Approve, Rework or Reject for item ${undecided
+                                .map(item => item.item_no)
+                                .join(", ")}`,
+                            "MASS_REQUEST_DECISIONS_INCOMPLETE"
+                        );
+                    }
+
+                    const cohortFor = action => {
+                        const ids = new Set(byAction[action]);
+                        return decided.filter(item => ids.has(String(item.id)));
+                    };
+                    const approveCohort = cohortFor(MASS_DECISION_ACTIONS.APPROVE);
+                    const reworkCohort = cohortFor(MASS_DECISION_ACTIONS.REWORK);
+                    const rejectCohort = cohortFor(MASS_DECISION_ACTIONS.REJECT);
+                    const approveIds = approveCohort.map(item => item.id);
+                    const reworkIds = reworkCohort.map(item => item.id);
+
+                    // Same carry rules as the whole-batch actions: approve takes
+                    // edits and attachments, rework attachments only, reject
+                    // neither.
+                    assertMassItemPayloadWithin(items, batchItems, {
+                        editableItemIds: approveIds,
+                        attachableItemIds: [...approveIds, ...reworkIds],
+                    });
+                    await applyMassItemFieldEdits(
+                        client,
+                        massRequestId,
+                        filterMassItemPayload(items, batchItems, approveIds)
+                    );
+
+                    const applyAttachmentsFor = async allowedItemIds => {
+                        const attachments =
+                            await applyMassCohortAttachmentChanges(client, {
+                                massRequestId,
+                                batchItems,
+                                items,
+                                allowedItemIds,
+                                uploadedBy: actorUsername ?? null,
+                            });
+                        savedFiles.push(...attachments.savedFiles);
+                        removedFilePaths.push(...attachments.removedFilePaths);
+                        return attachments.attachmentNote;
+                    };
+
+                    const rejected =
+                        rejectCohort.length > 0
+                            ? await applyMassReject(client, {
+                                  massRequestId,
+                                  batchItems,
+                                  cohort: rejectCohort,
+                                  actorUserId,
+                                  reason: rejectReason,
+                              })
+                            : null;
+
+                    const reworked =
+                        reworkCohort.length > 0
+                            ? await applyMassRework(client, {
+                                  massRequestId,
+                                  batchItems,
+                                  cohort: reworkCohort,
+                                  actorUserId,
+                                  requesterUserId: anchor.created_by,
+                                  reason: reworkReason,
+                                  newApprovers,
+                                  mailContent,
+                                  attachmentNote:
+                                      await applyAttachmentsFor(reworkIds),
+                              })
+                            : null;
+
+                    const approved =
+                        approveCohort.length > 0
+                            ? await applyMassApproval(client, {
+                                  massRequestId,
+                                  batchItems,
+                                  cohort: approveCohort,
+                                  actorUserId,
+                                  remark,
+                                  finalCodeSuffixes,
+                                  attachmentNote:
+                                      await applyAttachmentsFor(approveIds),
+                              })
+                            : null;
+
+                    await client.query("COMMIT");
+                    deleteSingleRequestStoredFiles(removedFilePaths);
+
+                    // Post-commit on purpose (see buildReworkNotifyResult).
+                    const notify = reworked
+                        ? await notifyMassRework(client, {
+                              massRequestId,
+                              anchor,
+                              rework: reworked,
+                              notifyChannel,
+                              mailContent,
+                              actorUserId,
+                          })
+                        : null;
+
+                    return { approved, reworked, rejected, notify };
+                } catch (error) {
+                    await client.query("ROLLBACK");
+                    throw error;
+                }
+            });
+
+            const { approved, reworked, rejected, notify } = outcome;
+
+            await pushCompletedMassItemsToSap(
+                massRequestId,
+                approved?.completed_count
+            );
+
+            return {
+                mass_request_id: Number(massRequestId),
+                approved,
+                reworked: reworked
+                    ? {
+                          stage: reworked.stage,
+                          mode: reworked.mode,
+                          status: reworked.status,
+                          assigned_to: reworked.assigned_to,
+                          item_ids: reworked.item_ids,
+                          updated_count: reworked.updated_count,
+                      }
+                    : null,
+                rejected,
+                final_codes: approved?.final_codes ?? [],
+                notify,
+                ...(reworked?.mode === "EMAIL" ? { emailOnly: true } : {}),
+            };
+        } catch (error) {
+            for (const savedFile of savedFiles) {
+                if (fs.existsSync(savedFile)) {
+                    fs.unlinkSync(savedFile);
+                }
+            }
+
+            console.error("Error deciding mass request items:", error);
+            throw error;
+        }
+    },
+
     // SAP rejected one or more items of the batch (item sap_push_status =
-    // 'ERROR'). Mirror of the single-request requestSapErrorRework, lifted to
-    // the batch: a mass action is always request-level, so ANY errored item
-    // reopens the Master Data step for the WHOLE batch (the MDM approver edits
-    // the offending rows in the approval dialog and re-approves; re-approval
-    // recomposes the final codes, sets every item back to PENDING and the
-    // inline push re-stages them — idempotent DELETE+INSERT, fresh FLAG='I').
-    // Only an active MDM_MATERIAL user (or ADMIN) may do this, and the manual
-    // approvers are NOT re-run.
+    // 'ERROR'). Mirror of the single-request requestSapErrorRework, per item:
+    // only the errored items reopen their Master Data step (the MDM approver
+    // edits those rows in the approval dialog and re-approves them;
+    // re-approval recomposes their final codes, sets them back to PENDING and
+    // the inline push re-stages them — idempotent DELETE+INSERT, fresh
+    // FLAG='I'). Items SAP accepted stay DONE. Only an active MDM_MATERIAL user
+    // (or ADMIN) may do this, and the manual approvers are NOT re-run.
     requestMassSapErrorRework: async ({
         massRequestId,
         actorUserId,
@@ -7918,15 +8731,21 @@ const MaterialRequests = {
                         );
                     }
 
-                    const steps = await loadMassItemSteps(
-                        client,
-                        massRequestId,
-                        { forUpdate: true }
+                    const errorItems = (
+                        await loadMassBatchState(client, massRequestId, {
+                            forUpdate: true,
+                        })
+                    ).filter(
+                        item =>
+                            normalizeMassItemStatus(item.sap_push_status) ===
+                            "ERROR"
                     );
-                    const mdmStep = steps.find(
-                        step => stepKindOf(step) === STEP_KINDS.MDM
+                    const mdmSteps = errorItems.map(item =>
+                        item.steps.find(
+                            step => stepKindOf(step) === STEP_KINDS.MDM
+                        )
                     );
-                    if (!mdmStep) {
+                    if (mdmSteps.length === 0 || mdmSteps.some(step => !step)) {
                         throw Object.assign(
                             new Error(
                                 "Master Data (MDM) stage not found for this mass request"
@@ -7938,15 +8757,14 @@ const MaterialRequests = {
                         );
                     }
 
-                    // Reopen the Master Data step in place on every item:
+                    // Reopen the Master Data step in place on each errored item:
                     // WAITING with the last grabber's approver_user_id
-                    // untouched, items back to Submit. final_code is left as-is
-                    // — the re-approval overwrites it with the newly entered
-                    // running number.
-                    await updateMassItemStepRowsByLevel(
+                    // untouched, the item back to Submit. final_code is left
+                    // as-is — the re-approval overwrites it with the newly
+                    // entered running number.
+                    await updateMassItemStepRowsById(
                         client,
-                        massRequestId,
-                        mdmStep.level,
+                        mdmSteps.map(step => step.id),
                         { status: "WAITING", acted_at: null, remark: null }
                     );
                     const updateResult = await client.query(
@@ -7957,16 +8775,22 @@ const MaterialRequests = {
                              sap_error_msg = NULL,
                              updated_at = NOW()
                          WHERE mass_request_id = $1
+                           AND id = ANY($3::bigint[])
                          RETURNING id`,
-                        [massRequestId, stepLabel(mdmStep)]
+                        [
+                            massRequestId,
+                            stepLabel(mdmSteps[0]),
+                            errorItems.map(item => item.id),
+                        ]
                     );
 
                     await client.query("COMMIT");
 
                     return {
                         mass_request_id: Number(massRequestId),
-                        stage: stepLabel(mdmStep),
+                        stage: stepLabel(mdmSteps[0]),
                         status: "Submit",
+                        item_ids: errorItems.map(item => item.id),
                         updated_count: updateResult.rowCount,
                     };
                 } catch (error) {
@@ -8150,6 +8974,7 @@ const MaterialRequests = {
     getMassRequestReworkEmailTemplate: async ({
         massRequestId,
         approverUserId,
+        itemIds = null,
     }) => {
         try {
             const items =
@@ -8162,6 +8987,20 @@ const MaterialRequests = {
                 });
             }
 
+            // Master Data reworking only some items: the mail lists those, and
+            // still threads on the batch's first item.
+            const requestedIds = normalizeMassItemIdList(itemIds);
+            const listedItems = requestedIds
+                ? items.filter(item => requestedIds.includes(String(item.id)))
+                : items;
+
+            if (listedItems.length === 0) {
+                throw Object.assign(
+                    new Error("Item does not belong to this mass request"),
+                    { statusCode: 400, code: "MASS_REQUEST_ITEM_NOT_IN_BATCH" }
+                );
+            }
+
             // Its own client, unlike the single path: the item read above owns
             // (and has already released) the only one this method holds, and a
             // request with no picked approver never asks for one at all.
@@ -8171,9 +9010,10 @@ const MaterialRequests = {
                     : await DBClientWrapper(client =>
                           loadReworkApproverFullname(client, approverUserId)
                       );
-            const { subject, body } = buildMassReworkEmailTemplate(items, {
-                approverName,
-            });
+            const { subject, body } = buildMassReworkEmailTemplate(
+                listedItems,
+                { approverName, anchorItem: items[0] }
+            );
 
             return { subject, body };
         } catch (error) {
@@ -8301,9 +9141,11 @@ const MaterialRequests = {
     },
 
     /**
-     * Save revised items after a mass request has been reworked by an approver.
-     * Updates item fields, resets the reworked approval stage to WAITING,
-     * and sets status back to Submit for the approver to review again.
+     * Save revised items after items of a mass request were reworked back to
+     * the requester. Only the items in Rework take part: their fields are
+     * updated, the step each was reworked at reopens (WAITING), and each goes
+     * back to Submit at that step. The rest of the batch — done, cancelled, or
+     * still with an approver — is left alone.
      */
     saveMassRequestRework: async ({
         massRequestId,
@@ -8316,27 +9158,19 @@ const MaterialRequests = {
                 await client.query("BEGIN");
 
                 try {
-                    const lockResult = await client.query(
-                        `SELECT i.id, i.status, i.assigned_to
-                         FROM mat_mass_request_item i
-                         WHERE i.mass_request_id = $1
-                         ORDER BY i.item_no ASC
-                         LIMIT 1
-                         FOR UPDATE OF i`,
-                        [massRequestId]
+                    await lockMassRequestAnchor(client, massRequestId);
+                    const batchItems = await loadMassBatchState(
+                        client,
+                        massRequestId,
+                        { forUpdate: true }
+                    );
+                    const reworkItems = batchItems.filter(
+                        item =>
+                            normalizeMassItemStatus(item.status) ===
+                            MASS_ITEM_STATUS.REWORK
                     );
 
-                    if (lockResult.rows.length === 0) {
-                        throw Object.assign(
-                            new Error("Mass request not found"),
-                            { statusCode: 404, code: "MASS_REQUEST_NOT_FOUND" }
-                        );
-                    }
-
-                    const firstItem = lockResult.rows[0];
-                    const status = String(firstItem.status || "").trim().toUpperCase();
-
-                    if (status !== "REWORK") {
+                    if (reworkItems.length === 0) {
                         throw Object.assign(
                             new Error("Mass request rework can only be saved while status is Rework"),
                             { statusCode: 409, code: "MASS_REQUEST_REWORK_SAVE_CONFLICT" }
@@ -8352,88 +9186,58 @@ const MaterialRequests = {
                         "comment"
                     );
 
-                    // Step model: the reworked stage is the step currently in
-                    // REWORK status (the header assigned_to was 'Requester').
-                    const firstItemSteps = await loadMassItemSteps(
-                        client,
-                        massRequestId,
-                        { forUpdate: true }
-                    );
-                    const reworkStep = firstItemSteps.find(
-                        step =>
-                            normalizeStepStatus(step.status) === "REWORK"
-                    );
+                    // Step model: each item's reworked stage is its step in
+                    // REWORK status (at any level — items can be reworked at
+                    // different stages).
+                    const reopened = reworkItems.map(item => ({
+                        item,
+                        reworkStep: item.steps.find(
+                            step =>
+                                normalizeStepStatus(step.status) === "REWORK"
+                        ),
+                    }));
 
-                    if (!reworkStep) {
+                    if (reopened.some(entry => !entry.reworkStep)) {
                         throw Object.assign(
                             new Error("Mass request rework stage is missing"),
                             { statusCode: 409, code: "MASS_REQUEST_REWORK_STAGE_MISSING" }
                         );
                     }
 
-                    const reworkStepLabel = stepLabel(reworkStep);
-
-                    // Update each item's editable fields if items are provided
-                    if (Array.isArray(items) && items.length > 0) {
-                        const ALLOWED_FIELDS = [
-                            "material_description",
-                            "base_uom",
-                            "plant_code",
-                            "sloc_code",
-                            "material_group",
-                            "material_sub_group",
-                            "po_text",
-                            "spesifikasi_tambahan",
-                        ];
-
-                        for (const item of items) {
-                            if (!item.id) continue;
-
-                            const edits = {};
-                            for (const field of ALLOWED_FIELDS) {
-                                if (item[field] !== undefined) {
-                                    edits[field] = item[field];
-                                }
-                            }
-                            // Handle uom -> base_uom mapping
-                            if (item.uom !== undefined && edits.base_uom === undefined) {
-                                edits.base_uom = item.uom;
-                            }
-
-                            if (Object.keys(edits).length === 0) continue;
-
-                            const editEntries = Object.entries(edits);
-                            const setClauses = editEntries.map(
-                                ([field], i) => `${field} = $${i + 3}`
-                            );
-                            setClauses.push("updated_at = NOW()");
-
-                            await client.query(
-                                `UPDATE mat_mass_request_item
-                                 SET ${setClauses.join(", ")}
-                                 WHERE id = $1 AND mass_request_id = $2`,
-                                [item.id, massRequestId, ...editEntries.map(([_, v]) => v)]
-                            );
-                        }
-                    }
-
-                    // Reopen the reworked step (WAITING) on every item, then push
-                    // the header (Submit + reworked-step label) to all items.
-                    await updateMassItemStepRowsByLevel(
+                    const reworkItemIds = reworkItems.map(item => item.id);
+                    assertMassItemPayloadWithin(items, batchItems, {
+                        editableItemIds: reworkItemIds,
+                    });
+                    await applyMassItemFieldEdits(
                         client,
                         massRequestId,
-                        reworkStep.level,
+                        filterMassItemPayload(items, batchItems, reworkItemIds)
+                    );
+
+                    // Reopen each item's reworked step (WAITING), then send each
+                    // item back to Submit at that step.
+                    await updateMassItemStepRowsById(
+                        client,
+                        reopened.map(entry => entry.reworkStep.id),
                         { status: "WAITING", acted_at: null, remark: null }
                     );
 
-                    await client.query(
-                        `UPDATE mat_mass_request_item
-                         SET status = 'Submit',
-                             assigned_to = $2,
-                             updated_at = NOW()
-                         WHERE mass_request_id = $1`,
-                        [massRequestId, reworkStepLabel]
-                    );
+                    const itemIdsByStage = new Map();
+                    for (const { item, reworkStep } of reopened) {
+                        const label = stepLabel(reworkStep);
+                        if (!itemIdsByStage.has(label)) {
+                            itemIdsByStage.set(label, []);
+                        }
+                        itemIdsByStage.get(label).push(item.id);
+                    }
+                    for (const [label, itemIds] of itemIdsByStage) {
+                        await updateMassItemHeaders(
+                            client,
+                            massRequestId,
+                            itemIds,
+                            { status: "Submit", assignedTo: label }
+                        );
+                    }
 
                     // The requester answering a rework — the mass rework
                     // dialog now asks for it explicitly (see
@@ -8443,15 +9247,21 @@ const MaterialRequests = {
                         requestId: massRequestId,
                         eventType: REQUEST_COMMENT_EVENTS.RESUBMIT,
                         actorUserId,
-                        comment: safeComment,
+                        comment: prefixMassItemScope(
+                            safeComment,
+                            buildMassItemScopeLabel(reworkItems, batchItems)
+                        ),
                     });
                     await client.query("COMMIT");
+
+                    const reworkStepLabel = stepLabel(reopened[0].reworkStep);
 
                     return {
                         mass_request_id: Number(massRequestId),
                         rework_stage: reworkStepLabel,
                         status: "Submit",
                         assigned_to: reworkStepLabel,
+                        item_ids: reworkItemIds,
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -8597,8 +9407,13 @@ module.exports = {
     insertMassItemApprovalStepsBatch,
     allocateMassItemIds,
     insertMassRequestItems,
-    loadMassItemSteps,
-    updateMassItemStepRowsByLevel,
+    lockMassRequestAnchor,
+    loadMassBatchState,
+    buildMassBatchState,
+    resolveMassActionCohort,
+    updateMassItemStepRowsById,
+    planMassApprovalDestinations,
+    normalizeMassDecisions,
     claimMdmMassItemStep,
     getSingleRequestAttachments,
     insertSingleRequestAttachment,
@@ -8656,5 +9471,10 @@ module.exports = {
     normalizeInboxScope,
     hasGrabbedMdmStep,
     applyStepInboxVisibility,
+    MASS_BATCH_STATUS_PARTIAL,
+    pickMassRepresentativeItem,
+    applyMassItemsStateToRow,
+    applyMassStepInboxVisibility,
+    applyMassRequesterView,
     GET_ADMINISTRATOR_APPROVER_MASTERS_QUERY,
 };

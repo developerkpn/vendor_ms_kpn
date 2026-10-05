@@ -711,32 +711,39 @@ test("reject controller never forwards attachment changes to the service", async
 // independently of the others.
 // ---------------------------------------------------------------------------
 
-const MASS_APPROVE_LOCK_ROW = { id: 601, status: "Submit" };
+const MASS_APPROVE_LOCK_ROW = { id: 601, request_no: "3000000601", created_by: "REQ-01" };
 
-const MASS_APPROVE_STEPS = () => [
-  {
-    id: 8001,
-    item_id: 601,
-    level: 1,
-    kind: "MANUAL",
-    approver_user_id: "APP-01",
-    approver_name: "Approver One",
-    status: "WAITING",
-    acted_at: null,
-    remark: null,
-  },
-  {
-    id: 8002,
-    item_id: 601,
-    level: 2,
-    kind: "MANUAL",
-    approver_user_id: "APP-02",
-    approver_name: "Approver Two",
-    status: "WAITING",
-    acted_at: null,
-    remark: null,
-  },
+// Both items of the batch, waiting together at Approval 1.
+const MASS_APPROVE_ITEMS = () => [
+  { id: 601, item_no: 1, request_no: "3000000601", status: "Submit", assigned_to: "Approval 1" },
+  { id: 602, item_no: 2, request_no: "3000000602", status: "Submit", assigned_to: "Approval 1" },
 ];
+
+const MASS_APPROVE_STEPS = () =>
+  [601, 602].flatMap((itemId, index) => [
+    {
+      id: 8001 + index * 10,
+      item_id: itemId,
+      level: 1,
+      kind: "MANUAL",
+      approver_user_id: "APP-01",
+      approver_name: "Approver One",
+      status: "WAITING",
+      acted_at: null,
+      remark: null,
+    },
+    {
+      id: 8002 + index * 10,
+      item_id: itemId,
+      level: 2,
+      kind: "MANUAL",
+      approver_user_id: "APP-02",
+      approver_name: "Approver Two",
+      status: "WAITING",
+      acted_at: null,
+      remark: null,
+    },
+  ]);
 
 test(
   "approveMassRequest applies independent attachment changes to each item",
@@ -768,6 +775,11 @@ test(
 
         if (/FOR UPDATE OF s/.test(queryText)) {
           const rows = MASS_APPROVE_STEPS();
+          return { rows, rowCount: rows.length };
+        }
+
+        if (/SELECT i\.id, i\.item_no, i\.request_no, i\.status/.test(queryText)) {
+          const rows = MASS_APPROVE_ITEMS();
           return { rows, rowCount: rows.length };
         }
 

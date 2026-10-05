@@ -268,26 +268,38 @@ test("assertMassFinalCodesAreDistinct 409s naming both colliding item numbers", 
 // approveMassRequest at the Master Data step (stubbed pg client)
 // ---------------------------------------------------------------------------
 
-// Every item shares the plan, so one MDM step row stands in for the batch.
-const mdmSteps = () => [
-    {
-        id: 91,
-        item_id: 11,
+// Every item of the batch waits at the Master Data step, claimed by MDM-01.
+const mdmSteps = () =>
+    massItems.map((item, index) => ({
+        id: 91 + index,
+        item_id: item.item_id,
         level: 1,
         kind: "MDM",
         approver_user_id: "MDM-01",
         status: "WAITING",
-    },
-];
+    }));
 
-const groupCodeRows = () =>
+const batchItemRows = () =>
     massItems.map(item => ({
-        item_id: item.item_id,
+        id: item.item_id,
         item_no: item.item_no,
         request_no: item.request_no,
-        material_group_code: item.material_group_code,
-        material_sub_group_code: item.material_sub_group_code,
+        status: "Submit",
+        assigned_to: "Master Data",
+        sap_push_status: null,
     }));
+
+// loadMassItemGroupCodes is scoped to the items being approved ($2).
+const groupCodeRows = itemIds =>
+    massItems
+        .filter(item => itemIds.map(String).includes(String(item.item_id)))
+        .map(item => ({
+            item_id: item.item_id,
+            item_no: item.item_no,
+            request_no: item.request_no,
+            material_group_code: item.material_group_code,
+            material_sub_group_code: item.material_sub_group_code,
+        }));
 
 // Drives approveMassRequest against a stub client. `duplicates` injects rows for
 // the three uniqueness lookups; `queries` collects everything that was issued.
@@ -315,11 +327,18 @@ const runMassApprove = async ({
             queries.push({ queryText, params });
 
             if (/FOR UPDATE OF i/.test(queryText)) {
-                return { rows: [{ id: 11, status: "Submit" }], rowCount: 1 };
+                return {
+                    rows: [{ id: 11, request_no: "3000000011", created_by: "REQ-01" }],
+                    rowCount: 1,
+                };
             }
 
             if (/FOR UPDATE OF s/.test(queryText)) {
-                return { rows: mdmSteps(), rowCount: 1 };
+                return { rows: mdmSteps(), rowCount: 3 };
+            }
+
+            if (/SELECT i\.id, i\.item_no, i\.request_no, i\.status/.test(queryText)) {
+                return { rows: batchItemRows(), rowCount: 3 };
             }
 
             if (/mst_page_access/i.test(queryText)) {
@@ -327,7 +346,8 @@ const runMassApprove = async ({
             }
 
             if (/mig\.code AS material_group_code/i.test(queryText)) {
-                return { rows: groupCodeRows(), rowCount: 3 };
+                const rows = groupCodeRows(params[1]);
+                return { rows, rowCount: rows.length };
             }
 
             if (/FROM mat_sap_data WHERE code = ANY/i.test(queryText)) {
@@ -494,7 +514,7 @@ test("approveMassRequest 409s when a composed code is held by another batch's it
     assert.match(error.message, /3000000099/);
 });
 
-test("the mass uniqueness lookups release a CANCELled code and skip this same batch", () => {
+test("the mass uniqueness lookups release a CANCELled code and skip only the items being rewritten", () => {
     const source = materialService.assertMassFinalCodePlanIsAvailable.toString();
 
     assert.match(source, /FROM mat_sap_data WHERE code = ANY/);
@@ -502,10 +522,13 @@ test("the mass uniqueness lookups release a CANCELled code and skip this same ba
         source,
         /FROM mat_single_request[\s\S]*UPPER\(COALESCE\(status, ''\)\) <> 'CANCEL'/
     );
+    // Not the whole batch: a sibling approved earlier (Master Data decides
+    // items one by one) already holds its code and must be checked.
     assert.match(
         source,
-        /FROM mat_mass_request_item[\s\S]*mass_request_id <> \$2[\s\S]*UPPER\(COALESCE\(status, ''\)\) <> 'CANCEL'/
+        /FROM mat_mass_request_item[\s\S]*id <> ALL\(\$2::bigint\[\]\)[\s\S]*UPPER\(COALESCE\(status, ''\)\) <> 'CANCEL'/
     );
+    assert.doesNotMatch(source, /mass_request_id <> \$2/);
 });
 
 // ---------------------------------------------------------------------------

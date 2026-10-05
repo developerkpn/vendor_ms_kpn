@@ -12,7 +12,12 @@ test("approveMassRequest wraps updates in a transaction", () => {
     assert.match(source, /BEGIN/);
     assert.match(source, /COMMIT/);
     assert.match(source, /ROLLBACK/);
-    assert.match(source, /FOR UPDATE OF i/);
+    // The batch lock is the shared first-item anchor every mass action takes.
+    assert.match(source, /lockMassRequestAnchor\(client, massRequestId\)/);
+    assert.match(
+        materialService.lockMassRequestAnchor.toString(),
+        /ORDER BY i\.item_no ASC\s+LIMIT 1\s+FOR UPDATE OF i/
+    );
 });
 
 test("requestMassRequestRework wraps updates in a transaction", () => {
@@ -85,10 +90,11 @@ test("saveMassRequestRework finds the reworked step at any level", () => {
     // Pins the fix for "Mass request rework stage is missing" when the rework
     // came from a later stage: the old resolver only checked approval_1/2.
     // With step rows the reworked step is whichever one is in REWORK status,
-    // not a fixed column.
+    // not a fixed column — looked up per item, since Master Data can rework
+    // items of one batch separately.
     assert.match(
         source,
-        /firstItemSteps\.find\([\s\S]*normalizeStepStatus\(step\.status\) === "REWORK"/,
+        /item\.steps\.find\([\s\S]*normalizeStepStatus\(step\.status\) === "REWORK"/,
         "saveMassRequestRework must pick the step in REWORK status from all steps"
     );
     assert.doesNotMatch(source, /approval_[123]_status/);

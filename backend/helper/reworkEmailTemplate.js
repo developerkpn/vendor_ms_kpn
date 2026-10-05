@@ -205,11 +205,19 @@ const buildSingleReworkEmailTemplate = (row = {}, { approverName } = {}) => {
  * @param {object} [options]
  * @param {string} [options.approverName] fullname of the picked approver, when
  *                                        the dialog asked about one
+ * @param {object} [options.anchorItem]   the batch's first item, when `items`
+ *                                        lists only some of the batch (Master
+ *                                        Data reworking part of it): the thread
+ *                                        is keyed on the batch, not on the
+ *                                        first item that happens to be listed
  * @returns {{subject: string, body: string, requestNo: string}}
  */
-const buildMassReworkEmailTemplate = (items = [], { approverName } = {}) => {
+const buildMassReworkEmailTemplate = (
+    items = [],
+    { approverName, anchorItem } = {}
+) => {
     const rows = Array.isArray(items) ? items : [];
-    const firstItem = rows[0] ?? {};
+    const firstItem = anchorItem ?? rows[0] ?? {};
     const requestNo = asText(firstItem.request_no);
 
     const locations = new Set(

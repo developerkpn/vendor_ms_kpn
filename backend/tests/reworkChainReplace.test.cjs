@@ -776,8 +776,22 @@ test("requestSingleRequestRework without a chain still returns an APP notify blo
 });
 
 // ---------------------------------------------------------------------------
-// Mass request: same replacement, fanned out over every item.
+// Mass request: same replacement, fanned out over every item waiting at
+// Master Data.
 // ---------------------------------------------------------------------------
+
+// Both items of the batch sit on the same chain, parked on Master Data. Step
+// ids are per item (item 9001: 8101..8103, item 9002: 9101..9103).
+const massChainItemIds = [9001, 9002];
+const massChainSteps = () =>
+    massChainItemIds.flatMap((itemId, index) =>
+        chainSteps().map(step => ({
+            ...step,
+            id: step.id + index * 1000,
+            item_id: itemId,
+            request_id: undefined,
+        }))
+    );
 
 const connectMassChainStub = ({
     queryLog,
@@ -786,11 +800,7 @@ const connectMassChainStub = ({
     stepUpdates,
     headerUpdates,
 }) => {
-    const massSteps = chainSteps().map(step => ({
-        ...step,
-        item_id: 9001,
-        request_id: undefined,
-    }));
+    const massSteps = massChainSteps();
 
     return async () => ({
         query: async (queryText, params = []) => {
@@ -805,14 +815,24 @@ const connectMassChainStub = ({
                     rows: [
                         {
                             id: 9001,
-                            status: "Submit",
                             created_by: "REQ-01",
                             request_no: "3000000012",
-                            // Parked on Master Data; the EMAIL path hands this
-                            // value straight back.
-                            assigned_to: "Master Data",
                         },
                     ],
+                };
+            }
+
+            if (/SELECT i\.id, i\.item_no, i\.request_no, i\.status/.test(queryText)) {
+                return {
+                    rows: massChainItemIds.map((id, index) => ({
+                        id,
+                        item_no: index + 1,
+                        request_no: String(3000000012 + index),
+                        status: "Submit",
+                        // Parked on Master Data; the EMAIL path hands this
+                        // value straight back.
+                        assigned_to: "Master Data",
+                    })),
                 };
             }
 
@@ -830,13 +850,6 @@ const connectMassChainStub = ({
                     email: `${String(id).toLowerCase()}@kpn-corp.com`,
                 }));
                 return { rows, rowCount: rows.length };
-            }
-
-            if (/SELECT i\.id\s+FROM mat_mass_request_item i/.test(queryText)) {
-                return {
-                    rows: [{ id: 9001 }, { id: 9002 }],
-                    rowCount: 2,
-                };
             }
 
             if (
@@ -920,12 +933,13 @@ test("requestMassRequestRework replaces the chain on every item of the batch", a
         assert.equal(result.emailOnly, undefined);
         assert.equal(sendCalls, 0);
 
-        // One batch-wide DELETE, one batch-wide Master Data renumber, then the
-        // new chain inserted per item (2 items x 2 levels).
+        // One DELETE over the reworked items, one Master Data renumber of
+        // their MDM step rows, then the new chain inserted per item (2 items x
+        // 2 levels).
         assert.equal(recorder.stepDeletes.length, 1);
-        assert.deepEqual(recorder.stepDeletes[0].params, [900, "MANUAL"]);
+        assert.deepEqual(recorder.stepDeletes[0].params, [[9001, 9002], "MANUAL"]);
         assert.equal(recorder.stepUpdates.length, 1);
-        assert.deepEqual(recorder.stepUpdates[0].params.slice(0, 2), [900, 3]);
+        assert.deepEqual(recorder.stepUpdates[0].params.slice(0, 2), [[8103, 9103], 3]);
         assert.doesNotMatch(
             recorder.stepUpdates[0].queryText,
             /approver_user_id|claimed_at/

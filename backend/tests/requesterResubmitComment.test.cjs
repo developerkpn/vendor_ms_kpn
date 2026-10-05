@@ -311,7 +311,15 @@ const connectMassReworkStub = ({ commentInserts = [] } = {}) =>
             }
 
             if (/FOR UPDATE OF i/.test(queryText)) {
-                return { rows: [{ id: 501, status: "REWORK", assigned_to: "Requester" }] };
+                return { rows: [{ id: 501, request_no: "3000000501", created_by: "REQ-01" }] };
+            }
+
+            if (/SELECT i\.id, i\.item_no, i\.request_no, i\.status/.test(queryText)) {
+                return {
+                    rows: [
+                        { id: 501, item_no: 1, request_no: "3000000501", status: "Rework", assigned_to: "Requester" },
+                    ],
+                };
             }
 
             if (/FOR UPDATE OF s/.test(queryText)) {
