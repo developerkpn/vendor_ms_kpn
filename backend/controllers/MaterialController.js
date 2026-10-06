@@ -2738,6 +2738,12 @@ const MaterialController = {
                         message: `rows must hold 1 to ${AI_MATCH_MAX_PREVIEW_LINES} lines`,
                     });
                 }
+                // The other lines of the same unsaved form, so a part entered
+                // twice in one batch is caught before anything is saved. Same
+                // shape as rows; a line is never its own sibling.
+                const siblingRows = (
+                    Array.isArray(req.body?.siblings) ? req.body.siblings : []
+                ).slice(0, AI_MATCH_MAX_PREVIEW_LINES);
                 lines = rows.map(row => ({
                     key: row?.rowIndex ?? null,
                     query: materialAiMatchService.buildMassItemQuery({
@@ -2745,6 +2751,20 @@ const MaterialController = {
                         po_text: row?.poText,
                         spesifikasi_tambahan: row?.spesifikasiTambahan,
                     }),
+                    siblings: siblingRows
+                        .filter(sibling => sibling?.rowIndex !== row?.rowIndex)
+                        .map(sibling => {
+                            const query = materialAiMatchService.buildMassItemQuery({
+                                material_description: sibling?.description,
+                                po_text: sibling?.poText,
+                                spesifikasi_tambahan: sibling?.spesifikasiTambahan,
+                            });
+                            return {
+                                ref: `Baris ${Number(sibling?.rowIndex) + 1}`,
+                                name: query.name,
+                                desc: query.desc,
+                            };
+                        }),
                 }));
             } else {
                 return res.status(400).json({

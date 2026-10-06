@@ -37,6 +37,9 @@ const {
     AI_MATCH_MAX_TOP_K,
     AI_MATCH_MAX_ERROR_LENGTH,
     AI_MATCH_MAX_PREVIEW_LINES,
+    AI_MATCH_SOURCE,
+    AI_MATCH_MAX_CANDIDATES,
+    AI_MATCH_CLOSED_REQUEST_STATUSES,
 } = require("../constants/materialAiMatch");
 const { SINGLE_REQUEST_TICKET_TYPES } = require("../constants/material");
 
@@ -146,14 +149,38 @@ function normalizeRecommendations(list) {
         // Kept verbatim: the labels the dialog maps are the AI side's exact
         // strings, down to the parentheses.
         matchType: item && item.match_type ? String(item.match_type) : "TEXT",
+        ...describeSource(item),
     }));
+}
+
+/**
+ * Where a recommendation comes from. A "request" one is not a material yet:
+ * its code is a request number, and the dialogs must not offer it as the
+ * existing material to use. A retired one is a material SAP has flagged for
+ * deletion or renamed "(NOT USE)": the same part, but not one to reuse as is.
+ */
+function describeSource(item) {
+    const source =
+        item && item.source === AI_MATCH_SOURCE.REQUEST
+            ? AI_MATCH_SOURCE.REQUEST
+            : AI_MATCH_SOURCE.CATALOG;
+    return {
+        source,
+        retired: Boolean(item && item.retired),
+        requestStatus:
+            source === AI_MATCH_SOURCE.REQUEST
+                ? normalizeText(
+                      item && (item.request_status ?? item.requestStatus)
+                  ).slice(0, 40)
+                : "",
+    };
 }
 
 /**
  * POST /recommend. Errors propagate: the caller maps them to a stored FAILED
  * row, which is where the description belongs.
  */
-async function callRecommender({ code, name, desc, topK }) {
+async function callRecommender({ code, name, desc, topK, candidates = [] }) {
     const config = module.exports.getConfig();
     const queryName = normalizeText(name);
     if (!queryName) {
@@ -168,6 +195,14 @@ async function callRecommender({ code, name, desc, topK }) {
             name: queryName,
             desc: normalizeText(desc),
             top_k: topK || config.topK,
+            candidates: (Array.isArray(candidates) ? candidates : [])
+                .slice(0, AI_MATCH_MAX_CANDIDATES)
+                .map(candidate => ({
+                    ref: normalizeText(candidate.ref),
+                    name: normalizeText(candidate.name),
+                    desc: normalizeText(candidate.desc),
+                    status: normalizeText(candidate.status),
+                })),
         },
         { timeout: config.timeoutMs }
     );
@@ -213,13 +248,18 @@ function describeAiError(error) {
  * rest carry on; lines are called one after another for the same reason the
  * mass run is (a single-process model server).
  *
- * @param {Array<{key: string|number, query: {code?: string, name: string, desc?: string}}>} lines
+ * Each line may carry `siblings`: the other lines of the same unsaved form
+ * ({ref, name, desc}), so a part entered twice in one batch is caught before
+ * anything is saved. Open requests already in the database are added to them.
+ *
+ * @param {Array<{key: string|number, query: {code?: string, name: string, desc?: string}, siblings?: Array}>} lines
  */
 async function previewMatches(lines) {
     const config = module.exports.getConfig();
     const list = Array.isArray(lines)
         ? lines.slice(0, AI_MATCH_MAX_PREVIEW_LINES)
         : [];
+    const inFlight = list.length ? await loadCandidatesSafely() : [];
 
     const results = [];
     for (const line of list) {
@@ -248,9 +288,18 @@ async function previewMatches(lines) {
         }
 
         try {
+            const siblings = (Array.isArray(line.siblings) ? line.siblings : [])
+                .map(sibling => ({
+                    ref: normalizeText(sibling && sibling.ref),
+                    name: normalizeText(sibling && sibling.name),
+                    desc: normalizeText(sibling && sibling.desc),
+                    status: "this request",
+                }))
+                .filter(sibling => sibling.name);
             const data = await module.exports.callRecommender({
                 ...query,
                 topK: config.topK,
+                candidates: [...siblings, ...inFlight],
             });
             const recommendations = module.exports.normalizeRecommendations(
                 data && data.recommendations
@@ -310,6 +359,7 @@ function sanitizeRequesterReview(raw) {
             name: normalizeText(item && item.name).slice(0, 300),
             similarity: roundSimilarity(item && item.similarity),
             matchType: normalizeText(item && item.matchType).slice(0, 60) || "TEXT",
+            ...describeSource(item),
         })),
     };
 }
@@ -430,6 +480,82 @@ async function loadMassRequestItems(massRequestId) {
         );
         return rows;
     });
+}
+
+/**
+ * Create requests that are not SAP materials yet: still in approval, or
+ * approved but not in mat_sap_data until the next daily SAP sync. Sent to the
+ * AI with every line so that two requests for the same new part - on the same
+ * day, or in the same batch - see each other. Newest first, capped.
+ *
+ * Each carries kind + id so a run can leave out the line it is matching.
+ */
+async function loadInFlightCandidates() {
+    return DBClientWrapper(async client => {
+        const { rows } = await client.query(
+            `SELECT kind, id, ref, name, descr, status FROM (
+                SELECT 'SINGLE' AS kind, s.id, s.request_no AS ref,
+                    s.material_description AS name,
+                    concat_ws(' ', s.long_text_1, s.long_text_2, s.long_text_3) AS descr,
+                    s.status, s.final_code, s.created_at
+                FROM mat_single_request s
+                WHERE s.ticket_type = $1
+                UNION ALL
+                SELECT 'MASS', i.id, i.request_no, i.material_description,
+                    concat_ws(' ', i.po_text, i.spesifikasi_tambahan),
+                    i.status, i.final_code, i.created_at
+                FROM mat_mass_request_item i
+                WHERE i.ticket_type = $1
+            ) r
+            WHERE upper(btrim(r.status)) <> ALL($2::text[])
+              AND btrim(coalesce(r.name, '')) <> ''
+              AND (upper(btrim(r.status)) <> 'DONE'
+                   OR NOT EXISTS (
+                       SELECT 1 FROM mat_sap_data m
+                       WHERE m.code = btrim(r.final_code)))
+            ORDER BY r.created_at DESC
+            LIMIT $3`,
+            [
+                SINGLE_REQUEST_TICKET_TYPES.CREATE,
+                AI_MATCH_CLOSED_REQUEST_STATUSES,
+                AI_MATCH_MAX_CANDIDATES,
+            ]
+        );
+        return rows.map(row => ({
+            kind: row.kind,
+            id: row.id,
+            ref: normalizeText(row.ref),
+            name: normalizeText(row.name),
+            desc: normalizeText(row.descr),
+            status:
+                normalizeText(row.status).toUpperCase() === "DONE"
+                    ? "DONE, not in SAP yet"
+                    : normalizeText(row.status),
+        }));
+    });
+}
+
+/**
+ * The in-flight requests, or none: they make a match better, never possible,
+ * so failing to load them must not fail the match.
+ */
+async function loadCandidatesSafely() {
+    try {
+        return await module.exports.loadInFlightCandidates();
+    } catch (error) {
+        console.error(
+            "[AI-MATCH] could not load in-flight requests, matching without them:",
+            error && error.message
+        );
+        return [];
+    }
+}
+
+/** The candidates for one line: everything but the line itself. */
+function candidatesExcluding(candidates, kind, id) {
+    return (candidates || []).filter(
+        candidate => !(candidate.kind === kind && String(candidate.id) === String(id))
+    );
 }
 
 /**
@@ -627,6 +753,11 @@ async function runSingleRequestMatch(requestId) {
         }
 
         const query = module.exports.buildSingleRequestQuery(row);
+        const candidates = candidatesExcluding(
+            await loadCandidatesSafely(),
+            AI_MATCH_KIND.SINGLE,
+            row.id
+        );
         await module.exports.upsertMatch({
             requestKind: AI_MATCH_KIND.SINGLE,
             requestId: row.id,
@@ -638,6 +769,7 @@ async function runSingleRequestMatch(requestId) {
             const data = await module.exports.callRecommender({
                 ...query,
                 topK: config.topK,
+                candidates,
             });
             const recommendations = module.exports.normalizeRecommendations(
                 data && data.recommendations
@@ -707,6 +839,10 @@ async function runMassRequestMatch(massRequestId) {
             item,
             query: module.exports.buildMassItemQuery(item),
         }));
+        // Loaded once for the batch: it already holds this batch's other lines
+        // (they are open requests too), which is how an item repeated within
+        // one mass request is caught.
+        const inFlight = await loadCandidatesSafely();
 
         for (const { item, query } of queries) {
             await module.exports.upsertMatch({
@@ -724,6 +860,11 @@ async function runMassRequestMatch(massRequestId) {
                 const data = await module.exports.callRecommender({
                     ...query,
                     topK: config.topK,
+                    candidates: candidatesExcluding(
+                        inFlight,
+                        AI_MATCH_KIND.MASS,
+                        item.id
+                    ),
                 });
                 const recommendations = module.exports.normalizeRecommendations(
                     data && data.recommendations
@@ -860,6 +1001,7 @@ module.exports = {
     recordRequesterReview,
     loadSingleRequestRow,
     loadMassRequestItems,
+    loadInFlightCandidates,
     upsertMatch,
     matchRowToDto,
     runSingleRequestMatch,

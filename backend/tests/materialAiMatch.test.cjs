@@ -6,11 +6,13 @@ const path = require("path");
 const service = require("../services/materialAiMatchService");
 
 // Nothing in this file may reach a database or the recommender. Every run test
-// replaces the four I/O seams by assignment — which is why the service calls
-// itself through module.exports — and puts them back afterwards.
+// replaces the I/O seams by assignment — which is why the service calls itself
+// through module.exports — and puts them back afterwards. The in-flight
+// request lookup answers "none open" unless a test says otherwise.
 const IO_SEAMS = [
   "loadSingleRequestRow",
   "loadMassRequestItems",
+  "loadInFlightCandidates",
   "upsertMatch",
   "callRecommender",
   "runSingleRequestMatch",
@@ -22,7 +24,7 @@ function stubService(stubs) {
   for (const name of IO_SEAMS) {
     original[name] = service[name];
   }
-  Object.assign(service, stubs);
+  Object.assign(service, { loadInFlightCandidates: async () => [] }, stubs);
   return () => Object.assign(service, original);
 }
 
@@ -230,6 +232,9 @@ test("normalizeRecommendations ranks in input order and rounds to four decimals"
     name: "P/N 31755122 INSERT EXHAUST",
     similarity: 0.9731,
     matchType: "EXACT (code + name match)",
+    source: "catalog",
+    retired: false,
+    requestStatus: "",
   });
   assert.equal(recs[1].rank, 2);
   assert.equal(recs[1].similarity, 0.8125);
@@ -868,6 +873,9 @@ test("sanitizeRequesterReview only accepts an explicit confirmation and caps the
     name: "X".repeat(300),
     similarity: 0.1235,
     matchType: "TEXT",
+    source: "catalog",
+    retired: false,
+    requestStatus: "",
   });
 });
 
@@ -985,7 +993,7 @@ test("previewAiMatch builds mass queries the same way the stored run does", asyn
         res
       )
     );
-    assert.deepEqual(received, [{ key: 4, query: { code: "", name: "PUMP LIFT", desc: "50HZ 3 PHASE" } }]);
+    assert.deepEqual(received, [{ key: 4, query: { code: "", name: "PUMP LIFT", desc: "50HZ 3 PHASE" }, siblings: [] }]);
     assert.deepEqual(res.body, { success: true, enabled: true, data: [{ key: 4, status: "DONE" }] });
   } finally {
     service.previewMatches = original;
@@ -1055,4 +1063,174 @@ test("single and mass submit record the requester's confirmation after the write
   const MaterialController = require("../controllers/MaterialController");
   assert.ok(MaterialController.createSingleRequest.toString().includes("recordAiMatchReviewSafely"));
   assert.ok(MaterialController.createMassRequest.toString().includes("recordMassAiMatchReviewsSafely"));
+});
+
+// ---------------------------------------------------------------------------
+// Requests not in SAP yet. Two requests for the same new part — on the same
+// day, or as two lines of one batch — must see each other, so every line goes
+// to the AI with the open requests (minus itself) as candidates.
+// ---------------------------------------------------------------------------
+
+test("normalizeRecommendations keeps where a recommendation comes from", () => {
+  const [request, retired] = service.normalizeRecommendations([
+    { code: "1000000071", name: "P/N 7X-2042 SEAL", similarity: 0.98, match_type: "PART NUMBER", source: "request", request_status: " Submit " },
+    { code: "937.111.I62", name: "(NOT USE) P/N X HOSE", similarity: 0.9, match_type: "TEXT", source: "catalog", retired: true, request_status: "ignored" },
+  ]);
+  assert.equal(request.source, "request");
+  assert.equal(request.requestStatus, "Submit");
+  assert.equal(request.retired, false);
+  assert.equal(retired.source, "catalog");
+  assert.equal(retired.retired, true);
+  assert.equal(retired.requestStatus, "");
+  assert.equal(service.normalizeRecommendations([{ code: "1", source: "elsewhere" }])[0].source, "catalog");
+});
+
+test("runSingleRequestMatch sends the open requests except itself", async () => {
+  let sent = null;
+  const restore = stubService({
+    loadSingleRequestRow: async () => CREATE_ROW,
+    loadInFlightCandidates: async () => [
+      { kind: "SINGLE", id: 501, ref: "1000000001", name: "PUMP LIFT", desc: "", status: "Submit" },
+      { kind: "SINGLE", id: 502, ref: "1000000002", name: "PUMP LIFT 50HZ", desc: "", status: "Submit" },
+      { kind: "MASS", id: 501, ref: "2000000001", name: "PUMP", desc: "", status: "Submit" },
+    ],
+    callRecommender: async payload => {
+      sent = payload;
+      return AI_RESPONSE;
+    },
+    upsertMatch: async args => ({ id: 9, request_kind: args.requestKind, status: args.status }),
+  });
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, () => service.runSingleRequestMatch(501));
+    assert.deepEqual(sent.candidates.map(c => c.ref), ["1000000002", "2000000001"]);
+  } finally {
+    restore();
+  }
+});
+
+test("runSingleRequestMatch still matches when the open requests cannot be loaded", async () => {
+  let sent = null;
+  const restore = stubService({
+    loadSingleRequestRow: async () => CREATE_ROW,
+    loadInFlightCandidates: async () => {
+      throw new Error("relation does not exist");
+    },
+    callRecommender: async payload => {
+      sent = payload;
+      return AI_RESPONSE;
+    },
+    upsertMatch: async args => ({ id: 9, request_kind: args.requestKind, status: args.status }),
+  });
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, () => service.runSingleRequestMatch(501));
+    assert.deepEqual(sent.candidates, []);
+  } finally {
+    restore();
+  }
+});
+
+test("runMassRequestMatch loads the open requests once and leaves each item out of its own list", async () => {
+  let loads = 0;
+  const sent = [];
+  const restore = stubService({
+    loadMassRequestItems: async () => [
+      { id: 11, item_no: 1, material_description: "P/N 41C3478 RIM AS" },
+      { id: 12, item_no: 2, material_description: "P/N 41C3478 RIM AS ASSY" },
+    ],
+    loadInFlightCandidates: async () => {
+      loads += 1;
+      return [
+        { kind: "MASS", id: 11, ref: "2000000009-1", name: "P/N 41C3478 RIM AS", desc: "", status: "Submit" },
+        { kind: "MASS", id: 12, ref: "2000000009-2", name: "P/N 41C3478 RIM AS ASSY", desc: "", status: "Submit" },
+      ];
+    },
+    callRecommender: async payload => {
+      sent.push(payload.candidates.map(c => c.ref));
+      return AI_RESPONSE;
+    },
+    upsertMatch: async args => ({ id: 1, request_kind: args.requestKind, status: args.status }),
+  });
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, () => service.runMassRequestMatch(7));
+    assert.equal(loads, 1);
+    assert.deepEqual(sent, [["2000000009-2"], ["2000000009-1"]]);
+  } finally {
+    restore();
+  }
+});
+
+test("previewMatches sends the other lines of the form before the open requests", async () => {
+  let sent = null;
+  const restore = stubService({
+    loadInFlightCandidates: async () => [{ kind: "SINGLE", id: 1, ref: "1000000071", name: "SEAL", desc: "", status: "Submit" }],
+    callRecommender: async payload => {
+      sent = payload;
+      return AI_RESPONSE;
+    },
+  });
+  try {
+    await service.previewMatches([
+      {
+        key: 0,
+        query: { code: "", name: "P/N 41C3478 RIM AS", desc: "" },
+        siblings: [{ ref: "Baris 2", name: " P/N 41C3478  RIM ", desc: "" }, { ref: "Baris 3", name: "", desc: "" }],
+      },
+    ]);
+    assert.deepEqual(
+      sent.candidates.map(c => [c.ref, c.name, c.status]),
+      [["Baris 2", "P/N 41C3478 RIM", "this request"], ["1000000071", "SEAL", "Submit"]]
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("previewAiMatch passes the other rows of a mass form as siblings, never the row itself", async () => {
+  const MaterialController = require("../controllers/MaterialController");
+  let received;
+  const original = service.previewMatches;
+  service.previewMatches = async lines => {
+    received = lines;
+    return [];
+  };
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, () =>
+      MaterialController.previewAiMatch(
+        {
+          body: {
+            kind: "mass",
+            rows: [{ rowIndex: 0, description: "PUMP LIFT", poText: "", spesifikasiTambahan: "" }],
+            siblings: [
+              { rowIndex: 0, description: "PUMP LIFT" },
+              { rowIndex: 2, description: "PUMP LIFT 50HZ", poText: "3 PHASE" },
+            ],
+          },
+        },
+        fakeResponse()
+      )
+    );
+    assert.deepEqual(received[0].siblings, [{ ref: "Baris 3", name: "PUMP LIFT 50HZ", desc: "3 PHASE" }]);
+  } finally {
+    service.previewMatches = original;
+  }
+});
+
+test("callRecommender sends the candidates trimmed and capped", async () => {
+  const axios = require("axios");
+  const originalPost = axios.post;
+  let body = null;
+  axios.post = async (url, payload) => {
+    body = payload;
+    return { data: AI_RESPONSE };
+  };
+  try {
+    await service.callRecommender({
+      name: "PUMP",
+      candidates: Array.from({ length: 400 }, (_, i) => ({ ref: ` R${i} `, name: ` N ${i} `, desc: null, status: "Submit", kind: "SINGLE", id: i })),
+    });
+    assert.equal(body.candidates.length, 300);
+    assert.deepEqual(body.candidates[0], { ref: "R0", name: "N 0", desc: "", status: "Submit" });
+  } finally {
+    axios.post = originalPost;
+  }
 });
