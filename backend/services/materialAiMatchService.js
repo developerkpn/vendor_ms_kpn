@@ -171,7 +171,7 @@ function describeSource(item) {
             source === AI_MATCH_SOURCE.REQUEST
                 ? normalizeText(
                       item && (item.request_status ?? item.requestStatus)
-                  ).slice(0, 40)
+                  ).slice(0, 80)
                 : "",
     };
 }
@@ -493,18 +493,21 @@ async function loadMassRequestItems(massRequestId) {
 async function loadInFlightCandidates() {
     return DBClientWrapper(async client => {
         const { rows } = await client.query(
-            `SELECT kind, id, ref, name, descr, status FROM (
+            `SELECT kind, id, ref, name, descr, status, batch_no, item_no FROM (
                 SELECT 'SINGLE' AS kind, s.id, s.request_no AS ref,
                     s.material_description AS name,
                     concat_ws(' ', s.long_text_1, s.long_text_2, s.long_text_3) AS descr,
-                    s.status, s.final_code, s.created_at
+                    s.status, s.final_code, s.created_at,
+                    NULL AS batch_no, NULL::smallint AS item_no
                 FROM mat_single_request s
                 WHERE s.ticket_type = $1
                 UNION ALL
                 SELECT 'MASS', i.id, i.request_no, i.material_description,
                     concat_ws(' ', i.po_text, i.spesifikasi_tambahan),
-                    i.status, i.final_code, i.created_at
+                    i.status, i.final_code, i.created_at,
+                    m.mass_request_no, i.item_no
                 FROM mat_mass_request_item i
+                JOIN mat_mass_request m ON m.id = i.mass_request_id
                 WHERE i.ticket_type = $1
             ) r
             WHERE upper(btrim(r.status)) <> ALL($2::text[])
@@ -527,12 +530,28 @@ async function loadInFlightCandidates() {
             ref: normalizeText(row.ref),
             name: normalizeText(row.name),
             desc: normalizeText(row.descr),
-            status:
-                normalizeText(row.status).toUpperCase() === "DONE"
-                    ? "DONE, not in SAP yet"
-                    : normalizeText(row.status),
+            status: describeInFlightStatus(row),
         }));
     });
+}
+
+/**
+ * The status line shown under a request's number. A mass item's own number
+ * (3...) is not what people know the request by: they find it by its Mass
+ * Request ticket (2...), so that and the item's position lead.
+ */
+function describeInFlightStatus(row) {
+    const status =
+        normalizeText(row && row.status).toUpperCase() === "DONE"
+            ? "DONE, not in SAP yet"
+            : normalizeText(row && row.status);
+    const batchNo = normalizeText(row && row.batch_no);
+    if (!batchNo) {
+        return status;
+    }
+    const itemNo = Number(row && row.item_no);
+    const batch = `Mass ${batchNo}${Number.isFinite(itemNo) && itemNo > 0 ? ` #${itemNo}` : ""}`;
+    return status ? `${batch} · ${status}` : batch;
 }
 
 /**
@@ -1002,6 +1021,7 @@ module.exports = {
     loadSingleRequestRow,
     loadMassRequestItems,
     loadInFlightCandidates,
+    describeInFlightStatus,
     upsertMatch,
     matchRowToDto,
     runSingleRequestMatch,

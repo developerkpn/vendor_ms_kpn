@@ -1234,3 +1234,21 @@ test("callRecommender sends the candidates trimmed and capped", async () => {
     axios.post = originalPost;
   }
 });
+
+test("a mass item is shown with its Mass Request ticket, not only its item number", () => {
+  assert.equal(
+    service.describeInFlightStatus({ status: "Submit", batch_no: " 2000000008 ", item_no: 1 }),
+    "Mass 2000000008 #1 · Submit"
+  );
+  assert.equal(
+    service.describeInFlightStatus({ status: "done", batch_no: "2000000008", item_no: 3 }),
+    "Mass 2000000008 #3 · DONE, not in SAP yet"
+  );
+  assert.equal(service.describeInFlightStatus({ status: "Rework", batch_no: null, item_no: null }), "Rework");
+  assert.equal(
+    service.normalizeRecommendations([
+      { code: "3000000032", source: "request", request_status: "Mass 2000000008 #1 · DONE, not in SAP yet" },
+    ])[0].requestStatus,
+    "Mass 2000000008 #1 · DONE, not in SAP yet"
+  );
+});
