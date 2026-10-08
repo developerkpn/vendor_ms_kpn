@@ -25,6 +25,12 @@ const materialSapStagingService = require("./backend/services/materialSapStaging
 const materialService = require("./backend/services/materialService");
 const reworkEmailInboundService = require("./backend/services/reworkEmailInboundService");
 const aiValidationService = require("./backend/services/aiValidationService");
+const {
+    ensureVendorSubmissionOutboxSchema,
+} = require("./backend/config/ensureVendorSubmissionOutboxSchema");
+const {
+    processPendingVendorSubmissions,
+} = require("./backend/services/vendorSubmissionOutboxService");
 const cron = require("node-cron");
 const moment = require("moment-timezone");
 
@@ -233,6 +239,21 @@ cron.schedule(
 
 async function startServer() {
     await ensureSingleRequestSchema(db);
+    await ensureVendorSubmissionOutboxSchema(db);
+    cron.schedule(
+        "* * * * *",
+        async () => {
+            try {
+                const result = await processPendingVendorSubmissions();
+                if (result.succeeded || result.retried || result.failed) {
+                    console.log("[CRON] Vendor submission outbox:", result);
+                }
+            } catch (error) {
+                console.error("[CRON] Vendor submission outbox failed:", error);
+            }
+        },
+        { noOverlap: true }
+    );
     // Materials admins besides ADMIN (MATERIAL_ADMIN group), kept in a cache.
     materialService.startMaterialAdminRefresh();
 
@@ -242,6 +263,6 @@ async function startServer() {
 }
 
 startServer().catch(error => {
-    console.error("Failed to ensure single request schema:", error);
+    console.error("Failed to initialize server schema:", error);
     process.exit(1);
 });

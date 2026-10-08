@@ -13,6 +13,9 @@ const tp = mailer.createTransport({
     host: process.env.SMTP_HOST,
     secure: true,
     port: 465,
+    connectionTimeout: 30000,
+    greetingTimeout: 30000,
+    socketTimeout: 60000,
     tls: {
         ciphers: "SSLv3",
         rejectUnauthorized: false,

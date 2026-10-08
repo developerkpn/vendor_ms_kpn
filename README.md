@@ -36,6 +36,42 @@ To serve the UI as well, build the frontend first: in the sibling `ui_vms`
 checkout, `npx vite build --mode production` writes into this repo's
 `public/build`.
 
+Vendor completion commits its vendor data, final ticket status, and durable
+external-work jobs together. A worker runs every minute to upload approved
+vendors to the SAP bridge, then send verification, tax, and completion emails.
+An unavailable bridge or failed email stays in `vendor_submission_outbox` for
+retry; it cannot roll back the completed MDM approval. Each job gets up to 12
+attempts, starting one minute apart with exponential backoff capped at one hour.
+Email delivery is at least once: a process crash after SMTP accepts an email but
+before the worker records success can result in a repeated notification.
+
+The server ensures the queue table on startup. Its standalone migration is
+`backend/migration/20261008_vendor_submission_outbox.sql` and can also be applied
+before deployment. Oracle uploads serialize by vendor ID and reuse a matching
+existing bridge row, preserving SAP status and avoiding repeated bank/file inserts.
+
+Inspect failed jobs with:
+
+```sql
+SELECT id, ticket_token, ven_id, job_type, status, attempts, last_error
+FROM vendor_submission_outbox
+WHERE status = 'FAILED'
+ORDER BY id;
+```
+
+After addressing the underlying problem (for example an unavailable attachment),
+requeue a specific failed job by ID:
+
+```sql
+UPDATE vendor_submission_outbox
+SET status = 'PENDING', attempts = 0, next_attempt_at = now(),
+    locked_until = NULL, claim_token = NULL, last_error = NULL
+WHERE id = :job_id AND status = 'FAILED';
+```
+
+Emails depend on their ticket's successful bridge upload. If that upload exhausts
+its retries, its emails wait until the upload job is repaired and requeued.
+
 Background jobs start with the server: SAP staging push, rework e-mail inbox
 poll, SAP sync, AI validation sweep. A local copy pointed at the shared dev
 database runs them too, so switch off the ones you don't need

@@ -8,9 +8,11 @@ const { Client } = require("pg");
 const EmailModel = require("./EmailModelv2");
 const jwt = require("jsonwebtoken");
 const Emailer = require("./EmailModel");
-const Vendor = require("./VendorModel");
 const Ticket = require("./TicketModel");
 const CGApi = require("./CGApiModel");
+const {
+    enqueueVendorSubmissionJob,
+} = require("../services/vendorSubmissionOutboxService");
 
 const ApprovalModel = {};
 
@@ -495,6 +497,7 @@ ApprovalModel.EndApproval = async (client, ticket_id, user_id) => {
             approval_pos: "END",
             is_active: false,
             updated_by: user_id,
+            updated_at: new Date(),
         };
         const [upVal, upQue] = Crud.updateItem(
             "ticket",
@@ -544,7 +547,7 @@ ApprovalModel.EndApproval = async (client, ticket_id, user_id) => {
         cc.push(additionalcc);
         let config = {
             to,
-            cc: cc.join(","),
+            cc: cc.filter(Boolean).join(","),
         };
         // console.log(config);
         // throw new Error("error");
@@ -567,17 +570,31 @@ ApprovalModel.EndApproval = async (client, ticket_id, user_id) => {
     
                 `);
             const link = `${hostname[0].hostname}/dashboard/vendorverif`;
-            await Emailer.RequestVerificator(
-                {
-                    title: ven_detail.title,
-                    local_ovs: ven_detail.local_ovs,
-                    ven_name: ven_detail.name_1,
+            const job = { ticketToken: ticket_id, venId: ven_detail.ven_id };
+            await enqueueVendorSubmissionJob(client, {
+                ...job,
+                jobType: "SAP_UPLOAD",
+            });
+            await enqueueVendorSubmissionJob(client, {
+                ...job,
+                jobType: "VERIFICATION_EMAIL",
+                dependsOnType: "SAP_UPLOAD",
+                payload: {
+                    detail: {
+                        title: ven_detail.title,
+                        local_ovs: ven_detail.local_ovs,
+                        ven_name: ven_detail.name_1,
+                    },
+                    link,
+                    to: verificator[0].email,
                 },
-                link,
-                verificator[0].email
-            );
-            await Vendor.UploadStaging(ven_detail.ven_id, client);
-            await Emailer.NotifPajak(ven_detail);
+            });
+            await enqueueVendorSubmissionJob(client, {
+                ...job,
+                jobType: "TAX_EMAIL",
+                dependsOnType: "SAP_UPLOAD",
+                payload: { detail: ven_detail },
+            });
         } else {
             const result = await CGApi.SubmitToTiptop(
                 client,
@@ -588,7 +605,13 @@ ApprovalModel.EndApproval = async (client, ticket_id, user_id) => {
             vendor_name = result.name;
         }
         //email confirm selesai
-        await EmailModel.EndTicket(vendor_name, vendor_code, config);
+        await enqueueVendorSubmissionJob(client, {
+            ticketToken: ticket_id,
+            venId: ven_detail.ven_id,
+            jobType: "COMPLETION_EMAIL",
+            dependsOnType: ven_detail.bu_id !== "CG" ? "SAP_UPLOAD" : null,
+            payload: { vendorName: vendor_name, vendorCode: vendor_code, config },
+        });
         return {
             message: `Ticket ${ven_detail.ticket_num} is Done`,
             ...ven_detail,

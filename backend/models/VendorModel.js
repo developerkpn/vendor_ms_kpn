@@ -1407,8 +1407,24 @@ const Vendor = {
             if (!psqlclient) {
                 psqlclient = await db.connect();
             }
-            const oraclient = await getConnection();
+            let oraclient;
+            let sessionLocked = false;
+            let releaseError;
+            const lockKey = `vms:vendor:staging:${ven_id}`;
             try {
+                // Serialize this vendor across replicas, including an upload
+                // retried after Oracle committed but the worker lost its lease.
+                // Legacy callers supply an open transaction; the worker owns
+                // its connection and uses a session lock instead.
+                await psqlclient.query(
+                    pgclient
+                        ? "SELECT pg_advisory_xact_lock(hashtext($1))"
+                        : "SELECT pg_advisory_lock(hashtext($1))",
+                    [lockKey]
+                );
+                sessionLocked = !pgclient;
+                oraclient = await getConnection();
+                oraclient.callTimeout = 60000;
                 const { rows: vendor_data } = await psqlclient.query(
                     `
                     select
@@ -1457,6 +1473,22 @@ const Vendor = {
                     [ven_id]
                 );
                 const ven = vendor_data[0];
+                if (!ven || !ven.ven_code) {
+                    throw new Error("Vendor code is required for SAP staging");
+                }
+                const { rows: staged } = await oraclient.execute(
+                    "SELECT VEN_CODE FROM VMS_VENDORDATA WHERE VEN_ID = :venId",
+                    { venId: ven_id }
+                );
+                if (staged.length) {
+                    if (staged.length !== 1 || staged[0][0] !== ven.ven_code) {
+                        throw new Error("Existing SAP staging record conflicts with this vendor");
+                    }
+                    // The header, banks and files are committed together. An
+                    // existing matching header means that upload is complete;
+                    // preserve SAP's flags and avoid appending duplicate children.
+                    return { ven_code: ven.ven_code, already_staged: true };
+                }
                 let localovs;
                 let title = "";
                 if (ven.title === "COMPANY") {
@@ -1581,19 +1613,38 @@ const Vendor = {
                     );
                     await oraclient.execute(insFile, valFile);
                 }
-                oraclient.commit();
+                await oraclient.commit();
                 return {
                     ven_code: ven.ven_code,
                 };
             } catch (error) {
-                oraclient.rollback();
+                if (oraclient) {
+                    try {
+                        await oraclient.rollback();
+                    } catch (rollbackError) {
+                        console.error("Vendor staging rollback failed:", rollbackError.message);
+                    }
+                }
                 throw error;
             } finally {
-                if (!pgclient && psqlclient) {
-                    psqlclient.release();
-                }
                 if (oraclient) {
-                    oraclient.release();
+                    try {
+                        await oraclient.close();
+                    } catch (closeError) {
+                        console.error("Vendor staging connection close failed:", closeError.message);
+                    }
+                }
+                if (sessionLocked) {
+                    try {
+                        await psqlclient.query("SELECT pg_advisory_unlock(hashtext($1))", [lockKey]);
+                    } catch (unlockError) {
+                        releaseError = unlockError;
+                    }
+                }
+                if (!pgclient && psqlclient) {
+                    // Drop a connection if unlocking failed, so a session lock
+                    // cannot leak back into the connection pool.
+                    psqlclient.release(releaseError);
                 }
             }
         } catch (error) {
