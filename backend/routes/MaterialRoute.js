@@ -2,9 +2,12 @@ const express = require("express");
 const router = express.Router();
 const MaterialController = require("../controllers/MaterialController");
 const GuideController = require("../controllers/GuideController");
+const MaterialDashboardController = require("../controllers/MaterialDashboardController");
 const AuthToken = require("../middleware/tokenmanager");
 const requireMaterialAdmin = require("../middleware/requireMaterialAdmin");
 const requireMaterialMasterData = require("../middleware/requireMaterialMasterData");
+
+router.get("/dashboard", AuthToken.authSession, MaterialDashboardController.getDashboard);
 
 // Get all material groups
 router.get("/groups", MaterialController.getMaterialGroups);
