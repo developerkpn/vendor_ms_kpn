@@ -7,11 +7,9 @@
  * store the ranked answer in mat_request_ai_match. The approval dialogs read
  * it back and show rank / code / name / similarity next to the request.
  *
- * ADVISORY ONLY. No approval logic reads this table. A 97% match does not
- * block a request and a failed run does not hold one up — the approver looks
- * at the list and decides. Keep it that way: the score is embedding-derived,
- * and a false "this already exists" must never be able to stall a real
- * material.
+ * Rankings remain advisory for approvals. Before creating a request, an
+ * exact full-text match blocks submission and directs the requester to MDM.
+ * Near matches and unavailable checks keep the existing submission behavior.
  *
  * Asynchronous with respect to the request. The submit/rework handlers call
  * schedule*Match(), which returns immediately and does the work on a later
@@ -38,10 +36,13 @@ const {
     AI_MATCH_MAX_ERROR_LENGTH,
     AI_MATCH_MAX_PREVIEW_LINES,
     AI_MATCH_SOURCE,
-    AI_MATCH_MAX_CANDIDATES,
-    AI_MATCH_CLOSED_REQUEST_STATUSES,
 } = require("../constants/materialAiMatch");
-const { SINGLE_REQUEST_TICKET_TYPES } = require("../constants/material");
+const {
+    SINGLE_REQUEST_TICKET_TYPES,
+    MASS_ITEM_GROUP_CODE_LATERAL_SQL,
+    MASS_ITEM_SUB_GROUP_CODE_LATERAL_SQL,
+    MATERIAL_PEOPLE_SQL,
+} = require("../constants/material");
 
 // Read on every call rather than at module load: dotenv populates process.env
 // from server.js, and the tests flip MATERIAL_AI_MATCH_ENABLED per case.
@@ -88,6 +89,8 @@ function joinDescription(parts) {
 function buildSingleRequestQuery(row) {
     return {
         code: normalizeText(row && row.material_code),
+        groupCode: normalizeText(row && row.material_group_code),
+        subgroupCode: normalizeText(row && row.material_sub_group_code),
         name: normalizeText(row && row.material_description),
         desc: joinDescription([
             row && row.long_text_1,
@@ -99,11 +102,15 @@ function buildSingleRequestQuery(row) {
 
 /**
  * A mass item's line. Always code-less: mass items are new materials, so there
- * is nothing to match a code against — only the text.
+ * is no final code to match. Group/subgroup selections travel separately.
  */
 function buildMassItemQuery(item) {
     return {
         code: "",
+        groupCode: normalizeText(item && (item.material_group_code !== undefined
+            ? item.material_group_code : item.material_group)),
+        subgroupCode: normalizeText(item && (item.material_sub_group_code !== undefined
+            ? item.material_sub_group_code : item.material_sub_group)),
         name: normalizeText(item && item.material_description),
         desc: joinDescription([
             item && item.po_text,
@@ -129,15 +136,28 @@ function roundSimilarity(value) {
     if (!Number.isFinite(num)) {
         return 0;
     }
-    return Math.round(num * 10000) / 10000;
+    const rounded = Math.round(num * 10000) / 10000;
+    return num < 1 ? Math.min(rounded, 0.9999) : Math.min(rounded, 1);
+}
+
+function recommendationSimilarity(item, query) {
+    const similarity = roundSimilarity(item && item.similarity);
+    if (similarity < 1 || !query) return similarity;
+    const text = value => normalizeText([
+        value?.name,
+        value?.desc ?? value?.description ?? value?.long_text,
+    ].filter(Boolean).join(" ")).toUpperCase();
+    // Older AI deployments can return 100% from bonuses despite different
+    // long text. Do not let those responses become duplicate blockers.
+    return text(query) && text(query) === text(item) ? similarity : 0.99;
 }
 
 /**
  * The AI side's recommendations, ranked. Rank is the position the recommender
- * returned them in — it sorts by similarity itself, and re-sorting here would
- * hide a disagreement rather than surface it.
+ * returned them in: catalogue results lead, then up to two relevant request
+ * results. Keep that order rather than sorting request rows above materials.
  */
-function normalizeRecommendations(list) {
+function normalizeRecommendations(list, query) {
     if (!Array.isArray(list)) {
         return [];
     }
@@ -145,7 +165,8 @@ function normalizeRecommendations(list) {
         rank: index + 1,
         code: normalizeText(item && item.code),
         name: normalizeText(item && item.name),
-        similarity: roundSimilarity(item && item.similarity),
+        desc: normalizeText(item && (item.desc ?? item.description ?? item.long_text)),
+        similarity: recommendationSimilarity(item, query),
         // Kept verbatim: the labels the dialog maps are the AI side's exact
         // strings, down to the parentheses.
         matchType: item && item.match_type ? String(item.match_type) : "TEXT",
@@ -154,7 +175,7 @@ function normalizeRecommendations(list) {
 }
 
 /**
- * Where a recommendation comes from. A "request" one is not a material yet:
+ * Where a recommendation comes from. A "request" row is a request summary:
  * its code is a request number, and the dialogs must not offer it as the
  * existing material to use. A retired one is a material SAP has flagged for
  * deletion or renamed "(NOT USE)": the same part, but not one to reuse as is.
@@ -173,14 +194,42 @@ function describeSource(item) {
                       item && (item.request_status ?? item.requestStatus)
                   ).slice(0, 80)
                 : "",
+        ...(source === AI_MATCH_SOURCE.REQUEST && (item?.requestDetails ?? item?.request_details) ? {
+            requestScope: ["other_user", "own", "same_batch"].includes(item.requestScope ?? item.request_scope)
+                ? item.requestScope ?? item.request_scope : "unknown",
+            requestDetails: sanitizeRequestDetails(item.requestDetails ?? item.request_details),
+        } : {}),
     };
+}
+
+// Only material/request summary data is shared across requesters. Full request
+// pages keep their existing access checks; attachments, emails and approvals
+// are not part of a duplicate-match result.
+function sanitizeRequestDetails(details) {
+    const value = details && typeof details === "object" ? details : {};
+    return Object.fromEntries(Object.entries({
+        kind: 10, requestNo: 50, batchNo: 50, itemNo: 10, materialCode: 50,
+        requesterName: 150, status: 80, createdAt: 40, groupCode: 30, subgroupCode: 30,
+    }).map(([key, limit]) => [key, normalizeText(value[key]).slice(0, limit)]));
+}
+
+function scopeCandidates(candidates, requesterId, massRequestId = null) {
+    return candidates.map(candidate => ({
+        ...candidate,
+        requestScope: massRequestId != null && candidate.kind === AI_MATCH_KIND.MASS &&
+            String(candidate.massRequestId) === String(massRequestId)
+            ? "same_batch"
+            : requesterId != null && candidate.requesterId != null
+                ? String(requesterId) === String(candidate.requesterId) ? "own" : "other_user"
+                : "unknown",
+    }));
 }
 
 /**
  * POST /recommend. Errors propagate: the caller maps them to a stored FAILED
  * row, which is where the description belongs.
  */
-async function callRecommender({ code, name, desc, topK, candidates = [] }) {
+async function callRecommender({ code, groupCode, subgroupCode, name, desc, topK, candidates = [] }) {
     const config = module.exports.getConfig();
     const queryName = normalizeText(name);
     if (!queryName) {
@@ -192,16 +241,23 @@ async function callRecommender({ code, name, desc, topK, candidates = [] }) {
         `${config.baseUrl}/recommend`,
         {
             code: normalizeText(code),
+            group_code: normalizeText(groupCode),
+            subgroup_code: normalizeText(subgroupCode),
             name: queryName,
             desc: normalizeText(desc),
             top_k: topK || config.topK,
             candidates: (Array.isArray(candidates) ? candidates : [])
-                .slice(0, AI_MATCH_MAX_CANDIDATES)
                 .map(candidate => ({
                     ref: normalizeText(candidate.ref),
                     name: normalizeText(candidate.name),
                     desc: normalizeText(candidate.desc),
                     status: normalizeText(candidate.status),
+                    group_code: normalizeText(candidate.groupCode),
+                    subgroup_code: normalizeText(candidate.subgroupCode),
+                    ...(candidate.requestDetails ? {
+                        request_scope: candidate.requestScope || "unknown",
+                        request_details: sanitizeRequestDetails(candidate.requestDetails),
+                    } : {}),
                 })),
         },
         { timeout: config.timeoutMs }
@@ -249,22 +305,24 @@ function describeAiError(error) {
  * mass run is (a single-process model server).
  *
  * Each line may carry `siblings`: the other lines of the same unsaved form
- * ({ref, name, desc}), so a part entered twice in one batch is caught before
+ * ({ref, name, desc, groupCode, subgroupCode}), so a duplicate is caught before
  * anything is saved. Open requests already in the database are added to them.
  *
  * @param {Array<{key: string|number, query: {code?: string, name: string, desc?: string}, siblings?: Array}>} lines
  */
-async function previewMatches(lines) {
+async function previewMatches(lines, { requesterId = null } = {}) {
     const config = module.exports.getConfig();
     const list = Array.isArray(lines)
         ? lines.slice(0, AI_MATCH_MAX_PREVIEW_LINES)
         : [];
-    const inFlight = list.length ? await loadCandidatesSafely() : [];
+    const inFlight = scopeCandidates(list.length ? await loadCandidatesSafely() : [], requesterId);
 
     const results = [];
     for (const line of list) {
         const query = {
             code: normalizeText(line && line.query && line.query.code),
+            groupCode: normalizeText(line && line.query && line.query.groupCode),
+            subgroupCode: normalizeText(line && line.query && line.query.subgroupCode),
             name: normalizeText(line && line.query && line.query.name),
             desc: normalizeText(line && line.query && line.query.desc),
         };
@@ -294,6 +352,10 @@ async function previewMatches(lines) {
                     name: normalizeText(sibling && sibling.name),
                     desc: normalizeText(sibling && sibling.desc),
                     status: "this request",
+                    groupCode: normalizeText(sibling && sibling.groupCode),
+                    subgroupCode: normalizeText(sibling && sibling.subgroupCode),
+                    requestScope: "same_batch",
+                    requestDetails: sanitizeRequestDetails({ requestNo: sibling?.ref, status: "this request" }),
                 }))
                 .filter(sibling => sibling.name);
             const data = await module.exports.callRecommender({
@@ -302,7 +364,7 @@ async function previewMatches(lines) {
                 candidates: [...siblings, ...inFlight],
             });
             const recommendations = module.exports.normalizeRecommendations(
-                data && data.recommendations
+                data && data.recommendations, query
             );
             const entities = (data && data.entities) || {};
             results.push({
@@ -335,6 +397,39 @@ async function previewMatches(lines) {
     return results;
 }
 
+/** Recheck server-side so omitting or editing the browser review cannot bypass a duplicate. */
+async function assertNoExactMatches(lines, { requesterId = null } = {}) {
+    if (!module.exports.getConfig().enabled) return;
+    let results;
+    try {
+        results = await module.exports.previewMatches(lines.map(line => ({
+            ...line,
+            siblings: lines.filter(other => other.key !== line.key).map(other => ({
+                ref: `Baris ${Number(other.key) + 1}`,
+                ...other.query,
+            })),
+        })), { requesterId });
+    } catch (error) {
+        // Preserve the existing ability to submit while AI is unavailable.
+        console.error("[AI-MATCH] submit check failed:", module.exports.describeAiError(error));
+        return;
+    }
+    const duplicates = results.filter(line =>
+        line.status === AI_MATCH_STATUS.DONE &&
+        line.recommendations.some(item => item.similarity === 1)
+    );
+    if (!duplicates.length) return;
+    const message = "Ditemukan kecocokan 100%. Material tidak dapat disubmit sebagai material baru. Silakan hubungi MDM.";
+    const error = new Error(message);
+    error.statusCode = 409;
+    error.errors = duplicates.map(line => ({
+        rowIndex: line.key,
+        fieldKey: line.key === "single" ? "material_description" : "description",
+        message,
+    }));
+    throw error;
+}
+
 /**
  * The requester's "brand new" confirmation as it arrives with a submit, made
  * safe to store. The list is what the browser says it showed, so it is
@@ -357,6 +452,7 @@ function sanitizeRequesterReview(raw) {
             rank: index + 1,
             code: normalizeText(item && item.code).slice(0, 50),
             name: normalizeText(item && item.name).slice(0, 300),
+            desc: normalizeText(item && item.desc).slice(0, 4000),
             similarity: roundSimilarity(item && item.similarity),
             matchType: normalizeText(item && item.matchType).slice(0, 60) || "TEXT",
             ...describeSource(item),
@@ -448,15 +544,21 @@ async function loadSingleRequestRow(requestId) {
     return DBClientWrapper(async client => {
         const { rows } = await client.query(
             `SELECT
-                id,
-                ticket_type,
-                material_code,
-                material_description,
-                long_text_1,
-                long_text_2,
-                long_text_3
-            FROM mat_single_request
-            WHERE id = $1`,
+                s.id,
+                s.created_by AS requester_id,
+                s.ticket_type,
+                s.material_code,
+                s.material_description,
+                s.long_text_1,
+                s.long_text_2,
+                s.long_text_3,
+                g.code AS material_group_code,
+                sg.code AS material_sub_group_code
+            FROM mat_single_request s
+            LEFT JOIN mat_item_group g ON g.id = s.material_group_id
+            LEFT JOIN mat_item_sub_group sg ON sg.id = s.material_sub_group_id
+                AND sg.item_group_id = s.material_group_id
+            WHERE s.id = $1`,
             [requestId]
         );
         return rows[0] || null;
@@ -467,62 +569,88 @@ async function loadMassRequestItems(massRequestId) {
     return DBClientWrapper(async client => {
         const { rows } = await client.query(
             `SELECT
-                id,
-                mass_request_id,
-                item_no,
-                material_description,
-                po_text,
-                spesifikasi_tambahan
-            FROM mat_mass_request_item
-            WHERE mass_request_id = $1
-            ORDER BY item_no`,
+                i.id,
+                i.mass_request_id,
+                i.item_no,
+                m.created_by AS requester_id,
+                i.material_description,
+                i.po_text,
+                i.spesifikasi_tambahan,
+                mig.code AS material_group_code,
+                mis.code AS material_sub_group_code
+            FROM mat_mass_request_item i
+            JOIN mat_mass_request m ON m.id = i.mass_request_id
+            ${MASS_ITEM_GROUP_CODE_LATERAL_SQL}
+            ${MASS_ITEM_SUB_GROUP_CODE_LATERAL_SQL}
+            WHERE i.mass_request_id = $1
+            ORDER BY i.item_no`,
             [massRequestId]
         );
         return rows;
     });
 }
 
+/** Resolve unsaved mass rows exactly as the final-code composer does. */
+async function resolveMassClassifications(items) {
+    if (!items.length) return [];
+    return DBClientWrapper(async client => {
+        const { rows } = await client.query(
+            `SELECT i.position, mig.code AS material_group_code,
+                mis.code AS material_sub_group_code
+             FROM unnest($1::text[], $2::text[]) WITH ORDINALITY
+                AS i(material_group, material_sub_group, position)
+             ${MASS_ITEM_GROUP_CODE_LATERAL_SQL}
+             ${MASS_ITEM_SUB_GROUP_CODE_LATERAL_SQL}
+             ORDER BY i.position`,
+            [items.map(item => normalizeText(item.material_group)),
+             items.map(item => normalizeText(item.material_sub_group))]
+        );
+        return items.map((item, index) => ({
+            ...item,
+            material_group_code: rows[index]?.material_group_code ?? null,
+            material_sub_group_code: rows[index]?.material_sub_group_code ?? null,
+        }));
+    });
+}
+
 /**
- * Create requests that are not SAP materials yet: still in approval, or
- * approved but not in mat_sap_data until the next daily SAP sync. Sent to the
- * AI with every line so that two requests for the same new part - on the same
- * day, or in the same batch - see each other. Newest first, capped.
+ * Create requests across all requesters and statuses, including history.
+ * The AI compares every row, with cached vectors, and only returns the best
+ * two relevant requests. No newest-first cutoff may hide an older duplicate.
  *
  * Each carries kind + id so a run can leave out the line it is matching.
  */
 async function loadInFlightCandidates() {
     return DBClientWrapper(async client => {
         const { rows } = await client.query(
-            `SELECT kind, id, ref, name, descr, status, batch_no, item_no FROM (
+            `SELECT r.*, COALESCE(NULLIF(u.fullname, ''), u.username, r.requester_id) AS requester_name FROM (
                 SELECT 'SINGLE' AS kind, s.id, s.request_no AS ref,
                     s.material_description AS name,
                     concat_ws(' ', s.long_text_1, s.long_text_2, s.long_text_3) AS descr,
                     s.status, s.final_code, s.created_at,
-                    NULL AS batch_no, NULL::smallint AS item_no
+                    NULL AS batch_no, NULL::smallint AS item_no,
+                    g.code AS group_code, sg.code AS subgroup_code,
+                    s.created_by AS requester_id, NULL::bigint AS mass_request_id
                 FROM mat_single_request s
+                LEFT JOIN mat_item_group g ON g.id = s.material_group_id
+                LEFT JOIN mat_item_sub_group sg ON sg.id = s.material_sub_group_id
+                    AND sg.item_group_id = s.material_group_id
                 WHERE s.ticket_type = $1
                 UNION ALL
                 SELECT 'MASS', i.id, i.request_no, i.material_description,
                     concat_ws(' ', i.po_text, i.spesifikasi_tambahan),
                     i.status, i.final_code, i.created_at,
-                    m.mass_request_no, i.item_no
+                    m.mass_request_no, i.item_no, mig.code, mis.code, m.created_by, m.id
                 FROM mat_mass_request_item i
                 JOIN mat_mass_request m ON m.id = i.mass_request_id
+                ${MASS_ITEM_GROUP_CODE_LATERAL_SQL}
+                ${MASS_ITEM_SUB_GROUP_CODE_LATERAL_SQL}
                 WHERE i.ticket_type = $1
             ) r
-            WHERE upper(btrim(r.status)) <> ALL($2::text[])
-              AND btrim(coalesce(r.name, '')) <> ''
-              AND (upper(btrim(r.status)) <> 'DONE'
-                   OR NOT EXISTS (
-                       SELECT 1 FROM mat_sap_data m
-                       WHERE m.code = btrim(r.final_code)))
-            ORDER BY r.created_at DESC
-            LIMIT $3`,
-            [
-                SINGLE_REQUEST_TICKET_TYPES.CREATE,
-                AI_MATCH_CLOSED_REQUEST_STATUSES,
-                AI_MATCH_MAX_CANDIDATES,
-            ]
+            LEFT JOIN ${MATERIAL_PEOPLE_SQL} u ON u.user_id = r.requester_id
+            WHERE btrim(coalesce(r.name, '')) <> ''
+            ORDER BY r.created_at DESC, r.kind, r.id DESC`,
+            [SINGLE_REQUEST_TICKET_TYPES.CREATE]
         );
         return rows.map(row => ({
             kind: row.kind,
@@ -531,6 +659,16 @@ async function loadInFlightCandidates() {
             name: normalizeText(row.name),
             desc: normalizeText(row.descr),
             status: describeInFlightStatus(row),
+            groupCode: normalizeText(row.group_code),
+            subgroupCode: normalizeText(row.subgroup_code),
+            requesterId: row.requester_id,
+            massRequestId: row.mass_request_id,
+            requestDetails: sanitizeRequestDetails({
+                kind: row.kind, requestNo: row.ref, batchNo: row.batch_no, itemNo: row.item_no,
+                materialCode: row.final_code, requesterName: row.requester_name, status: row.status,
+                createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+                groupCode: row.group_code, subgroupCode: row.subgroup_code,
+            }),
         }));
     });
 }
@@ -541,10 +679,7 @@ async function loadInFlightCandidates() {
  * Request ticket (2...), so that and the item's position lead.
  */
 function describeInFlightStatus(row) {
-    const status =
-        normalizeText(row && row.status).toUpperCase() === "DONE"
-            ? "DONE, not in SAP yet"
-            : normalizeText(row && row.status);
+    const status = normalizeText(row && row.status);
     const batchNo = normalizeText(row && row.batch_no);
     if (!batchNo) {
         return status;
@@ -724,8 +859,10 @@ function matchRowToDto(row) {
             rank: Number(item && item.rank) || index + 1,
             code: item && item.code ? String(item.code) : "",
             name: item && item.name ? String(item.name) : "",
+            desc: normalizeText(item && (item.desc ?? item.description ?? item.long_text)),
             similarity: roundSimilarity(item && item.similarity),
             matchType: (item && item.matchType) || "TEXT",
+            ...describeSource(item),
         })),
         topSimilarity: toNumberOrNull(row.top_similarity),
         latencyMs: toNumberOrNull(row.latency_ms),
@@ -772,11 +909,11 @@ async function runSingleRequestMatch(requestId) {
         }
 
         const query = module.exports.buildSingleRequestQuery(row);
-        const candidates = candidatesExcluding(
+        const candidates = scopeCandidates(candidatesExcluding(
             await loadCandidatesSafely(),
             AI_MATCH_KIND.SINGLE,
             row.id
-        );
+        ), row.requester_id);
         await module.exports.upsertMatch({
             requestKind: AI_MATCH_KIND.SINGLE,
             requestId: row.id,
@@ -791,7 +928,7 @@ async function runSingleRequestMatch(requestId) {
                 candidates,
             });
             const recommendations = module.exports.normalizeRecommendations(
-                data && data.recommendations
+                data && data.recommendations, query
             );
             const saved = await module.exports.upsertMatch({
                 requestKind: AI_MATCH_KIND.SINGLE,
@@ -879,14 +1016,14 @@ async function runMassRequestMatch(massRequestId) {
                 const data = await module.exports.callRecommender({
                     ...query,
                     topK: config.topK,
-                    candidates: candidatesExcluding(
+                    candidates: scopeCandidates(candidatesExcluding(
                         inFlight,
                         AI_MATCH_KIND.MASS,
                         item.id
-                    ),
+                    ), item.requester_id, massRequestId),
                 });
                 const recommendations = module.exports.normalizeRecommendations(
-                    data && data.recommendations
+                    data && data.recommendations, query
                 );
                 const saved = await module.exports.upsertMatch({
                     requestKind: AI_MATCH_KIND.MASS,
@@ -1015,11 +1152,13 @@ module.exports = {
     callRecommender,
     describeAiError,
     previewMatches,
+    assertNoExactMatches,
     sanitizeRequesterReview,
     pairMassReviewsWithItems,
     recordRequesterReview,
     loadSingleRequestRow,
     loadMassRequestItems,
+    resolveMassClassifications,
     loadInFlightCandidates,
     describeInFlightStatus,
     upsertMatch,

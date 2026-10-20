@@ -118,6 +118,7 @@ async function recordMassAiMatchReviewsSafely({
 // SAP columns), so the pre-save check asks the AI about exactly what gets saved.
 async function buildSinglePreviewQuery({
     materialGroupCode,
+    subgroup,
     requestFields,
     templateValues,
 }) {
@@ -136,8 +137,25 @@ async function buildSinglePreviewQuery({
         validation.normalizedTemplateValues || safeTemplateValues,
         validation.template || {}
     );
+    // The browser selects a subgroup's database ID, not its SAP code.
+    let subgroupCode = "";
+    if (subgroup !== undefined && subgroup !== null && subgroup !== "") {
+        const subgroupId = Number(subgroup);
+        const selected = Number.isSafeInteger(subgroupId) && subgroupId > 0
+            ? await materialService.getSubGroupById(subgroupId)
+            : null;
+        if (!selected || selected.deleted_at ||
+            String(selected.group_code).trim() !== materialGroupCode) {
+            const error = new Error("Selected subgroup does not belong to the material group");
+            error.statusCode = 400;
+            throw error;
+        }
+        subgroupCode = selected.subgroup_code;
+    }
     return materialAiMatchService.buildSingleRequestQuery({
         material_code: "",
+        material_group_code: materialGroupCode,
+        material_sub_group_code: subgroupCode,
         material_description:
             generated.material_description ||
             safeRequestFields.material_description,
@@ -1942,6 +1960,24 @@ const MaterialController = {
                 }
             }
 
+            if (ticketType === "Create" && materialAiMatchService.getConfig().enabled) {
+                const generated = buildMaterialDescriptionAndLongText(
+                    validation.normalizedTemplateValues || templateValues,
+                    validation.template || {}
+                );
+                const query = materialAiMatchService.buildSingleRequestQuery({
+                    ...normalizedRequestFields,
+                    material_description: generated.material_description || normalizedRequestFields.material_description,
+                    long_text_1: generated.long_text_1 || normalizedRequestFields.long_text_1,
+                    long_text_2: generated.long_text_2 || normalizedRequestFields.long_text_2,
+                    long_text_3: generated.long_text_3 || normalizedRequestFields.long_text_3,
+                    material_group_code: materialGroup.code,
+                });
+                await materialAiMatchService.assertNoExactMatches([
+                    { key: "single", query },
+                ], { requesterId: userId });
+            }
+
             const createdRequest = await materialService.createSingleRequest({
                 ticketType,
                 materialCode,
@@ -2211,6 +2247,25 @@ const MaterialController = {
                     newName: `${Date.now()}_${safeBaseName}.${extension}`,
                     mimeType: getMimeType(extension),
                 });
+            }
+
+            if (materialAiMatchService.getConfig().enabled) {
+                const classifiedItems = await materialAiMatchService.resolveMassClassifications(
+                    filledRowIndexes.map(rowIndex => ({
+                        material_group: rows[rowIndex].materialGroup,
+                        material_sub_group: rows[rowIndex].materialSubGroup,
+                        material_description: rows[rowIndex].description,
+                        po_text: rows[rowIndex].poText,
+                        spesifikasi_tambahan: rows[rowIndex].spesifikasiTambahan,
+                    }))
+                );
+                await materialAiMatchService.assertNoExactMatches(
+                    classifiedItems.map((item, position) => ({
+                        key: filledRowIndexes[position],
+                        query: materialAiMatchService.buildMassItemQuery(item),
+                    })),
+                    { requesterId: userId }
+                );
             }
 
             const createdMassRequest = await materialService.createMassRequest({
@@ -2722,6 +2777,7 @@ const MaterialController = {
                         key: "single",
                         query: await buildSinglePreviewQuery({
                             materialGroupCode,
+                            subgroup: req.body?.subgroup,
                             requestFields: req.body?.requestFields,
                             templateValues: req.body?.templateValues,
                         }),
@@ -2744,27 +2800,33 @@ const MaterialController = {
                 const siblingRows = (
                     Array.isArray(req.body?.siblings) ? req.body.siblings : []
                 ).slice(0, AI_MATCH_MAX_PREVIEW_LINES);
-                lines = rows.map(row => ({
-                    key: row?.rowIndex ?? null,
-                    query: materialAiMatchService.buildMassItemQuery({
+                const classifiedItems = await materialAiMatchService.resolveMassClassifications(
+                    [...rows, ...siblingRows].map(row => ({
+                        material_group: row?.materialGroup,
+                        material_sub_group: row?.materialSubGroup,
                         material_description: row?.description,
                         po_text: row?.poText,
                         spesifikasi_tambahan: row?.spesifikasiTambahan,
-                    }),
+                    }))
+                );
+                const queries = classifiedItems.map(materialAiMatchService.buildMassItemQuery);
+                lines = rows.map((row, rowPosition) => ({
+                    key: row?.rowIndex ?? null,
+                    query: queries[rowPosition],
                     siblings: siblingRows
-                        .filter(sibling => sibling?.rowIndex !== row?.rowIndex)
-                        .map(sibling => {
-                            const query = materialAiMatchService.buildMassItemQuery({
-                                material_description: sibling?.description,
-                                po_text: sibling?.poText,
-                                spesifikasi_tambahan: sibling?.spesifikasiTambahan,
-                            });
+                        .map((sibling, siblingPosition) => {
+                            const query = queries[rows.length + siblingPosition];
                             return {
+                                rowIndex: sibling?.rowIndex,
                                 ref: `Baris ${Number(sibling?.rowIndex) + 1}`,
                                 name: query.name,
                                 desc: query.desc,
+                                groupCode: query.groupCode,
+                                subgroupCode: query.subgroupCode,
                             };
-                        }),
+                        })
+                        .filter(sibling => sibling.rowIndex !== row?.rowIndex)
+                        .map(({ rowIndex, ...sibling }) => sibling),
                 }));
             } else {
                 return res.status(400).json({
@@ -2773,13 +2835,13 @@ const MaterialController = {
                 });
             }
 
-            const data = await materialAiMatchService.previewMatches(lines);
+            const data = await materialAiMatchService.previewMatches(lines, { requesterId: req.cookies?.user_id });
             return res.json({ success: true, enabled: true, data });
         } catch (error) {
             console.error("[AI-MATCH] preview failed:", error && error.message);
-            return res.status(500).json({
+            return res.status(error.statusCode === 400 ? 400 : 500).json({
                 success: false,
-                message: "Failed to check for similar materials",
+                message: error.statusCode === 400 ? error.message : "Failed to check for similar materials",
             });
         }
     },

@@ -12,6 +12,7 @@ const service = require("../services/materialAiMatchService");
 const IO_SEAMS = [
   "loadSingleRequestRow",
   "loadMassRequestItems",
+  "resolveMassClassifications",
   "loadInFlightCandidates",
   "upsertMatch",
   "callRecommender",
@@ -153,6 +154,8 @@ test("getConfig clamps top_k and falls back on a bad timeout", () => {
 test("buildSingleRequestQuery joins the long-text columns with single spaces", () => {
   const query = service.buildSingleRequestQuery({
     material_code: "  935.461.472 ",
+    material_group_code: " 935 ",
+    material_sub_group_code: " 461 ",
     material_description: "PUMP   LIFT\n",
     long_text_1: "HEAVY DUTY",
     long_text_2: "  50HZ  ",
@@ -161,6 +164,8 @@ test("buildSingleRequestQuery joins the long-text columns with single spaces", (
 
   assert.deepEqual(query, {
     code: "935.461.472",
+    groupCode: "935",
+    subgroupCode: "461",
     name: "PUMP LIFT",
     desc: "HEAVY DUTY 50HZ",
   });
@@ -175,11 +180,13 @@ test("buildSingleRequestQuery leaves the description empty when no long text was
     long_text_3: undefined,
   });
 
-  assert.deepEqual(query, { code: "", name: "BEARING", desc: "" });
+  assert.deepEqual(query, { code: "", groupCode: "", subgroupCode: "", name: "BEARING", desc: "" });
 });
 
 test("buildMassItemQuery joins po_text and spesifikasi and never sends a code", () => {
   const query = service.buildMassItemQuery({
+    material_group: " 935 ",
+    material_sub_group: " 461 ",
     material_description: "  INSERT  EXHAUST ",
     po_text: "P/N 31755122",
     spesifikasi_tambahan: "STAINLESS  STEEL",
@@ -188,8 +195,25 @@ test("buildMassItemQuery joins po_text and spesifikasi and never sends a code", 
   assert.deepEqual(query, {
     code: "",
     name: "INSERT EXHAUST",
+    groupCode: "935",
+    subgroupCode: "461",
     desc: "P/N 31755122 STAINLESS STEEL",
   });
+});
+
+test("buildMassItemQuery uses resolved codes and leaves unresolved classifications empty", () => {
+  const resolved = service.buildMassItemQuery({
+    material_description: "PUMP", material_group: "PUMPS", material_sub_group: "LIFT",
+    material_group_code: "910", material_sub_group_code: "016",
+  });
+  assert.equal(resolved.groupCode, "910");
+  assert.equal(resolved.subgroupCode, "016");
+  const unresolved = service.buildMassItemQuery({
+    material_description: "PUMP", material_group: "910", material_sub_group: "016",
+    material_group_code: null, material_sub_group_code: null,
+  });
+  assert.equal(unresolved.groupCode, "");
+  assert.equal(unresolved.subgroupCode, "");
 });
 
 // ---------------------------------------------------------------------------
@@ -230,6 +254,7 @@ test("normalizeRecommendations ranks in input order and rounds to four decimals"
     rank: 1,
     code: "935.461.472",
     name: "P/N 31755122 INSERT EXHAUST",
+    desc: "",
     similarity: 0.9731,
     matchType: "EXACT (code + name match)",
     source: "catalog",
@@ -256,6 +281,73 @@ test("normalizeRecommendations answers an empty list for anything that is not an
   assert.deepEqual(service.normalizeRecommendations(undefined), []);
   assert.deepEqual(service.normalizeRecommendations("nope"), []);
   assert.deepEqual(service.normalizeRecommendations({ 0: "x" }), []);
+});
+
+test("100% requires the full name and long text, including with older AI responses", () => {
+  const query = { name: "P/N 040074 AB BK3 0BP0 O-RING FKM", desc: "55 X 5.5 MM" };
+  for (const source of ["catalog", "request"]) {
+    const [different, same, near] = service.normalizeRecommendations([
+      { ...query, desc: "55 X 5 MM", similarity: 1, source },
+      { ...query, name: query.name.toLowerCase(), desc: " 55 X  5.5 MM ", similarity: 1, source },
+      { ...query, similarity: 0.999999, source },
+    ], query);
+    assert.equal(different.similarity, 0.99);
+    assert.equal(same.similarity, 1);
+    assert.equal(near.similarity, 0.9999);
+  }
+});
+
+test("server submit check blocks exact catalogue and request matches for single and mass lines", async () => {
+  const calls = [];
+  let source = "catalog";
+  const restore = stubService({ callRecommender: async query => {
+    calls.push(query);
+    return { recommendations: [{ name: query.name, desc: query.desc, similarity: 1, source }] };
+  } });
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+      for (source of ["catalog", "request"]) {
+        await assert.rejects(service.assertNoExactMatches([
+          { key: "single", query: { name: "RING", desc: "55 X 5 MM" } },
+        ], { requesterId: "requester" }), error => {
+          assert.equal(error.statusCode, 409);
+          assert.match(error.message, /100%.*MDM/);
+          assert.equal(error.errors[0].fieldKey, "material_description");
+          return true;
+        });
+        await assert.rejects(service.assertNoExactMatches([
+          { key: 1, query: { name: "RING", desc: "55 X 5 MM" } },
+          { key: 4, query: { name: "PUMP", desc: "50HZ" } },
+        ]), error => {
+          assert.equal(error.statusCode, 409);
+          assert.deepEqual(error.errors.map(item => item.rowIndex), [1, 4]);
+          assert.equal(error.errors[0].fieldKey, "description");
+          return true;
+        });
+        assert.equal(calls.at(-2).candidates[0].ref, "Baris 5");
+        assert.equal(calls.at(-1).candidates[0].ref, "Baris 2");
+      }
+    });
+  } finally { restore(); }
+});
+
+test("server submit check allows near matches, changed long text, AI failures and the disabled feature", async () => {
+  const restore = stubService({ callRecommender: async query => {
+    if (query.name === "FAILED") throw new Error("offline");
+    return { recommendations: [{ name: query.name, desc: "55 X 5 MM", similarity: 1 }] };
+  } });
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+      await service.assertNoExactMatches([{ key: 0, query: { name: "RING", desc: "55 X 5.5 MM" } }]);
+      await service.assertNoExactMatches([{ key: 0, query: { name: "FAILED" } }]);
+      service.callRecommender = async query => ({ recommendations: [{ name: query.name, similarity: 0.99999 }] });
+      await service.assertNoExactMatches([{ key: 0, query: { name: "RING" } }]);
+    });
+    service.callRecommender = async () => { throw new Error("must not call AI"); };
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "false" }, () =>
+      service.assertNoExactMatches([{ key: 0, query: { name: "RING" } }])
+    );
+  } finally { restore(); }
 });
 
 // ---------------------------------------------------------------------------
@@ -401,6 +493,8 @@ const CREATE_ROW = {
   id: 501,
   ticket_type: "Create",
   material_code: "",
+  material_group_code: "910",
+  material_sub_group_code: "016",
   material_description: "PUMP LIFT",
   long_text_1: "HEAVY DUTY",
   long_text_2: null,
@@ -433,6 +527,8 @@ test("runSingleRequestMatch writes PENDING then DONE with the top similarity", a
     assert.equal(upserts[0].requestId, 501);
     assert.deepEqual(upserts[0].query, {
       code: "",
+      groupCode: "910",
+      subgroupCode: "016",
       name: "PUMP LIFT",
       desc: "HEAVY DUTY",
     });
@@ -447,6 +543,9 @@ test("runSingleRequestMatch writes PENDING then DONE with the top similarity", a
     assert.deepEqual(upserts[1].entities, AI_RESPONSE.entities);
 
     assert.equal(sentQuery.name, "PUMP LIFT");
+    assert.equal(sentQuery.code, "");
+    assert.equal(sentQuery.groupCode, "910");
+    assert.equal(sentQuery.subgroupCode, "016");
     assert.equal(sentQuery.topK, 5);
   } finally {
     restore();
@@ -559,6 +658,8 @@ test("runMassRequestMatch pends every item, then calls sequentially and survives
         id: 11,
         mass_request_id: 7,
         item_no: 1,
+        material_group_code: "910",
+        material_sub_group_code: "016",
         material_description: "PUMP LIFT",
         po_text: "HEAVY DUTY",
         spesifikasi_tambahan: null,
@@ -567,6 +668,8 @@ test("runMassRequestMatch pends every item, then calls sequentially and survives
         id: 12,
         mass_request_id: 7,
         item_no: 2,
+        material_group_code: "935",
+        material_sub_group_code: "461",
         material_description: "INSERT EXHAUST",
         po_text: null,
         spesifikasi_tambahan: "STAINLESS STEEL",
@@ -574,6 +677,8 @@ test("runMassRequestMatch pends every item, then calls sequentially and survives
     ],
     callRecommender: async payload => {
       inFlight += 1;
+      assert.equal(payload.groupCode, payload.name === "PUMP LIFT" ? "910" : "935");
+      assert.equal(payload.subgroupCode, payload.name === "PUMP LIFT" ? "016" : "461");
       // Sequential means the second call cannot start before the first has
       // settled — overlapping calls would show up here.
       assert.equal(inFlight, 1);
@@ -803,7 +908,7 @@ test("previewMatches ranks each line, fails an empty one and survives a failing 
   try {
     const results = await withEnv({ MATERIAL_AI_MATCH_TOP_K: "3" }, () =>
       service.previewMatches([
-        { key: 0, query: { name: "  PUMP   LIFT ", desc: "50HZ" } },
+        { key: 0, query: { name: "  PUMP   LIFT ", desc: "50HZ", groupCode: " 910 ", subgroupCode: " 016 " } },
         { key: 1, query: { name: "" } },
         { key: 2, query: { name: "BROKEN" } },
       ])
@@ -826,6 +931,8 @@ test("previewMatches ranks each line, fails an empty one and survives a failing 
     // The empty line never reaches the recommender; top_k comes from config.
     assert.deepEqual(calls.map(call => call.name), ["PUMP LIFT", "BROKEN"]);
     assert.equal(calls[0].topK, 3);
+    assert.equal(calls[0].groupCode, "910");
+    assert.equal(calls[0].subgroupCode, "016");
   } finally {
     restore();
   }
@@ -871,12 +978,27 @@ test("sanitizeRequesterReview only accepts an explicit confirmation and caps the
     rank: 1,
     code: "90",
     name: "X".repeat(300),
+    desc: "",
     similarity: 0.1235,
     matchType: "TEXT",
     source: "catalog",
     retired: false,
     requestStatus: "",
   });
+});
+
+test("recommendation descriptions and source flags survive storage and DTO reads", () => {
+  const recs = service.normalizeRecommendations([
+    { code: "969.202.174", name: "KIT", desc: "  CHAMBER\nSTACK CR 10-16 GRUNDFOS ", similarity: 0.987, match_type: "PART NUMBER", retired: true },
+    { code: "1000000071", name: "KIT", desc: "CHAMBER STACK", source: "request", request_status: "Submit" },
+  ]);
+  const dto = service.matchRowToDto({ status: "DONE", recommendations: JSON.stringify(recs) });
+  assert.equal(dto.recommendations[0].desc, "CHAMBER STACK CR 10-16 GRUNDFOS");
+  assert.equal(dto.recommendations[0].retired, true);
+  assert.equal(dto.recommendations[1].desc, "CHAMBER STACK");
+  assert.equal(dto.recommendations[1].source, "request");
+  assert.equal(dto.recommendations[1].requestStatus, "Submit");
+  assert.equal(service.sanitizeRequesterReview({ confirmedNew: true, recommendations: recs }).recommendations[0].desc, recs[0].desc);
 });
 
 test("sanitizeRequesterReview records a confirmation with no matches shown", () => {
@@ -952,6 +1074,71 @@ function fakeResponse() {
   };
 }
 
+test("single and mass create reject exact matches before any write, even without a browser review", async () => {
+  const controller = require("../controllers/MaterialController");
+  const materialService = require("../services/materialService");
+  const template = require("../models/MaterialTemplateModel");
+  const formidable = require("formidable");
+  const originalParse = formidable.IncomingForm.prototype.parse;
+  const originals = {
+    getMaterialGroupByCode: materialService.getMaterialGroupByCode,
+    createSingleRequest: materialService.createSingleRequest,
+    createMassRequest: materialService.createMassRequest,
+    validate: template.validateMaterialRequestTemplate,
+  };
+  let parsed;
+  let writes = 0;
+  const restore = stubService({
+    resolveMassClassifications: async items => items,
+    callRecommender: async query => ({ recommendations: query.name === "RING"
+      ? [{ name: query.name, desc: query.desc, similarity: 1, source: "request" }]
+      : [] }),
+  });
+  formidable.IncomingForm.prototype.parse = async () => parsed;
+  materialService.getMaterialGroupByCode = async () => ({ id: 1, code: "935" });
+  materialService.createSingleRequest = materialService.createMassRequest = async () => { writes += 1; };
+  template.validateMaterialRequestTemplate = async ({ requestFields }) => ({
+    errors: [], normalizedRequestFields: requestFields,
+  });
+  const req = { cookies: { user_id: "requester" }, headers: { "content-type": "multipart/form-data" } };
+  const file = { originalFilename: "proof.png" };
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+      for (const review of [undefined, JSON.stringify({ confirmedNew: true, recommendations: [] })]) {
+        parsed = [{
+          ticketType: "Create", materialGroupCode: "935", templateValues: "{}",
+          requestFields: JSON.stringify({ material_description: "RING", long_text_1: "55 X 5 MM", base_unit_of_measure: "EA" }),
+          aiMatchReview: review,
+        }, { files: [file] }];
+        const single = fakeResponse();
+        await controller.createSingleRequest(req, single);
+        assert.equal(single.statusCode, 409, JSON.stringify(single.body));
+        assert.match(single.body.message, /100%.*MDM/);
+        assert.equal(single.body.errors[0].fieldKey, "material_description");
+
+        const row = { plant: "P1", sloc: "S1", materialGroup: "935", description: "RING", poText: "55 X 5 MM", uom: "EA" };
+        parsed = [{
+          rows: JSON.stringify([{}, row, {}, { ...row, description: "PUMP" }]),
+          massRequestReason: "Required parts", fileRowIndex: ["1", "3"], aiMatchReview: review,
+        }, { files: [file, file] }];
+        const mass = fakeResponse();
+        await controller.createMassRequest(req, mass);
+        assert.equal(mass.statusCode, 409, JSON.stringify(mass.body));
+        assert.deepEqual(mass.body.errors.map(error => error.rowIndex), [1]);
+        assert.match(mass.body.errors[0].message, /100%.*MDM/);
+      }
+      assert.equal(writes, 0);
+    });
+  } finally {
+    restore();
+    formidable.IncomingForm.prototype.parse = originalParse;
+    materialService.getMaterialGroupByCode = originals.getMaterialGroupByCode;
+    materialService.createSingleRequest = originals.createSingleRequest;
+    materialService.createMassRequest = originals.createMassRequest;
+    template.validateMaterialRequestTemplate = originals.validate;
+  }
+});
+
 test("previewAiMatch answers enabled:false and calls nothing while the feature is off", async () => {
   const MaterialController = require("../controllers/MaterialController");
   let called = false;
@@ -976,6 +1163,12 @@ test("previewAiMatch builds mass queries the same way the stored run does", asyn
   const MaterialController = require("../controllers/MaterialController");
   let received;
   const original = service.previewMatches;
+  const originalResolve = service.resolveMassClassifications;
+  service.resolveMassClassifications = async items => {
+    assert.equal(items[0].material_group, "PUMPS");
+    assert.equal(items[0].material_sub_group, "016 - LIFT");
+    return items.map(item => ({ ...item, material_group_code: "910", material_sub_group_code: "016" }));
+  };
   service.previewMatches = async lines => {
     received = lines;
     return [{ key: 4, status: "DONE" }];
@@ -987,16 +1180,17 @@ test("previewAiMatch builds mass queries the same way the stored run does", asyn
         {
           body: {
             kind: "mass",
-            rows: [{ rowIndex: 4, description: "PUMP LIFT", poText: "50HZ", spesifikasiTambahan: "3 PHASE" }],
+            rows: [{ rowIndex: 4, materialGroup: "PUMPS", materialSubGroup: "016 - LIFT", description: "PUMP LIFT", poText: "50HZ", spesifikasiTambahan: "3 PHASE" }],
           },
         },
         res
       )
     );
-    assert.deepEqual(received, [{ key: 4, query: { code: "", name: "PUMP LIFT", desc: "50HZ 3 PHASE" }, siblings: [] }]);
+    assert.deepEqual(received, [{ key: 4, query: { code: "", groupCode: "910", subgroupCode: "016", name: "PUMP LIFT", desc: "50HZ 3 PHASE" }, siblings: [] }]);
     assert.deepEqual(res.body, { success: true, enabled: true, data: [{ key: 4, status: "DONE" }] });
   } finally {
     service.previewMatches = original;
+    service.resolveMassClassifications = originalResolve;
   }
 });
 
@@ -1027,7 +1221,7 @@ test("previewAiMatch composes a single description from the template like the sa
         res
       )
     );
-    assert.deepEqual(received, [{ key: "single", query: { code: "", name: "PUMP,LIFT 50HZ", desc: "" } }]);
+    assert.deepEqual(received, [{ key: "single", query: { code: "", groupCode: "910", subgroupCode: "", name: "PUMP,LIFT 50HZ", desc: "" } }]);
   } finally {
     MaterialTemplate.validateMaterialRequestTemplate = originalValidate;
     service.previewMatches = originalPreview;
@@ -1052,6 +1246,49 @@ test("previewAiMatch rejects an unknown kind and an oversized batch", async () =
     await MaterialController.previewAiMatch({ body: { kind: "single" } }, noGroup);
     assert.equal(noGroup.statusCode, 400);
   });
+});
+
+test("single preview resolves the selected subgroup ID to its code and rejects mismatched selections", async () => {
+  const controller = require("../controllers/MaterialController");
+  const materialService = require("../services/materialService");
+  const template = require("../models/MaterialTemplateModel");
+  const originalValidate = template.validateMaterialRequestTemplate;
+  const originalSubgroup = materialService.getSubGroupById;
+  const originalPreview = service.previewMatches;
+  const lookedUp = [];
+  let received;
+  template.validateMaterialRequestTemplate = async () => ({ template: {}, normalizedTemplateValues: {} });
+  materialService.getSubGroupById = async id => {
+    lookedUp.push(id);
+    if (id === 42) return { id, group_code: "910", subgroup_code: "016" };
+    if (id === 43) return { id, group_code: "911", subgroup_code: "016" };
+    if (id === 44) return { id, group_code: "910", subgroup_code: "016", deleted_at: new Date() };
+    return null;
+  };
+  service.previewMatches = async lines => { received = lines; return []; };
+  const body = { kind: "single", materialGroupCode: "910", requestFields: { material_description: "PUMP" } };
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+      const valid = fakeResponse();
+      await controller.previewAiMatch({ body: { ...body, subgroup: "42" } }, valid);
+      assert.equal(valid.statusCode, 200);
+      assert.equal(received[0].query.code, "");
+      assert.equal(received[0].query.groupCode, "910");
+      assert.equal(received[0].query.subgroupCode, "016");
+      assert.deepEqual(lookedUp, [42]);
+      for (const subgroup of ["43", "44", "99", "910.016", "0"]) {
+        received = null;
+        const invalid = fakeResponse();
+        await controller.previewAiMatch({ body: { ...body, subgroup } }, invalid);
+        assert.equal(invalid.statusCode, 400);
+        assert.equal(received, null);
+      }
+    });
+  } finally {
+    template.validateMaterialRequestTemplate = originalValidate;
+    materialService.getSubGroupById = originalSubgroup;
+    service.previewMatches = originalPreview;
+  }
 });
 
 test("MaterialRoute exposes the pre-save preview", () => {
@@ -1173,13 +1410,15 @@ test("previewMatches sends the other lines of the form before the open requests"
       {
         key: 0,
         query: { code: "", name: "P/N 41C3478 RIM AS", desc: "" },
-        siblings: [{ ref: "Baris 2", name: " P/N 41C3478  RIM ", desc: "" }, { ref: "Baris 3", name: "", desc: "" }],
+        siblings: [{ ref: "Baris 2", name: " P/N 41C3478  RIM ", desc: "", groupCode: " 935 ", subgroupCode: " 461 " }, { ref: "Baris 3", name: "", desc: "" }],
       },
     ]);
     assert.deepEqual(
       sent.candidates.map(c => [c.ref, c.name, c.status]),
       [["Baris 2", "P/N 41C3478 RIM", "this request"], ["1000000071", "SEAL", "Submit"]]
     );
+    assert.equal(sent.candidates[0].groupCode, "935");
+    assert.equal(sent.candidates[0].subgroupCode, "461");
   } finally {
     restore();
   }
@@ -1189,6 +1428,8 @@ test("previewAiMatch passes the other rows of a mass form as siblings, never the
   const MaterialController = require("../controllers/MaterialController");
   let received;
   const original = service.previewMatches;
+  const originalResolve = service.resolveMassClassifications;
+  service.resolveMassClassifications = async items => items;
   service.previewMatches = async lines => {
     received = lines;
     return [];
@@ -1202,20 +1443,21 @@ test("previewAiMatch passes the other rows of a mass form as siblings, never the
             rows: [{ rowIndex: 0, description: "PUMP LIFT", poText: "", spesifikasiTambahan: "" }],
             siblings: [
               { rowIndex: 0, description: "PUMP LIFT" },
-              { rowIndex: 2, description: "PUMP LIFT 50HZ", poText: "3 PHASE" },
+              { rowIndex: 2, materialGroup: "910", materialSubGroup: "016", description: "PUMP LIFT 50HZ", poText: "3 PHASE" },
             ],
           },
         },
         fakeResponse()
       )
     );
-    assert.deepEqual(received[0].siblings, [{ ref: "Baris 3", name: "PUMP LIFT 50HZ", desc: "3 PHASE" }]);
+    assert.deepEqual(received[0].siblings, [{ ref: "Baris 3", name: "PUMP LIFT 50HZ", desc: "3 PHASE", groupCode: "910", subgroupCode: "016" }]);
   } finally {
     service.previewMatches = original;
+    service.resolveMassClassifications = originalResolve;
   }
 });
 
-test("callRecommender sends the candidates trimmed and capped", async () => {
+test("callRecommender trims candidates without losing requests beyond the old 300 limit", async () => {
   const axios = require("axios");
   const originalPost = axios.post;
   let body = null;
@@ -1226,10 +1468,16 @@ test("callRecommender sends the candidates trimmed and capped", async () => {
   try {
     await service.callRecommender({
       name: "PUMP",
-      candidates: Array.from({ length: 400 }, (_, i) => ({ ref: ` R${i} `, name: ` N ${i} `, desc: null, status: "Submit", kind: "SINGLE", id: i })),
+      groupCode: " 910 ",
+      subgroupCode: " 016 ",
+      candidates: Array.from({ length: 400 }, (_, i) => ({ ref: ` R${i} `, name: ` N ${i} `, desc: null, status: "Submit", groupCode: " 935 ", subgroupCode: " 461 ", kind: "SINGLE", id: i })),
     });
-    assert.equal(body.candidates.length, 300);
-    assert.deepEqual(body.candidates[0], { ref: "R0", name: "N 0", desc: "", status: "Submit" });
+    assert.equal(body.candidates.length, 400);
+    assert.equal(body.candidates[399].ref, "R399");
+    assert.equal(body.code, "");
+    assert.equal(body.group_code, "910");
+    assert.equal(body.subgroup_code, "016");
+    assert.deepEqual(body.candidates[0], { ref: "R0", name: "N 0", desc: "", status: "Submit", group_code: "935", subgroup_code: "461" });
   } finally {
     axios.post = originalPost;
   }
@@ -1242,7 +1490,7 @@ test("a mass item is shown with its Mass Request ticket, not only its item numbe
   );
   assert.equal(
     service.describeInFlightStatus({ status: "done", batch_no: "2000000008", item_no: 3 }),
-    "Mass 2000000008 #3 · DONE, not in SAP yet"
+    "Mass 2000000008 #3 · done"
   );
   assert.equal(service.describeInFlightStatus({ status: "Rework", batch_no: null, item_no: null }), "Rework");
   assert.equal(
@@ -1251,4 +1499,76 @@ test("a mass item is shown with its Mass Request ticket, not only its item numbe
     ])[0].requestStatus,
     "Mass 2000000008 #1 · DONE, not in SAP yet"
   );
+});
+
+test("preview marks other users, own requests and same-batch lines separately", async () => {
+  let sent;
+  const restore = stubService({
+    loadInFlightCandidates: async () => [
+      { ref: "OTHER", name: "PUMP", requesterId: "bob", requestDetails: { requesterName: "Bob" } },
+      { ref: "OWN", name: "PUMP", requesterId: "alice", requestDetails: { requesterName: "Alice" } },
+      { ref: "UNKNOWN", name: "PUMP" },
+    ],
+    callRecommender: async payload => { sent = payload; return { recommendations: [] }; },
+  });
+  try {
+    await service.previewMatches([{ key: 0, query: { name: "PUMP" }, siblings: [{ ref: "Baris 2", name: "PUMP" }] }], { requesterId: "alice" });
+    assert.deepEqual(sent.candidates.map(candidate => candidate.requestScope), ["same_batch", "other_user", "own", "unknown"]);
+  } finally { restore(); }
+});
+
+test("single and mass runs classify matches relative to the requester and leave out themselves", async () => {
+  const calls = [];
+  const restore = stubService({
+    loadSingleRequestRow: async () => ({ id: 1, ticket_type: "Create", material_description: "PUMP", requester_id: "alice" }),
+    loadMassRequestItems: async () => [{ id: 2, item_no: 1, material_description: "PUMP", requester_id: "alice" }],
+    loadInFlightCandidates: async () => [
+      { kind: "SINGLE", id: 1, ref: "SELF", name: "PUMP", requesterId: "alice" },
+      { kind: "MASS", id: 2, ref: "MASS-SELF", name: "PUMP", requesterId: "alice", massRequestId: 7 },
+      { kind: "MASS", id: 3, ref: "SIBLING", name: "PUMP", requesterId: "alice", massRequestId: 7 },
+      { kind: "SINGLE", id: 4, ref: "OTHER", name: "PUMP", requesterId: "bob" },
+    ],
+    callRecommender: async payload => { calls.push(payload); return { recommendations: [] }; },
+    upsertMatch: async payload => payload,
+  });
+  try {
+    await withEnv({ MATERIAL_AI_MATCH_ENABLED: "true" }, async () => {
+      await service.runSingleRequestMatch(1);
+      await service.runMassRequestMatch(7);
+    });
+    assert.deepEqual(calls[0].candidates.map(candidate => [candidate.ref, candidate.requestScope]), [["MASS-SELF", "own"], ["SIBLING", "own"], ["OTHER", "other_user"]]);
+    assert.deepEqual(calls[1].candidates.map(candidate => [candidate.ref, candidate.requestScope]), [["SELF", "own"], ["SIBLING", "same_batch"], ["OTHER", "other_user"]]);
+  } finally { restore(); }
+});
+
+test("request material details survive AI normalization, storage and review without unrelated private fields", () => {
+  const [recommendation] = service.normalizeRecommendations([{
+    code: "REQ1", name: "PUMP", desc: "LONG TEXT", source: "request", request_scope: "other_user",
+    request_status: "DONE", request_details: {
+      requestNo: "REQ1", materialCode: "910.016.001", requesterName: " Bob ", status: "DONE",
+      email: "private@example.test", attachments: ["private-file"], description: "not used",
+    },
+  }]);
+  assert.equal(recommendation.requestScope, "other_user");
+  assert.equal(recommendation.requestDetails.requesterName, "Bob");
+  assert.equal(recommendation.requestDetails.materialCode, "910.016.001");
+  assert.ok(!JSON.stringify(recommendation).includes("private"));
+  const review = service.sanitizeRequesterReview({ confirmedNew: true, recommendations: [recommendation] });
+  assert.deepEqual(review.recommendations[0].requestDetails, recommendation.requestDetails);
+  const saved = service.matchRowToDto({ recommendations: [recommendation] });
+  assert.deepEqual(saved.recommendations[0].requestDetails, recommendation.requestDetails);
+});
+
+test("AI candidate payload includes material details and scope, but no owner ID, email or attachments", async () => {
+  const axios = require("axios");
+  const original = axios.post;
+  let body;
+  axios.post = async (_, payload) => { body = payload; return { data: {} }; };
+  try {
+    await service.callRecommender({ name: "PUMP", candidates: [{ ref: "REQ1", name: "PUMP", requesterId: "private-id", requestScope: "other_user",
+      requestDetails: { requesterName: "Bob", materialCode: "910.016.001", email: "private@example.test" } }] });
+    assert.equal(body.candidates[0].request_scope, "other_user");
+    assert.equal(body.candidates[0].request_details.materialCode, "910.016.001");
+    assert.ok(!JSON.stringify(body).includes("private"));
+  } finally { axios.post = original; }
 });

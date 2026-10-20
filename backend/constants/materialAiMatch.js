@@ -30,21 +30,12 @@ const AI_MATCH_MAX_ERROR_LENGTH = 500;
 const AI_MATCH_MAX_PREVIEW_LINES = 10;
 
 // Where a recommendation comes from: an existing SAP material (mat_sap_data),
-// or a request that is not in SAP yet — still in approval, approved but not
-// synced (the SAP sync runs once a day), or another line of the same batch.
-// The AI ranks the requests sent to it with the materials and tags them.
+// or a Create request in any status, from any requester, including another
+// line of the same batch. Catalogue rows lead; relevant requests follow.
 const AI_MATCH_SOURCE = Object.freeze({
     CATALOG: "catalog",
     REQUEST: "request",
 });
-
-// Requests sent along with each line. The AI only shows the ones that look
-// like the same material (at most 2 per line), so this is a ceiling on payload
-// size, newest first; at today's volume (~30 open requests) it is never hit.
-const AI_MATCH_MAX_CANDIDATES = 300;
-
-// Request statuses that end a request without creating a material.
-const AI_MATCH_CLOSED_REQUEST_STATUSES = Object.freeze(["CANCEL", "REJECTED", "REJECT"]);
 
 module.exports = {
     AI_MATCH_KIND,
@@ -56,6 +47,4 @@ module.exports = {
     AI_MATCH_MAX_ERROR_LENGTH,
     AI_MATCH_MAX_PREVIEW_LINES,
     AI_MATCH_SOURCE,
-    AI_MATCH_MAX_CANDIDATES,
-    AI_MATCH_CLOSED_REQUEST_STATUSES,
 };
