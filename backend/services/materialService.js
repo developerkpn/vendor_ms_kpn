@@ -6486,7 +6486,11 @@ const MaterialRequests = {
                         // Terminal completion: flag the request for the Oracle
                         // SAP-staging push, performed out-of-band by the cron
                         // job (pushPendingMaterialsToSapStaging).
-                        headerPatch.sap_push_status = "PENDING";
+                        if (normalizedTicketType === SINGLE_REQUEST_TICKET_TYPES.CREATE) {
+                            headerPatch.sap_push_status = "PENDING";
+                        } else {
+                            headerPatch.sap_push_status = null;
+                        }
                     }
 
                     await updateSingleRequestColumns(
@@ -6514,6 +6518,7 @@ const MaterialRequests = {
                         status: headerPatch.status,
                         assigned_to: headerPatch.assigned_to,
                         final_code: finalCode,
+                        ticket_type: normalizedTicketType,
                     };
                 } catch (error) {
                     await client.query("ROLLBACK");
@@ -6527,7 +6532,11 @@ const MaterialRequests = {
             // so a push failure here leaves it PENDING (recoverable) and must
             // NOT fail the approval response. The cron only handles SAP's
             // write-back sync now, not the outbound push.
-            if (result && result.status === "DONE") {
+            if (
+                result &&
+                result.status === "DONE" &&
+                result.ticket_type === SINGLE_REQUEST_TICKET_TYPES.CREATE
+            ) {
                 try {
                     await materialSapStagingService.pushPendingMaterialsToSapStaging(
                         { requestId, limit: 1 }
