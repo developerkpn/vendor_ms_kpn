@@ -233,15 +233,24 @@ const UserController = {
 
     createNewUser: async (req, res) => {
         const Dt = req.body;
-        console.log(Dt);
         if (req.body.hasOwnProperty("password")) {
             Dt.password = req.body.password;
         }
         try {
             let submitDt;
-            if (Dt.role == "VENDOR") {
+            const existingAccountType = Dt.user_id ? await User.getAccountType(Dt.user_id) : null;
+            if (Dt.user_id && !existingAccountType) {
+                throw Object.assign(new Error("User no longer exists. Refresh the user list."), {
+                    statusCode: 404,
+                });
+            }
+            // Existing managers may have PROC, TAX or MDM access roles. The
+            // stored account, rather than an empty manager field, chooses the table.
+            const accountType = existingAccountType
+                || (Dt.role === "MGR" ? "MGR" : Dt.role === "VENDOR" ? "VENDOR" : "USER");
+            if (accountType === "VENDOR") {
                 submitDt = await User.updateVendor(Dt);
-            } else if (Dt.mgr_id === "") {
+            } else if (accountType === "MGR") {
                 submitDt = await User.createManager(Dt);
             } else {
                 submitDt = await User.createUser(Dt);
@@ -252,7 +261,9 @@ const UserController = {
             });
         } catch (error) {
             console.error(error);
-            res.status(500).send(error);
+            res.status(error.statusCode || 500).send({
+                message: error.message || String(error),
+            });
         }
     },
 

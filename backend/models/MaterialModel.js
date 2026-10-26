@@ -11,6 +11,7 @@ const pool = require("../config/connection");
 const saveToDatabase = require("../helper/sap_seeding");
 const TRANS = require("../config/transaction.js");
 const { MATERIAL_PEOPLE_SQL } = require("../constants/material");
+const { loadMaterialAttachments } = require("../services/materialAttachmentService");
 
 
 function parseWildcardSearch(term) {
@@ -906,25 +907,8 @@ const Material = {
                 const materialIds = materialsQuery.rows.map(m => m.id);
 
                 // Get attachments for these materials in a separate query
-                const attachmentsQuery = await client.query(
-                    `SELECT material_id, id, attachment, type
-                     FROM mat_attachment
-                     WHERE material_id = ANY($1)`,
-                    [materialIds]
-                );
-
-                // Create a map of attachments by material_id
-                const attachmentsByMaterialId = {};
-                attachmentsQuery.rows.forEach(attachment => {
-                    if (!attachmentsByMaterialId[attachment.material_id]) {
-                        attachmentsByMaterialId[attachment.material_id] = [];
-                    }
-                    attachmentsByMaterialId[attachment.material_id].push({
-                        id: attachment.id,
-                        attachment: attachment.attachment,
-                        type: attachment.type,
-                    });
-                });
+                const attachmentsByMaterialId =
+                    await Material.getAttachmentsByMaterialIds(client, materialIds);
 
                 // Add attachments to each material
                 const materialsWithAttachments = materialsQuery.rows.map(
@@ -1135,25 +1119,8 @@ const Material = {
                 }
 
                 // Get attachments for these materials in a separate query
-                const attachmentsQuery = await client.query(
-                    `SELECT material_id, id, attachment, type
-                     FROM mat_attachment
-                     WHERE material_id = ANY($1)`,
-                    [materialIds]
-                );
-
-                // Create a map of attachments by material_id
-                const attachmentsByMaterialId = {};
-                attachmentsQuery.rows.forEach(attachment => {
-                    if (!attachmentsByMaterialId[attachment.material_id]) {
-                        attachmentsByMaterialId[attachment.material_id] = [];
-                    }
-                    attachmentsByMaterialId[attachment.material_id].push({
-                        id: attachment.id,
-                        attachment: attachment.attachment,
-                        type: attachment.type,
-                    });
-                });
+                const attachmentsByMaterialId =
+                    await Material.getAttachmentsByMaterialIds(client, materialIds);
 
                 // Add attachments to each material
                 const materialsWithAttachments = materialsQuery.rows.map(
@@ -1962,13 +1929,9 @@ const Material = {
 
     // Utility: Fetch and group attachments
     getAttachmentsByMaterialIds: async (client, ids) => {
-        if (!ids.length) return {};
-        const res = await client.query(
-            `SELECT material_id, id, attachment, type FROM mat_attachment WHERE material_id = ANY($1)`,
-            [ids]
-        );
+        const attachments = await loadMaterialAttachments(client, ids);
         const map = {};
-        res.rows.forEach(({ material_id, ...rest }) => {
+        attachments.forEach(({ material_id, ...rest }) => {
             if (!map[material_id]) map[material_id] = [];
             map[material_id].push(rest);
         });
@@ -2060,16 +2023,9 @@ const Material = {
 
     getMaterialAttachments: async materialId => {
         try {
-            return await DBClientWrapper(async client => {
-                const result = await client.query(
-                    `SELECT id, attachment, type, material_id
-                    FROM mat_attachment
-                    WHERE material_id = $1
-                    ORDER BY id`,
-                    [materialId]
-                );
-                return result.rows;
-            });
+            return await DBClientWrapper(client =>
+                loadMaterialAttachments(client, [materialId])
+            );
         } catch (error) {
             console.error("Error fetching material attachments:", error);
             throw error;
@@ -2092,14 +2048,11 @@ const Material = {
 
                 try {
                     // Check current attachment count
-                    const attachmentCountQuery = await client.query(
-                        "SELECT COUNT(*) as count FROM mat_attachment WHERE material_id = $1",
+                    const currentAttachments = await loadMaterialAttachments(
+                        client,
                         [materialId]
                     );
-
-                    const currentAttachmentCount = parseInt(
-                        attachmentCountQuery.rows[0].count
-                    );
+                    const currentAttachmentCount = currentAttachments.length;
                     const MAX_ATTACHMENTS = 3;
 
                     if (currentAttachmentCount >= MAX_ATTACHMENTS) {
@@ -2319,6 +2272,12 @@ const Material = {
     },
 
     deleteAttachment: async (attachmentId, updatedBy) => {
+        if (/^(single|mass)-request:/.test(String(attachmentId))) {
+            throw Object.assign(
+                new Error("Request attachments are read-only in the material catalog"),
+                { statusCode: 403 }
+            );
+        }
         try {
             return await DBClientWrapper(async client => {
                 // Begin transaction
@@ -2832,28 +2791,13 @@ const Material = {
                     WHERE m.code = ANY($1)`,
                     [codes]
                 );
-                const idToMaterial = {};
-                materialRes.rows.forEach(row => {
-                    idToMaterial[row.id] = { ...row, attachments: [] };
-                });
                 const ids = materialRes.rows.map(row => row.id);
                 if (ids.length === 0) return [];
-                // Fetch attachments for these materials
-                const attachRes = await client.query(
-                    `SELECT material_id, id, attachment, type FROM mat_attachment WHERE material_id = ANY($1)`,
-                    [ids]
-                );
-                attachRes.rows.forEach(att => {
-                    if (idToMaterial[att.material_id]) {
-                        idToMaterial[att.material_id].attachments.push({
-                            id: att.id,
-                            attachment: att.attachment,
-                            type: att.type,
-                        });
-                    }
-                });
-                // Return as array of material objects (with attachments)
-                return Object.values(idToMaterial);
+                const attachments = await Material.getAttachmentsByMaterialIds(client, ids);
+                return materialRes.rows.map(material => ({
+                    ...material,
+                    attachments: attachments[material.id] || [],
+                }));
             });
         } catch (error) {
             console.error("Error fetching material details by codes:", error);

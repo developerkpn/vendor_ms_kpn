@@ -79,7 +79,7 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
         }
     },
     createUser: async params => {
-        const uidExist = params.user_id;
+        const uidExist = params.user_id || "";
         let pass;
         let query, val;
         let submitState = "";
@@ -88,7 +88,6 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
         } else {
             submitState = "insert";
         }
-        console.log(params);
         if (params.hasOwnProperty("password")) {
             pass = await hashPassword(params.password);
         }
@@ -104,7 +103,7 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
         const username = params.username;
         const email = params.email;
         const userGroup = params.usergroup;
-        const mgr_id = params.mgr_id;
+        const mgr_id = params.mgr_id || null;
         const role = params.role;
         let userSubmit = {
             fullname: fullname,
@@ -150,6 +149,28 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
         try {
             client = await db.connect();
             await client.query(TRANS.BEGIN);
+            if (mgr_id) {
+                const manager = await client.query(
+                    "SELECT mgr_id, is_active FROM mst_mgr WHERE mgr_id = $1 FOR KEY SHARE",
+                    [mgr_id]
+                );
+                if (!manager.rows[0]?.is_active) {
+                    // Keep an unchanged legacy assignment when a user edits
+                    // their profile. A new assignment must be an active manager.
+                    const existing = uidExist
+                        ? await client.query(
+                              "SELECT mgr_id FROM mst_user WHERE user_id = $1",
+                              [uidExist]
+                          )
+                        : { rows: [] };
+                    if (existing.rows[0]?.mgr_id !== mgr_id) {
+                        throw Object.assign(
+                            new Error("Select an active manager before saving this user."),
+                            { statusCode: 400 }
+                        );
+                    }
+                }
+            }
             const insertUser = await client.query(query, val);
             await client.query(TRANS.COMMIT);
             return { name: insertUser.rows[0].username };
@@ -195,6 +216,28 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
         }
     },
 
+    getAccountType: async idUser => {
+        const client = await db.connect();
+        try {
+            const result = await client.query(
+                `SELECT 'USER' AS account_type FROM mst_user WHERE user_id = $1
+                 UNION ALL
+                 SELECT 'MGR' AS account_type FROM mst_mgr WHERE mgr_id = $1
+                 UNION ALL
+                 SELECT 'VENDOR' AS account_type FROM a_uservendor WHERE user_id = $1`,
+                [idUser]
+            );
+            if (result.rows.length > 1) {
+                throw Object.assign(new Error("This user ID belongs to multiple accounts."), {
+                    statusCode: 409,
+                });
+            }
+            return result.rows[0]?.account_type || null;
+        } finally {
+            client.release();
+        }
+    },
+
     showUserData: async idUser => {
         const client = await db.connect();
         const q = `SELECT * FROM (SELECT FULLNAME,
@@ -212,7 +255,8 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
             BU_ID_2,
             DEPT_ID, 
             EMP_ROLE_ID,
-            EMAIL
+            EMAIL,
+            'USER' AS ACCOUNT_TYPE
         FROM MST_USER
         UNION ALL
         SELECT FULLNAME,
@@ -230,7 +274,8 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
             BU_ID_2,
             DEPT_ID, 
             EMP_ROLE_ID,
-            EMAIL
+            EMAIL,
+            'MGR' AS ACCOUNT_TYPE
         FROM MST_MGR
         UNION ALL
         SELECT FULLNAME,
@@ -248,7 +293,8 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
             null as BU_ID_2,
             null as DEPT_ID, 
             null as EMP_ROLE_ID,
-            EMAIL
+            EMAIL,
+            'VENDOR' AS ACCOUNT_TYPE
         FROM a_uservendor
         ) AS userdata where user_id = $1`;
         try {
@@ -265,14 +311,10 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
     },
 
     createManager: async params => {
-        const uidExist = params.user_id;
+        const uidExist = params.user_id || "";
         let pass = "";
         let query, val;
-        if (uidExist != "") {
-            submitState = "update";
-        } else {
-            submitState = "insert";
-        }
+        const submitState = uidExist ? "update" : "insert";
         if (params.hasOwnProperty("password")) {
             pass = await hashPassword(params.password);
         }
@@ -284,7 +326,7 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
         const currentdate = new Date().toLocaleDateString();
         const startDate = params.createddate;
         const validDate = params.expireddate;
-        const user_id = uuid.uuid();
+        const user_id = uidExist || uuid.uuid();
         const fullname = params.fullname;
         const username = params.username;
         const email = params.email;
@@ -317,6 +359,8 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
         if (submitState == "insert") {
             [query, val] = crud.insertItem("mst_mgr", userSubmit, "username");
         } else {
+            // This ID is also referenced by users, tickets and material approvals.
+            delete userSubmit.mgr_id;
             [query, val] = crud.updateItem(
                 "mst_mgr",
                 userSubmit,
@@ -981,7 +1025,8 @@ SELECT us.mgr_id as id, us.fullname, us.username, us.email, sec.user_group_name,
     showManagers: async () => {
         const client = await db.connect();
         try {
-            const q = `select mgr_id, fullname from mst_mgr`;
+            const q = `SELECT mgr_id, fullname, bu_id, bu_id_1, bu_id_2,
+                dept_id, is_active FROM mst_mgr ORDER BY fullname, mgr_id`;
             const managers = await client.query(q);
             return {
                 count: managers.rowCount,

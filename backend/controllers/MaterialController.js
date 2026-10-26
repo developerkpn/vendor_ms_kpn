@@ -1356,7 +1356,7 @@ const MaterialController = {
         } catch (error) {
             console.error("Error deleting attachment:", error);
 
-            let statusCode = 500;
+            let statusCode = error.statusCode || 500;
             let message = "Failed to delete attachment";
 
             if (error.message === "Attachment not found") {
