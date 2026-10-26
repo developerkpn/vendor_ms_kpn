@@ -64,9 +64,9 @@ function answerStepModelQuery(queryText, steps) {
 }
 
 /**
- * Approving the last step pushes the request to the Oracle SAP staging bridge
- * right away. A test must never reach that bridge, so the push is replaced for
- * the duration of fn.
+ * Approving the last step of a Create request pushes it to the Oracle SAP
+ * staging bridge right away. A test must never reach that bridge, so the push
+ * is replaced for the duration of fn.
  */
 async function withSapPushStubbed(fn) {
   const original = materialSapStagingService.pushPendingMaterialsToSapStaging;
@@ -499,6 +499,109 @@ test("approveSingleRequestByAdmin stores composed final_code on the Master Data 
     db.connect = originalConnect;
   }
 });
+
+for (const ticketType of ["Create", "Change", "Extend"]) {
+  test(`Master Data approval completes ${ticketType} with the correct SAP status and push`, async () => {
+    const originalConnect = db.connect;
+    const originalGetLocationAndPlant = materialService.getLocationAndPlant;
+    const steps = stepsWaitingOnMasterData(77, "APP-03");
+    let headerPatch;
+
+    db.connect = async () => ({
+      query: async (queryText, params = []) => {
+        if (["BEGIN", "COMMIT", "ROLLBACK"].includes(queryText)) {
+          return { rows: [], rowCount: null };
+        }
+
+        if (/FOR UPDATE OF r/.test(queryText)) {
+          return {
+            rows: [{
+              request_id: 77,
+              request_no: "1000000077",
+              assigned_to: "Master Data",
+              created_by: "REQ-01",
+              created_at: new Date("2026-05-01T08:00:00.000Z"),
+              status: "Submit",
+              ticket_type: ticketType,
+              material_group_code: "901",
+              material_sub_group_code: "031",
+              material_group_id: 12,
+              material_sub_group_id: 110,
+              plant_code: "P1",
+              sloc_code: "S1",
+              material_description: "Approved material",
+              base_uom: "EA",
+              material_code: ticketType === "Create" ? null : "901.031.100",
+              template_payload: { requestFields: {}, templateValues: {} },
+            }],
+            rowCount: 1,
+          };
+        }
+
+        const stepAnswer = answerStepModelQuery(queryText, steps);
+        if (stepAnswer) return stepAnswer;
+
+        if (/FROM mst_mgr\)\s+mu[\s\S]*JOIN mst_page_access/i.test(queryText)) {
+          return { rows: [{ "?column?": 1 }], rowCount: 1 };
+        }
+
+        // Extend validates the existing material before applying its location.
+        if (/SELECT 1\s+FROM mat_sap_data\s+WHERE code = \$1/.test(queryText)) {
+          return { rows: [{ "?column?": 1 }], rowCount: 1 };
+        }
+        if (/UPDATE mat_sap_data/.test(queryText)) {
+          return { rows: [], rowCount: 1 };
+        }
+
+        if (/UPDATE mat_single_request\s+SET assigned_to/.test(queryText)) {
+          headerPatch = Object.fromEntries(
+            [...queryText.matchAll(/(\w+) = \$(\d+)/g)]
+              .filter(match => match[1] !== "id")
+              .map(match => [match[1], params[Number(match[2]) - 1]])
+          );
+          return { rows: [], rowCount: 1 };
+        }
+
+        if (/mat_request_comment/.test(queryText)) {
+          return { rows: [], rowCount: 1 };
+        }
+        throw new Error(`Unexpected query: ${queryText}`);
+      },
+      release: () => {},
+    });
+    materialService.getLocationAndPlant = async () => [
+      { plant_code: "P1", storage_location: "S1" },
+    ];
+
+    try {
+      await withSapPushStubbed(async pushCalls => {
+        const result = await materialService.approveSingleRequestByAdmin({
+          requestId: 77,
+          actorUserId: "APP-03",
+          actorUsername: "mdm.user",
+          remark: "approved",
+          finalCodeSuffix: ticketType === "Create" ? "123" : null,
+        });
+
+        assert.equal(result.status, "DONE");
+        assert.equal(result.assigned_to, "Completed");
+        assert.equal(result.ticket_type, ticketType);
+        assert.equal(headerPatch.status, "DONE");
+        assert.equal(
+          headerPatch.sap_push_status,
+          ticketType === "Create" ? "PENDING" : null
+        );
+        assert.deepEqual(
+          pushCalls,
+          ticketType === "Create" ? [{ requestId: 77, limit: 1 }] : []
+        );
+      });
+    } finally {
+      db.connect = originalConnect;
+      materialService.getLocationAndPlant = originalGetLocationAndPlant;
+    }
+  });
+}
 
 test("getSingleRequestApprovalInbox query aggregates edit history from history table", () => {
   assert.match(
@@ -2290,6 +2393,7 @@ test("approveSingleRequestByAdmin hands the last manual approval to the open Mas
         status: "Submit",
         assigned_to: "Master Data",
         final_code: null,
+        ticket_type: "Change",
       });
       // Only the manual step is written; the Master Data step is left unclaimed.
       assert.equal(stepUpdates.length, 1);
@@ -2437,6 +2541,7 @@ test("approveSingleRequestByAdmin skips history insert when edit-history table i
       status: "Submit",
       assigned_to: "Approval 2",
       final_code: null,
+      ticket_type: "Create",
     });
     assert.equal(
       queryLog.some(entry =>

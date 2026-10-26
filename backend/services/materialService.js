@@ -6483,10 +6483,12 @@ const MaterialRequests = {
                         headerPatch.final_code = finalCode;
                     }
                     if (!nextActive) {
-                        // Terminal completion: flag the request for the Oracle
-                        // SAP-staging push, performed out-of-band by the cron
-                        // job (pushPendingMaterialsToSapStaging).
-                        if (normalizedTicketType === SINGLE_REQUEST_TICKET_TYPES.CREATE) {
+                        // Only Create needs Oracle staging. Change/Extend are
+                        // complete as soon as Master Data approves them.
+                        if (
+                            normalizedTicketType ===
+                            SINGLE_REQUEST_TICKET_TYPES.CREATE
+                        ) {
                             headerPatch.sap_push_status = "PENDING";
                         } else {
                             headerPatch.sap_push_status = null;
@@ -6526,12 +6528,12 @@ const MaterialRequests = {
                 }
             });
 
-            // Immediate SAP staging push on terminal completion (the MDM/final
-            // stage was just approved). Best-effort + out-of-transaction: the
-            // request is already committed DONE with sap_push_status='PENDING',
+            // Immediate SAP staging push for a completed Create request.
+            // Best-effort + out-of-transaction: the request is already committed
+            // DONE with sap_push_status='PENDING',
             // so a push failure here leaves it PENDING (recoverable) and must
-            // NOT fail the approval response. The cron only handles SAP's
-            // write-back sync now, not the outbound push.
+            // NOT fail the approval response. The cron can retry pending pushes
+            // and reconcile SAP's write-back.
             if (
                 result &&
                 result.status === "DONE" &&
