@@ -114,6 +114,13 @@ router.get("/suggestions", MaterialController.getSearchSuggestions);
 // Search all materials (including deleted)
 router.get("/search/all", MaterialController.searchAllMaterials);
 
+// Upload comment image (for rework/reject reason attachments)
+router.post(
+    "/comments/upload-image",
+    AuthToken.authSession,
+    MaterialController.uploadCommentImage
+);
+
 // Get attachments by material ID
 router.get(
     "/:materialId/attachments",

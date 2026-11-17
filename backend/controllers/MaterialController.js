@@ -1308,6 +1308,9 @@ const MaterialController = {
                 case ".gif":
                     contentType = "image/gif";
                     break;
+                case ".webp":
+                    contentType = "image/webp";
+                    break;
                 case ".doc":
                 case ".docx":
                     contentType = "application/msword";
@@ -1369,6 +1372,115 @@ const MaterialController = {
                 message,
                 error: error.message,
             });
+        }
+    },
+
+    // Upload an image attached to a rework or reject comment
+    uploadCommentImage: async (req, res) => {
+        let tempFilePath = null;
+        try {
+            const form = new formidable.IncomingForm();
+            form.options.multiples = false;
+            form.options.maxFileSize = 10 * 1024 * 1024; // 10MB max image size
+
+            const [, filesResult] = await form.parse(req);
+            const file =
+                filesResult.file?.[0] ||
+                filesResult.file ||
+                filesResult.files?.[0] ||
+                filesResult.files ||
+                filesResult.image?.[0] ||
+                filesResult.image;
+
+            if (!file) {
+                return res.status(400).json({
+                    success: false,
+                    message: "No image file provided",
+                });
+            }
+
+            tempFilePath = file.filepath;
+            const originalFilename = file.originalFilename || "image.png";
+            const ext =
+                path.extname(originalFilename).toLowerCase().replace(/^\./, "") ||
+                "png";
+            const allowedExts = ["png", "jpg", "jpeg", "gif", "webp"];
+
+            if (!allowedExts.includes(ext)) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Invalid image format. Allowed formats: ${allowedExts.join(", ")}`,
+                });
+            }
+
+            const today = new Date();
+            const year = today.getFullYear();
+            const month = String(today.getMonth() + 1).padStart(2, "0");
+            const day = String(today.getDate()).padStart(2, "0");
+            const dateSegment = `${year}-${month}-${day}`;
+
+            const targetDir = path.join(
+                path.resolve(),
+                "backend",
+                "public",
+                "attachments",
+                "comments",
+                dateSegment
+            );
+
+            if (!fs.existsSync(targetDir)) {
+                fs.mkdirSync(targetDir, { recursive: true });
+            }
+
+            const cleanBase =
+                path
+                    .basename(originalFilename, `.${ext}`)
+                    .replace(/[^a-zA-Z0-9_-]/g, "_")
+                    .slice(0, 50) || "image";
+            const uniqueFilename = `${Date.now()}_${cleanBase}.${ext}`;
+            const targetFilePath = path.join(targetDir, uniqueFilename);
+
+            fs.copyFileSync(tempFilePath, targetFilePath);
+
+            const relativePath = path.posix.join(
+                "attachments",
+                "comments",
+                dateSegment,
+                uniqueFilename
+            );
+
+            const mimeTypes = {
+                png: "image/png",
+                jpg: "image/jpeg",
+                jpeg: "image/jpeg",
+                gif: "image/gif",
+                webp: "image/webp",
+            };
+
+            return res.status(200).json({
+                success: true,
+                message: "Image uploaded successfully",
+                data: {
+                    fileName: originalFilename,
+                    filePath: relativePath,
+                    fileUrl: `/material/file/${relativePath}`,
+                    fileType: mimeTypes[ext] || "image/png",
+                    size: file.size,
+                },
+            });
+        } catch (error) {
+            console.error("Error uploading comment image:", error);
+            return res.status(500).json({
+                success: false,
+                message: "Failed to upload comment image",
+                error: error.message,
+            });
+        } finally {
+            if (tempFilePath && fs.existsSync(tempFilePath)) {
+                try {
+                    fs.unlinkSync(tempFilePath);
+                } catch (_) {}
+            }
         }
     },
 
