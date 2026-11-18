@@ -731,7 +731,7 @@ const EmailGen = {
             </body>
         `;
     },
-    RejectReq: (ven_detail, remarks) => {
+    RejectReq: (ven_detail, remarks, inlineImages = []) => {
         return `
           <!doctype html>
         <html lang="en">
@@ -832,7 +832,22 @@ const EmailGen = {
                                                 sebagai berikut :
                                                 <br />
                                                 <br />
-                                                ${remarks} 
+                                                ${remarks}
+                                                ${
+                                                    inlineImages && inlineImages.length > 0
+                                                        ? `<div style="margin-top: 20px; border-top: 1px dashed #ccc; padding-top: 15px;">
+                                                            <b style="color: #333; font-size: 14px;">Lampiran Gambar Revisi:</b><br/>
+                                                            ${inlineImages
+                                                                .map(
+                                                                    img =>
+                                                                        `<div style="margin-top: 10px;">
+                                                                            <img src="cid:${img.cid}" style="max-width: 100%; border: 1px solid #ddd; border-radius: 6px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);" alt="${img.filename}" />
+                                                                        </div>`
+                                                                )
+                                                                .join("")}
+                                                           </div>`
+                                                        : ""
+                                                }
                                             </h4>
                                         </td>
                                     </tr>

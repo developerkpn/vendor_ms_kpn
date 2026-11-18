@@ -424,7 +424,7 @@ const Ticket = {
                                 log_rejection
                             group by
                                 ticket_id) LR on
-                            LR.ticket_id = T.token
+                            LR.ticket_id = T.token or LR.ticket_id = cast(T.ticket_id as varchar) or LR.ticket_id = T.ticket_num
                         left join approval_steps as2 on t.approval_type = as2.id_doctype and t.approval_pos = as2.index_approval
                         left join mst_department md on md.dept_code = proc.dept_id 
                         left join ticket_rule bu_ticket on t.approval_type = bu_ticket.doctype 
@@ -749,7 +749,7 @@ const Ticket = {
         }
     },
 
-    async RejectTicketv2(ticket_id, remarks, session) {
+    async RejectTicketv2(ticket_id, remarks, session, attachments = []) {
         try {
             const client = await db.connect();
             try {
@@ -764,7 +764,8 @@ const Ticket = {
                     client,
                     ticket_id,
                     remarks,
-                    session
+                    session,
+                    attachments
                 );
                 // throw new Error("test");
                 await client.query(TRANS.COMMIT);
@@ -1391,7 +1392,26 @@ const Ticket = {
                     `,
                     [decoded.ticket_id]
                 );
-                return res_vendor_data[0];
+
+                const qLogs = `select lr.remarks, lr.create_at, coalesce(mu.fullname, lr.create_by) as create_by, lr.ticket_state
+                from log_rejection lr
+                left join all_users mu on mu.user_id = lr.create_by 
+                where lr.ticket_id = $1 
+                   or lr.ticket_id in (select cast(ticket_id as varchar) from ticket where token = $1 or ticket_num = $1)
+                   or lr.ticket_id in (select token from ticket where cast(ticket_id as varchar) = $1 or ticket_num = $1)
+                order by lr.create_at desc`;
+                const { rows: logs } = await client.query(qLogs, [decoded.ticket_id]);
+                const formattedLogs = logs.map(item => ({
+                    remarks: item.remarks,
+                    create_at: moment(item.create_at).format("DD-MM-YYYY HH:mm:ss"),
+                    create_by: item.create_by,
+                    ticket_state: item.ticket_state,
+                }));
+
+                const returnData = res_vendor_data[0] || {};
+                returnData.ticket_id = decoded.ticket_id;
+                returnData.rework_logs = formattedLogs;
+                return returnData;
             } catch (error) {
                 throw error;
             } finally {

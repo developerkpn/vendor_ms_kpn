@@ -599,9 +599,36 @@ EmailModel.SendMDM = async (client, detail_vendor, config, bu = "NON_CG") => {
     }
 };
 
-EmailModel.RejectTicket = async (detail_vendor, remarks, config) => {
+EmailModel.RejectTicket = async (detail_vendor, remarks, config, attachments = []) => {
     try {
-        const html_gen = EmailGen.RejectReq(detail_vendor, remarks);
+        const emailAttachments = [];
+        const inlineImages = [];
+
+        if (attachments && attachments.length > 0) {
+            attachments.forEach((att, idx) => {
+                const isImg = (att.mimetype && att.mimetype.startsWith("image/")) ||
+                              /\.(jpg|jpeg|png|gif|webp)$/i.test(att.originalName || att.filename);
+                const cid = `rework_img_${idx}`;
+                if (isImg) {
+                    emailAttachments.push({
+                        filename: att.originalName || att.filename,
+                        path: att.path,
+                        cid: cid,
+                    });
+                    inlineImages.push({
+                        cid: cid,
+                        filename: att.originalName || att.filename,
+                    });
+                } else {
+                    emailAttachments.push({
+                        filename: att.originalName || att.filename,
+                        path: att.path,
+                    });
+                }
+            });
+        }
+
+        const html_gen = EmailGen.RejectReq(detail_vendor, remarks, inlineImages);
         /**
          * @type {import("nodemailer").SendMailOptions}
          */
@@ -610,6 +637,7 @@ EmailModel.RejectTicket = async (detail_vendor, remarks, config) => {
             ...config,
             subject: `Vendor ${detail_vendor.name_1} Rejected Request (${detail_vendor.ticket_num})`,
             html: html_gen,
+            attachments: emailAttachments,
         };
         await tp.sendMail(setup);
     } catch (error) {

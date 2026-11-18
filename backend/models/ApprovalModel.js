@@ -598,7 +598,7 @@ ApprovalModel.EndApproval = async (client, ticket_id, user_id) => {
     }
 };
 
-ApprovalModel.RejectApproval = async (client, ticket_id, remarks, session) => {
+ApprovalModel.RejectApproval = async (client, ticket_id, remarks, session, attachments = []) => {
     try {
         const today = moment().toISOString();
         // console.log(today);
@@ -649,12 +649,19 @@ ApprovalModel.RejectApproval = async (client, ticket_id, remarks, session) => {
                 }
                 break;
         }
+
+        let fullRemarks = remarks;
+        if (attachments && attachments.length > 0) {
+            const attList = attachments.map(a => `${a.originalName} (${a.url})`).join("\n- ");
+            fullRemarks = `${remarks}\n\nLampiran:\n- ${attList}`;
+        }
+
         const [qins, valins] = Crud.insertItem(
             "log_rejection",
             {
                 ticket_id: ticket_id,
                 create_at: today,
-                remarks: remarks,
+                remarks: fullRemarks,
                 create_by: session.user_id,
                 ticket_state: current_step.emp_role_id,
             },
@@ -662,14 +669,57 @@ ApprovalModel.RejectApproval = async (client, ticket_id, remarks, session) => {
         );
         await client.query(qins, valins);
         const ven_detail = ApprovalTrack.ticket;
+
+        // Collect CCs: Current Approver + Tim MDM + Agung + Wildan
+        const ccSet = new Set();
+        if (current_step && current_step.email) {
+            ccSet.add(current_step.email.trim());
+        }
+
+        try {
+            const { rows: mdmUsers } = await client.query(
+                `SELECT email FROM mst_user 
+                 WHERE (role = 'MDM' OR emp_role_id = 'MDM' OR dept_id = 'MDM') 
+                 AND email IS NOT NULL AND email != ''`
+            );
+            mdmUsers.forEach(u => {
+                if (u.email) ccSet.add(u.email.trim());
+            });
+        } catch (e) {
+            console.error("Failed fetching MDM emails for CC:", e.message);
+        }
+
+        try {
+            const { rows: namedUsers } = await client.query(
+                `SELECT email FROM mst_user 
+                 WHERE (LOWER(fullname) LIKE '%agung%' OR LOWER(fullname) LIKE '%wildan%' 
+                    OR LOWER(email) LIKE '%agung%' OR LOWER(email) LIKE '%wildan%')
+                 AND email IS NOT NULL AND email != ''`
+            );
+            namedUsers.forEach(u => {
+                if (u.email) ccSet.add(u.email.trim());
+            });
+        } catch (e) {
+            console.error("Failed fetching Agung/Wildan emails for CC:", e.message);
+        }
+
+        if (process.env.REWORK_EMAIL_CC) {
+            process.env.REWORK_EMAIL_CC.split(",").forEach(em => {
+                if (em.trim()) ccSet.add(em.trim());
+            });
+        }
+        ["agung@kpn-corp.com", "wildan@kpn-corp.com"].forEach(em => ccSet.add(em));
+
+        const ccList = Array.from(ccSet).filter(Boolean).join(",");
+
         let config_email = {
             to:
                 next_step && next_step.email
                     ? next_step.email
                     : ven_detail.email,
-            cc: current_step.email,
+            cc: ccList,
         };
-        await EmailModel.RejectTicket(ven_detail, remarks, config_email);
+        await EmailModel.RejectTicket(ven_detail, remarks, config_email, attachments);
         return {
             message: `Ticket ${ven_detail.ticket_num} is rejected`,
         };

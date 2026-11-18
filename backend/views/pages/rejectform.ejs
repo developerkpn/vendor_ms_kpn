@@ -418,12 +418,38 @@
                         </table>
                     </tr>
                     <tr>
+                        <td colspan="2" style="padding: 1em 2.5em;">
+                            <div style="background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 15px; margin-bottom: 10px;">
+                                <h4 style="margin-top: 0; margin-bottom: 12px; color: #333; display: flex; align-items: center; gap: 8px;">
+                                    📋 View Rework / Riwayat Penolakan
+                                </h4>
+                                <% if (typeof rework_logs !== 'undefined' && rework_logs && rework_logs.length > 0) { %>
+                                    <div style="display: flex; flex-direction: column; gap: 10px; max-height: 250px; overflow-y: auto;">
+                                        <% rework_logs.forEach(function(log) { %>
+                                            <div style="background: #ffffff; border-left: 4px solid #dc3545; border-radius: 4px; padding: 10px 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
+                                                <div style="display: flex; justify-content: space-between; font-size: 12px; color: #6c757d; margin-bottom: 5px;">
+                                                    <strong style="color: #495057;"><%= log.create_by || 'Approver' %> (<%= log.ticket_state || 'REVIEW' %>)</strong>
+                                                    <span><%= log.create_at %></span>
+                                                </div>
+                                                <div style="font-size: 13px; color: #212529; white-space: pre-wrap;"><%= log.remarks %></div>
+                                            </div>
+                                        <% }); %>
+                                    </div>
+                                <% } else { %>
+                                    <div style="font-size: 13px; color: #6c757d; font-style: italic;">
+                                        Belum ada catatan rework sebelumnya.
+                                    </div>
+                                <% } %>
+                            </div>
+                        </td>
+                    </tr>
+                    <tr>
                         <table class="bg_white" width="100%">
-                            <form id="RejectForm">
+                            <form id="RejectForm" enctype="multipart/form-data">
                                 <tr>
                                     <td
                                         width="20%"
-                                        style="padding: 0.1em 2.5em"
+                                        style="padding: 0.1em 2.5em; vertical-align: top;"
                                     >
                                         Reasons
                                     </td>
@@ -433,7 +459,36 @@
                                             cols="40"
                                             rows="5"
                                             id="Reason"
+                                            placeholder="Tuliskan alasan penolakan / catatan revisi..."
+                                            style="width: 100%; max-width: 400px; padding: 8px; border: 1px solid #ced4da; border-radius: 4px;"
                                         ></textarea>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td
+                                        width="20%"
+                                        style="padding: 0.5em 2.5em; vertical-align: top;"
+                                    >
+                                        Lampiran / Sisip Gambar
+                                    </td>
+                                    <td style="padding: 0.5em 2.5em">
+                                        <input
+                                            type="file"
+                                            id="FileAttachment"
+                                            name="files"
+                                            multiple
+                                            accept="image/*,.pdf,.doc,.docx,.xlsx"
+                                            style="display: none;"
+                                        />
+                                        <button
+                                            type="button"
+                                            onclick="$('#FileAttachment').click();"
+                                            style="border: 1px solid #007bff; color: #007bff; background: transparent; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 13px;"
+                                        >
+                                            📎 Pilih File / Gambar
+                                        </button>
+                                        <span id="fileCount" style="margin-left: 10px; color: #666; font-size: 12px;">Tidak ada file dipilih</span>
+                                        <div id="imagePreviewContainer" style="display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px;"></div>
                                     </td>
                                 </tr>
                                 <tr>
@@ -443,6 +498,7 @@
                                     ></td>
                                     <td>
                                         <button
+                                            id="btnSubmit"
                                             class="btn btn-primary"
                                             style="
                                                 margin-left: 16em;
@@ -498,19 +554,71 @@
 ></script>
 <script>
     const token = `<%= token%>`;
+
+    $("#FileAttachment").on("change", function(e) {
+        const files = e.target.files;
+        if (files.length > 0) {
+            $("#fileCount").text(files.length + " file dipilih");
+        } else {
+            $("#fileCount").text("Tidak ada file dipilih");
+        }
+        $("#imagePreviewContainer").empty();
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            if (file.type.startsWith("image/")) {
+                const reader = new FileReader();
+                reader.onload = function(evt) {
+                    const img = $("<img>").attr("src", evt.target.result).css({
+                        "width": "80px",
+                        "height": "80px",
+                        "object-fit": "cover",
+                        "border-radius": "4px",
+                        "border": "1px solid #ccc"
+                    });
+                    $("#imagePreviewContainer").append(img);
+                };
+                reader.readAsDataURL(file);
+            } else {
+                const badge = $("<div>").text("📄 " + file.name).css({
+                    "padding": "4px 8px",
+                    "background": "#e9ecef",
+                    "border-radius": "4px",
+                    "font-size": "12px",
+                    "color": "#495057",
+                    "border": "1px solid #ced4da"
+                });
+                $("#imagePreviewContainer").append(badge);
+            }
+        }
+    });
+
     $("#RejectForm").on("submit", async e => {
         e.preventDefault();
-        await axios
-            .post("/api/ticket/rejectmgr", {
-                token: token,
-                reason: $("#Reason").val(),
-            })
-            .then(result => {
-                alert("Success rejecting ticket");
-                window.location.reload();
-            })
-            .catch(error => {
-                alert(error.message);
+        const reason = $("#Reason").val();
+        if (!reason || !reason.trim()) {
+            alert("Mohon sertakan alasan penolakan (Reasons)");
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append("token", token);
+        formData.append("reason", reason);
+
+        const files = $("#FileAttachment")[0].files;
+        for (let i = 0; i < files.length; i++) {
+            formData.append("files", files[i]);
+        }
+
+        $("#btnSubmit").prop("disabled", true).text("Submitting...");
+        try {
+            await axios.post("/api/ticket/rejectmgr", formData, {
+                headers: { "Content-Type": "multipart/form-data" }
             });
+            alert("Success rejecting ticket");
+            window.location.reload();
+        } catch (error) {
+            $("#btnSubmit").prop("disabled", false).text("Submit");
+            alert(error.response?.data?.message || error.message);
+        }
     });
 </script>

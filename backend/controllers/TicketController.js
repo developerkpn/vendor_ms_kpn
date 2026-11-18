@@ -7,6 +7,8 @@ const crud = require("../helper/crudquery");
 const moment = require("moment");
 const fa = require("speakeasy");
 const path = require("path");
+const fs = require("fs");
+const formidable = require("formidable");
 const jwt = require("jsonwebtoken");
 const { isAxiosError } = require("axios");
 const MutexModel = require("../models/MutexModel");
@@ -436,22 +438,19 @@ TicketController.rejectMgrv2 = async (req, res) => {
     try {
         const { token_appr } = req.query;
         const result = await Ticket.renderRejectForm(token_appr);
+        const renderData = {
+            ven_name: result.name,
+            ven_type: result.type,
+            company: result.company,
+            token: token_appr,
+            reason: "has rejected by you",
+            rework_logs: result.rework_logs || [],
+        };
         if (result.bu_type == "NON_CG") {
-            res.render("rejectform", {
-                ven_name: result.name,
-                ven_type: result.type,
-                company: result.company,
-                token: token_appr,
-                reason: "has rejected by you",
-            });
+            res.render("rejectform", renderData);
         } else {
-            res.render("rejectform_cg", {
-                ven_name: result.name,
-                ven_type: result.type,
-                ven_class: result.ven_class,
-                token: token_appr,
-                reason: "has rejected by you",
-            });
+            renderData.ven_class = result.ven_class;
+            res.render("rejectform_cg", renderData);
         }
     } catch (error) {
         console.error(error);
@@ -460,29 +459,81 @@ TicketController.rejectMgrv2 = async (req, res) => {
 };
 
 TicketController.RejectMgrbyLink = async (req, res) => {
-    const { reason, token } = req.body;
-    const decoded = jwt.decode(token, process.env.TOKEN_KEY);
-    await MutexModel.CreateLock(decoded.ticket_id);
-    const getCurrentSession = await Ticket.getSessionApprbyLink(
-        decoded.ticket_id
-    );
-    const session = getCurrentSession;
+    let reason = "";
+    let token = "";
+    let uploadedFiles = [];
+
     try {
-        const result = await Ticket.RejectTicketv2(
-            decoded.ticket_id,
-            reason,
-            session
+        const contentType = req.headers["content-type"] || "";
+        if (contentType.includes("multipart/form-data")) {
+            const form = new formidable.IncomingForm();
+            form.options.multiples = true;
+            form.options.maxFileSize = 25 * 1024 * 1024;
+            const [fields, files] = await form.parse(req);
+            token = Array.isArray(fields.token) ? fields.token[0] : fields.token;
+            reason = Array.isArray(fields.reason) ? fields.reason[0] : fields.reason;
+
+            let fileList = [];
+            if (files.files) {
+                fileList = Array.isArray(files.files) ? files.files : [files.files];
+            } else if (files.attachment) {
+                fileList = Array.isArray(files.attachment) ? files.attachment : [files.attachment];
+            }
+
+            const uploadDir = path.join(__dirname, "../public/rework");
+            if (!fs.existsSync(uploadDir)) {
+                fs.mkdirSync(uploadDir, { recursive: true });
+            }
+
+            for (const file of fileList) {
+                if (file && file.originalFilename) {
+                    const safeName = `${Date.now()}_${file.originalFilename.replace(/[^a-zA-Z0-9.-]/g, "_")}`;
+                    const destPath = path.join(uploadDir, safeName);
+                    fs.copyFileSync(file.filepath, destPath);
+                    uploadedFiles.push({
+                        originalName: file.originalFilename,
+                        filename: safeName,
+                        path: destPath,
+                        mimetype: file.mimetype,
+                        size: file.size,
+                        url: `/static/rework/${safeName}`,
+                    });
+                }
+            }
+        } else {
+            token = req.body.token;
+            reason = req.body.reason;
+        }
+
+        const decoded = jwt.decode(token, process.env.TOKEN_KEY);
+        await MutexModel.CreateLock(decoded.ticket_id);
+        const getCurrentSession = await Ticket.getSessionApprbyLink(
+            decoded.ticket_id
         );
-        res.status(200).send({
-            message: "Ticket rejected",
-        });
-    } catch (error) {
-        console.error(error);
+        const session = getCurrentSession;
+        try {
+            const result = await Ticket.RejectTicketv2(
+                decoded.ticket_id,
+                reason,
+                session,
+                uploadedFiles
+            );
+            res.status(200).send({
+                message: "Ticket rejected",
+            });
+        } catch (error) {
+            console.error(error);
+            res.status(500).send({
+                message: error.message,
+            });
+        } finally {
+            await MutexModel.Unlock(decoded.ticket_id);
+        }
+    } catch (err) {
+        console.error(err);
         res.status(500).send({
-            message: error.message,
+            message: err.message,
         });
-    } finally {
-        await MutexModel.Unlock(decoded.ticket_id);
     }
 };
 
@@ -842,15 +893,20 @@ TicketController.rejectLog = async (req, res) => {
         const client = await db.connect();
         try {
             const { ticket_state, ticket_id } = req.query;
-            const q = `select lr.remarks, lr.create_at, coalesce(mu.fullname, lr.create_by) as create_by, lr.id from log_rejection lr
+            const q = `select lr.remarks, lr.create_at, coalesce(mu.fullname, lr.create_by) as create_by, lr.id, lr.ticket_state 
+            from log_rejection lr
             left join all_users mu on mu.user_id = lr.create_by 
-            where ticket_id = $1  order by create_at desc`;
+            where lr.ticket_id = $1  
+               or lr.ticket_id in (select cast(ticket_id as varchar) from ticket where token = $1 or ticket_num = $1)
+               or lr.ticket_id in (select token from ticket where cast(ticket_id as varchar) = $1 or ticket_num = $1)
+            order by lr.create_at desc`;
             const { rows } = await client.query(q, [ticket_id]);
             const results = rows.map(item => ({
                 id: item.id,
                 remarks: item.remarks,
                 create_at: moment(item.create_at).format("DD-MM-YYYY HH:mm:ss"),
                 create_by: item.create_by,
+                ticket_state: item.ticket_state,
             }));
             res.status(200).send(results);
         } catch (error) {
